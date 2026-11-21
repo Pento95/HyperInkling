@@ -99,7 +99,6 @@ Longest single request, 6 requests served at once, KV cache FP8 E4M3 (8 bits).
 
 ```bash
 git clone https://github.com/Pento95/HyperInkling hyperinkling && cd hyperinkling
-scripts/setup-vllm.sh && scripts/build-image.sh   # once, ~1 hour
 python3 scripts/wizard.py && docker compose up -d   # downloads this checkpoint
 ```
 

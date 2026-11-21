@@ -20,11 +20,13 @@ a model-preparation pipeline, and a launcher with measured defaults.
 
 ```bash
 git clone https://github.com/Pento95/HyperInkling hyperinkling && cd hyperinkling
-scripts/setup-vllm.sh && scripts/build-image.sh   # once, ~1 hour: compiles vLLM for sm86
 python3 scripts/wizard.py         # a few questions -> .env (context, vision, DSpark, ...)
-docker compose up -d              # first start downloads the checkpoint (~16 GB)
+docker compose up -d              # first start pulls the image (~26 GB) and the checkpoint (~16 GB)
 docker compose logs -f hyperinkling
 ```
+
+To build the image yourself instead (~1 hour, compiles vLLM for sm86):
+`scripts/setup-vllm.sh && scripts/build-image.sh`, then `IMAGE=hyperinkling:latest` in `.env`.
 
 The OpenAI-compatible API is at `http://127.0.0.1:8080/v1`, model `inkling-2-mini`
 (`GET /health` when it is up; `GET /` is a 404 by design). The port is published on

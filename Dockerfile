@@ -8,6 +8,9 @@
 ARG VLLM_IMAGE=hyperinkling-vllm:sm86
 FROM ${VLLM_IMAGE}
 
+LABEL org.opencontainers.image.source=https://github.com/Pento95/HyperInkling \
+      org.opencontainers.image.description="Inkling 2 Mini on one RTX 3090 / 3090 Ti (vLLM, sm86)" \
+      org.opencontainers.image.licenses=Apache-2.0
 WORKDIR /app
 COPY start.sh LICENSE README.md ./
 COPY scripts/ scripts/

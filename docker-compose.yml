@@ -20,7 +20,7 @@ x-gpu: &gpu
 
 services:
   prepare:
-    image: ${IMAGE:-hyperinkling:latest}
+    image: ${IMAGE:-ghcr.io/pento95/hyperinkling:0.1.0}
     entrypoint: ["/bin/bash", "-c"]
     command:
       - >-
@@ -32,7 +32,7 @@ services:
       - hf-cache:/cache
 
   hyperinkling:
-    image: ${IMAGE:-hyperinkling:latest}
+    image: ${IMAGE:-ghcr.io/pento95/hyperinkling:0.1.0}
     <<: *gpu
     depends_on:
       prepare:
