@@ -30,7 +30,7 @@ def test_copies_the_continuation_of_the_longest_match():
     history = [1, 2, 3, *doc, 7, 8, *doc[10:20]]
     drafts, cache, look = _run(history, [9] * K)
     assert drafts == doc[20:27]
-    assert look.used[0].item() == 1
+    assert look.used[0].item() == K  # all K positions came from the lookup
     for step, tok in enumerate(doc[20:27]):
         row = cache[1, step].float()
         assert row[tok].item() == 0.0 and torch.isinf(row).sum().item() == VOCAB - 1

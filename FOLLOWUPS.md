@@ -8,7 +8,7 @@ Any item that trades something for something else ships as a wizard option, not 
 
 | phase | items | then |
 |---|---|---|
-| 2, the checkpoint | 6, 8, 11, 12, 13, 14, 29 | checkpoint on Hugging Face (2) |
+| 2, the checkpoint | 6, 8, 11, 12, 13, 14 | checkpoint on Hugging Face (2) |
 | 3, context | 17, 18, 19, 30 | |
 | 4, speed and polish | 7, 9, 10, 21, 22, 31 | Reddit post |
 
@@ -32,14 +32,12 @@ dropped ideas are at the end, with the reason, so they are not re-tried blind.
 ### DSpark
 
 6. **Lookup drafting from the context** [HQ `dflash2-lookup-drafting`, BS suffix drafter]:
-   written (`ops/lookup.py`, `HYPERINKLING_LOOKUP=1`, `tests/test_lookup.py`), off by default,
-   gain not shown. On spec_bench and the extraction bench it moves -9% to +13% by kind of
-   text (within sampling noise; extraction 377 vs 397 tok/s); greedy divergence is the same as two
-   runs without it (item 14). The case it is for, quoting a far document, is not measured:
-   `bench/copy_test.py` does not get the model to copy even with the passage's start
-   prefilled (5% verbatim at 2k context, it stops after 12 tokens at 20k). Next: a copy
-   prompt the model follows (e.g. "repeat the text between the markers"), then off vs on
-   at the same k, k=4 and k=7.
+   `ops/lookup.py`, `HYPERINKLING_LOOKUP=1`, off by default; lossless (greedy text equals
+   `SPEC=off`). Copying a 120-line table from a 2-50k document (`bench/copy_test.py`): at
+   the default k it adds 2% (4.88 -> 5.00 tokens per step, the ceiling); at k=7 7-13%
+   (7.07-7.43 -> 8.00; 438 -> 494 tok/s at 50k). The drafter copies tables well on its own;
+   the verify length is the bigger lever (k=7: +33% while copying, -14 to -21% on chat and
+   code), hence 7. On spec_bench and the extraction bench the lookup is within noise.
 7. **Per-request verify length** [BS draft policy, vLLM adaptive verification]: needs decode
    graphs with per-request query lengths. docs/varlen-decode-investigation.md has the map,
    with file:line references and open doubts;
@@ -63,16 +61,20 @@ dropped ideas are at the end, with the reason, so they are not re-tried blind.
 11. **Unembed INT4 GPTQ** [HQ fast variant: int4 GPTQ lm_head]: ~0.25 ms per step, and the
     drafter's base logits would read half as much. Judge by the KL median.
 12. **Attention 4-bit** [NS] (GPTQ + int4 GEMV): ~0.7 ms per step at one request.
-13. **A faster W4A16 GEMV** [NS]: `ops/linear_w4.py` reaches ~500 GB/s (INT8 ~900); it
-    limits the drafter layers and any 4-bit head or attention (11, 12).
+13. **A faster W4A16 GEMV** [NS]: `ops/linear_w4.py` reaches 400-550 GB/s at decode (INT8
+    ~900). Outputs of 16k columns or more now take the single-launch kernel (Markov fold
+    786 vs 660 GB/s at 1 row, 679 vs 431 at 7; gate_up 724 vs 554), the rest keep split-K,
+    which the single launch loses to (`bench/w4_gemv.py`). The remaining cost is the
+    nibble unpack and conversion; a faster kernel there helps 11 and 12.
 
 ### Quality and measurement
 
 14. **Run-to-run nondeterminism** [NS]: the same request scored twice on one server differs
     from position 1 (~0.003 in logprob), and an expert flip carries it down the sequence
-    (KL mean floor 0.060; the median, 0.0003, is what decisions use). Marlin MoE is bitwise
-    repeatable (`tests/test_determinism.py`); next suspects: `_rel_attention_kernel`,
-    `_k_group_kernel` routing ties, cuBLAS. Extend the test kernel by kernel.
+    (KL mean floor 0.060; the median, 0.0003, is what decisions use). Bitwise repeatable
+    (`tests/test_determinism.py`): Marlin MoE, the W8 linear, `bgemv`, `short_conv`. Not yet
+    tested: `_rel_attention_kernel` (prefill attention), the router (`_k_group_kernel`,
+    `select_experts`), `attn_res`, cuBLAS.
 
 ### Context, best effort (no DSpark, vision off the GPU)
 
@@ -92,11 +94,6 @@ dropped ideas are at the end, with the reason, so they are not re-tried blind.
 ### Added with the plan
 
 
-29. **Draft vocabulary subset** [HQ `qwen3_5-mtp-draft-vocab`]: the drafter has no head of its
-    own; its base logits (shared INT8 head, ~0.5 ms) and Markov fold (~0.2 ms) span all 201k
-    rows. Computing both on 32-40k rows calibrated on the model's own output (Italian and JSON
-    included) saves ~5% of a ~10.5 ms step; excluded tokens can no longer be drafted, so
-    acceptance drops on rare ones. Output unchanged (full verify). A wizard option if it pays.
 30. **Memory profile after warmup** [HQ `memory-profile-after-warmup`]: vLLM checks the
     context limit before the warmup, hence the two-boot measurement (NOTES). Profiling
     after it makes the first boot's estimate the real one.
@@ -117,3 +114,8 @@ dropped ideas are at the end, with the reason, so they are not re-tried blind.
 - The release's MXFP8 experts on layers 20-23 [BS] (`prepare/mix_experts.py`, 2026-11-21):
   KL median 0.0027 vs 0.0030 (the noise floor is 0.0003), top-1 92.5% vs 92.35%, for
   +1.94 GiB (~110k tokens of context); layer 23 alone changes nothing.
+- A draft vocabulary subset [HQ `qwen3_5-mtp-draft-vocab`] (2026-11-22): base logits and the
+  Markov fold on 32k or 48k head rows (the most frequent in the model's own calibration
+  output, 9.5k distinct, filled by lowest id). Steps 5% shorter, but acceptance fell
+  (extraction bench 42.5% -> 34-35%, 419 -> 394-400 tok/s; struct -5 to -12%); only chat
+  gained (+3-7%). Document text needs the full vocabulary.

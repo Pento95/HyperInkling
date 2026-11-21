@@ -1,4 +1,4 @@
-From 54bcbe652075dec4f915e14a8033195b23941182 Mon Sep 17 00:00:00 2001
+From 8768abec41f16bfa77405ff55c65ac242207afc4 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -28,7 +28,8 @@ Runs Inkling2Loop on RTX 3090-class GPUs (on top of vllm#69028):
 - DSpark drafter: base logits and the Markov fold from the shared INT8 LM
   head (the bf16 head is no longer kept); the fold in INT4/INT8
   (HYPERINKLING_DSPARK_FOLD=w4|w8); draft layers in INT4 g128 RTN on a
-  split-K Triton W4A16 kernel (ops/linear_w4.py, HYPERINKLING_DRAFT_W4);
+  Triton W4A16 kernel (ops/linear_w4.py, HYPERINKLING_DRAFT_W4; split-K below
+  16k output columns, one launch above);
   Markov embedding in pinned host RAM with HYPERINKLING_EMBED_UVA; draft
   KV as the target's unit-scale E4M3 (HYPERINKLING_DRAFT_KV_FP8, through a
   KV-write-only FlashAttention impl: the draft's attention runs in
@@ -42,7 +43,7 @@ Runs Inkling2Loop on RTX 3090-class GPUs (on top of vllm#69028):
   HyperQwen's dflash2-lookup-drafting): the longest suffix match in the
   request's history is fused with the DSpark drafts, point masses in the
   draft-logits cache keep rejection sampling exact; the token history is
-  kept on the GPU while it is on. Off by default (gain not shown yet).
+  kept on the GPU while it is on. Off by default.
 - sconv metadata: padding rows start at num_actual_tokens, so the
   >256-token tile skip in _sconv_kernel keeps the cache taps of a tile
   that mixes real and padding rows (upstream bug).
@@ -74,9 +75,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/fp8_emu.py    |  76 +++++++
  vllm/models/inkling2/nvidia/ops/gemv.py       |   5 +-
  vllm/models/inkling2/nvidia/ops/linear.py     |  19 +-
- vllm/models/inkling2/nvidia/ops/linear_w4.py  | 194 ++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w4.py  | 209 ++++++++++++++++++
  vllm/models/inkling2/nvidia/ops/linear_w8.py  | 132 +++++++++++
- vllm/models/inkling2/nvidia/ops/lookup.py     | 178 +++++++++++++++
+ vllm/models/inkling2/nvidia/ops/lookup.py     | 192 ++++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe.py        |  28 +--
  vllm/models/inkling2/nvidia/ops/moe_marlin.py | 209 ++++++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_sm120.py  |   6 +-
@@ -92,7 +93,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/core/sched/scheduler.py               |  38 +++-
  vllm/v1/engine/core.py                        |  82 +++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++++
- 39 files changed, 1827 insertions(+), 127 deletions(-)
+ 39 files changed, 1856 insertions(+), 127 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/fp8_emu.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
@@ -1608,10 +1609,10 @@ index f3da872c3..f1c231430 100644
      return out
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w4.py b/vllm/models/inkling2/nvidia/ops/linear_w4.py
 new file mode 100644
-index 000000000..05a061769
+index 000000000..5a2217db9
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w4.py
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,209 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W4A16 linears: bf16 weights quantized at load time to int4
@@ -1638,6 +1639,8 @@ index 000000000..05a061769
 +W4_DECODE_WARPS = 4
 +W4_DECODE_STAGES = 2
 +W4_PROGRAMS_PER_SM = 2
++# Decode outputs at least this wide take the single-launch kernel.
++W4_WIDE_N = 16384
 +
 +
 +def quantize_int4(weight: torch.Tensor):
@@ -1766,6 +1769,19 @@ index 000000000..05a061769
 +    if out is None:
 +        out = torch.empty((m, n), dtype=x.dtype, device=x.device)
 +    if m == 0:
++        return out
++    if m <= 64 and n >= W4_WIDE_N:
++        # Wide outputs (the Markov fold, the drafter's gate_up) fill every SM without
++        # splitting K: one launch, no fp32 partials (bench/w4_gemv.py, RTX 3090 Ti:
++        # fold 786 vs 660 GB/s at 1 row, 679 vs 431 at 7; gate_up 724 vs 554 at 1 row).
++        bm = max(16, triton.next_power_of_2(m))
++        bn = 128 if m == 1 else 64
++        wide_k = k > 1024
++        _w4_kernel[(triton.cdiv(n, bn), 1)](
++            x, packed, scale, zero, out, m, n, k,
++            x.stride(0), packed.stride(0), scale.stride(0), zero.stride(0), out.stride(0),
++            BM=bm, BN=bn, G=GROUP, num_warps=8 if wide_k else 4, num_stages=3 if wide_k else 2,
++        )  # fmt: skip
 +        return out
 +    if m <= 64:
 +        bm = max(16, triton.next_power_of_2(m))
@@ -1946,10 +1962,10 @@ index 000000000..93a740e96
 +        ]
 diff --git a/vllm/models/inkling2/nvidia/ops/lookup.py b/vllm/models/inkling2/nvidia/ops/lookup.py
 new file mode 100644
-index 000000000..7adad6c9b
+index 000000000..87a4cdea5
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/lookup.py
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,192 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Drafting from the request's own context (HYPERINKLING_LOOKUP=1).
@@ -2047,25 +2063,19 @@ index 000000000..7adad6c9b
 +    look_ptr,
 +    len_ptr,
 +    valid_ptr,
-+    use_ptr,
++    used_ptr,
 +    idx_mapping_ptr,
 +    idx_mapping_stride,
-+    cache_ptr,
-+    cache_stride_row,
-+    cache_stride_step,
 +    nmin,
 +    nstrong,
 +    agree_min,
-+    vocab,
 +    K: tl.constexpr,
 +    BLOCK_K: tl.constexpr,
-+    BLOCK_V: tl.constexpr,
-+    HAS_CACHE: tl.constexpr,
 +):
-+    """Fuse, then rewrite the draft-logits rows of the taken positions to a point mass.
-+    Grid (requests, K): program (r, 0) decides, every program rewrites its own step."""
++    """One program per request: decide, then write the taken positions. `used` holds how
++    many leading positions came from the lookup (0: none)."""
 +    req = tl.program_id(0)
-+    step = tl.program_id(1)
++    tl.store(used_ptr + req, 0)
 +    req_state = tl.load(idx_mapping_ptr + req * idx_mapping_stride)
 +    if req_state < 0:
 +        return
@@ -2079,18 +2089,37 @@ index 000000000..7adad6c9b
 +    # Positions the match did not supply are not agreement.
 +    agree = tl.minimum(tl.min(tl.where(disagree, idx, K)), valid)
 +    take = (match_len >= nstrong) | ((match_len >= nmin) & (agree >= agree_min))
-+    # Every program of the request computes the same decision; each writes its own step.
-+    if take & (step < valid):
-+        token = tl.load(look_ptr + req * K + step).to(tl.int64)
-+        tl.store(draft_ptr + req * draft_stride + step, token)
-+        if HAS_CACHE:
-+            row = cache_ptr + req_state.to(tl.int64) * cache_stride_row + step * cache_stride_step
-+            for v0 in range(0, vocab, BLOCK_V):
-+                offs = v0 + tl.arange(0, BLOCK_V)
-+                tl.store(row + offs, float("-inf"), mask=offs < vocab)
-+            tl.store(row + token, 0.0)
-+    if step == 0:
-+        tl.store(use_ptr + req, (take & (valid > 0)).to(tl.int32))
++    if take & (valid > 0):
++        tl.store(draft_ptr + req * draft_stride + idx, looked, mask=kmask & (idx < valid))
++        tl.store(used_ptr + req, valid)
++
++
++@triton.jit
++def _point_mass_kernel(
++    draft_ptr,
++    draft_stride,
++    used_ptr,
++    idx_mapping_ptr,
++    idx_mapping_stride,
++    cache_ptr,
++    cache_stride_row,
++    cache_stride_step,
++    vocab,
++    BLOCK_V: tl.constexpr,
++):
++    """Grid (requests, K): the draft-logits row of each taken position becomes a point mass
++    on the token now in `draft_tokens`."""
++    req = tl.program_id(0)
++    step = tl.program_id(1)
++    req_state = tl.load(idx_mapping_ptr + req * idx_mapping_stride)
++    if (req_state < 0) | (step >= tl.load(used_ptr + req)):
++        return
++    token = tl.load(draft_ptr + req * draft_stride + step)
++    row = cache_ptr + req_state.to(tl.int64) * cache_stride_row + step * cache_stride_step
++    for v0 in range(0, vocab, BLOCK_V):
++        offs = v0 + tl.arange(0, BLOCK_V)
++        tl.store(row + offs, float("-inf"), mask=offs < vocab)
++    tl.store(row + token, 0.0)
 +
 +
 +class ContextLookup:
@@ -2104,7 +2133,7 @@ index 000000000..7adad6c9b
 +        self.tokens = torch.zeros(max_num_reqs, k, dtype=torch.int32, device=device)
 +        self.match_len = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
 +        self.valid = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
-+        # Per request: 1 when this step's drafts came from the lookup (for stats).
++        # Per request: how many leading drafts came from the lookup this step.
 +        self.used = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
 +
 +    def apply(self, token_history: torch.Tensor, total_len: torch.Tensor,
@@ -2118,16 +2147,17 @@ index 000000000..7adad6c9b
 +            K=self.k, NMAX=self.nmax, NMIN=min(self.nmin, 4), BLOCK=1024,
 +            BLOCK_K=triton.next_power_of_2(self.k), num_warps=4,
 +        )
-+        cache = draft_logits if draft_logits is not None else draft_tokens
-+        _fuse_kernel[(num_reqs, self.k)](
++        _fuse_kernel[(num_reqs,)](
 +            draft_tokens, draft_tokens.stride(0), self.tokens, self.match_len, self.valid,
-+            self.used, idx_mapping, idx_mapping_stride, cache,
-+            cache.stride(0), cache.stride(1) if cache.dim() > 1 else 0,
-+            self.nmin, self.nstrong, self.agree_min,
-+            cache.shape[-1] if draft_logits is not None else 0,
-+            K=self.k, BLOCK_K=triton.next_power_of_2(self.k), BLOCK_V=4096,
-+            HAS_CACHE=draft_logits is not None, num_warps=4,
++            self.used, idx_mapping, idx_mapping_stride, self.nmin, self.nstrong,
++            self.agree_min, K=self.k, BLOCK_K=triton.next_power_of_2(self.k), num_warps=1,
 +        )
++        if draft_logits is not None:
++            _point_mass_kernel[(num_reqs, self.k)](
++                draft_tokens, draft_tokens.stride(0), self.used, idx_mapping,
++                idx_mapping_stride, draft_logits, draft_logits.stride(0),
++                draft_logits.stride(1), draft_logits.shape[-1], BLOCK_V=4096, num_warps=4,
++            )
 diff --git a/vllm/models/inkling2/nvidia/ops/moe.py b/vllm/models/inkling2/nvidia/ops/moe.py
 index f4c0f540a..a0d6d48f5 100644
 --- a/vllm/models/inkling2/nvidia/ops/moe.py

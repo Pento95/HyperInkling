@@ -140,6 +140,9 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   `--encoder-cache-size 16384`.
 - **The KV CPU tier needs prefix caching on**; it worked first time with Inkling's
   hybrid groups.
+- **Greedy output depends on the verify length.** Each `SPEC_K` runs different kernel
+  shapes, so near-ties resolve differently: compare a speculative change against `SPEC=off`
+  (or the same `SPEC_K`), never across k. Within one configuration it is repeatable.
 - **KL: compare medians.** One request at a time the same transcript scored twice on one
   server still differs from the first positions (~0.003 in logprob; Marlin MoE is bitwise
   repeatable, `tests/test_determinism.py`); where that flips an expert the difference
