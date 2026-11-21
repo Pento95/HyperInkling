@@ -72,7 +72,22 @@ items each; about +-1.3 points of noise):
 |---|---|---|
 | one request, decode (long prompts) | 128 tok/s | 214 tok/s |
 | one request, structured output | 135 tok/s | ~310 tok/s |
-| longest request, vision on the GPU, 6 at once | 345k tokens | 268k tokens |
+
+## Maximum context with HyperInkling (RTX 3090 Ti)
+
+Longest single request with 6 requests served at once, KV cache at 8 bits. The vision
+tower can run on the GPU, stream from host RAM (+27 ms per A4 page), or be left out (text
+only); turning async scheduling off frees context for -3 to -4% decode.
+
+| vision tower | DSpark, async on | DSpark, async off | no DSpark, async on | no DSpark, async off |
+|---|---|---|---|---|
+| on the GPU | 213k | **268k** (default) | 291k | 345k |
+| in host RAM | 249k | 302k | 331k | 386k |
+| none (text only) | 249k | 302k | 336k | 386k |
+
+Fewer requests at once leave a little more (279k with DSpark and the vision tower on the GPU
+at 1 request). Above ~262k it is best effort, as far as the 24 GiB allow, not the model's 1M.
+HyperInkling's wizard picks the setting from this table.
 
 ## Use
 
