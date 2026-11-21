@@ -67,7 +67,7 @@ scripts/serve-try.sh <log> [args]     # short-context eager boot of the original
 
 venv/bin/python -m pytest -q tests/                          # kernel tests (GPU; test_auth.py not)
 venv/bin/python -m pytest -q -s tests/test_bgemv.py -k <name>  # one test, with timings
-ruff check <file>                                             # lint (ruff, user-installed)
+ruff check bench prepare tests scripts                        # lint: ruff 0.17.6 (as CI), rules in ruff.toml
 ```
 
 CI (`.github/workflows/checks.yml`, no GPU): the patch applies to BASE, ruff, shell syntax,
