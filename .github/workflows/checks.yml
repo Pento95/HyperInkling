@@ -21,6 +21,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/ruff-action@v3
         with:
+          version: "0.13.2"
           args: check bench prepare tests scripts
       - name: shell syntax
         run: for f in start.sh scripts/*.sh bench/*.sh prepare/*.sh; do bash -n "$f"; done
