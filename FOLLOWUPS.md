@@ -18,11 +18,9 @@ with `hf download --include` only when chosen.
 
 ## Release (in progress)
 
-2. **GitHub and Hugging Face** (ask before each push): `Pento95/HyperInkling` is not created
-   yet (gh is logged in). The checkpoint is uploaded, **private**, as
-   `Pentium95/Inkling-2-Mini-W4A16-g128-gptq` (README = docs/MODEL_CARD.md; re-upload it when
-   the card changes); public after phase 2. Then check compose's `prepare` download, the one
-   container path not run yet.
+2. **Published 0.1.0** (GitHub release, `ghcr.io/pento95/hyperinkling:0.1.0`, the HF checkpoint;
+   re-upload the HF README from docs/MODEL_CARD.md when the card changes). Not yet run: a
+   fresh machine's compose `prepare` download from HF.
 
 ## Still to try
 
