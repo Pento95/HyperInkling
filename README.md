@@ -105,7 +105,7 @@ The wizard reads that table; these are the defaults and what each knob costs or 
 | `IMAGE_MAX_W` / `_H` | 1240 x 1760 | largest image (A4 at 150 ppi, 1,364 tokens); larger ones are scaled down to it | A4 at 300 ppi (2480 x 3508, with `ENCODER_CACHE=16384`): about the same context, but each page costs ~4x the tokens | 300 ppi: ~4x the prefill per page |
 | `MAX_SEQS` | 6 | requests at once | longest request with DSpark: 279k at 1, 268k at 6, 257k at 16, 228k at 64 | 6 -> 16 requests: ~430 -> 740 tok/s decode in total |
 | `KV_OFFLOAD_GB` | `auto` (60% of RAM - 8 GiB, at most 36) | prefix-cache tier in host RAM (`/dev/shm`) | host RAM only | evicted prefixes come back in 0.1 s instead of seconds |
-| `NBT` | 1024 | prefill chunk | 512: more context | 512: -22% prefill |
+| `NBT` | 1024 | prefill chunk | 2048: ~68k tokens less (268k -> 200k), async off; 512: more | 2048: +7-8% prefill (6,050 vs 5,610 tok/s), same decode; 512: -22% prefill |
 | `SPEC_K` | `[[1,2,4],[3,6,3]]` | drafts verified per step, by batch size | none | measured best |
 | `SPEC_DRAFT` | `probabilistic` | drafts sampled from the draft distribution | none | +15-20% on structured output at temperature > 0 |
 | `HOST` / `VLLM_API_KEY` | 127.0.0.1 / none | who can connect | none | none |

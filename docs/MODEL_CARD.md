@@ -81,6 +81,10 @@ KV cache FP8 E4M3.
 | decode, one request, structured output | 135 tok/s | ~310 tok/s |
 | decode, 6 requests, prose, aggregate | 428 tok/s | 436 tok/s |
 
+Prefill chunk (`NBT`, a wizard option): 2048 instead of the default 1024 gives 6,050 instead of
+5,610 tok/s prefill (one prompt and 6 at once, aggregate), the same decode, and ~68k tokens
+less context (200k instead of 268k with DSpark).
+
 ## Maximum context with HyperInkling (RTX 3090 Ti)
 
 Longest single request, 6 requests served at once, KV cache FP8 E4M3 (8 bits).

@@ -30,6 +30,10 @@ ROPE_BYTES_PER_TOKEN = 512
 MEASURED_AT = 1_048_576
 # Speeds, RTX 3090 Ti, 2026-11-21 (README): decode tok/s of one request, AA-LCR prompts.
 DECODE_1 = {"dspark": 214, "off": 128}
+# NBT=2048 (prefill chunk): +7-8% prefill, same decode; context lost against NBT=1024 with
+# async scheduling off (measured 2026-11-21, 6 requests, vision on the GPU). With async on
+# it costs far more (213k -> 94k), so 2048 runs with async off.
+NBT2048_COST = {"dspark": 67_712, "off": 73_728}
 
 
 def load_table():
@@ -169,10 +173,17 @@ def main():
     print(f"   n) no: longest request {fmt_tokens(off) if off else '?'}")
     spec = "dspark" if ask("   choice", "yn", "y") == "y" else "off"
 
+    print("\n3b) Prefill chunk (NBT): 1024, or 2048 for +7-8% prefill (same decode) at "
+          f"~{fmt_tokens(NBT2048_COST[spec])} less context, async scheduling off.")
+    nbt = ask("   chunk", ("1024", "2048"), "1024")
+
     # Context: async scheduling first (faster); one step in flight frees the second
     # in-flight chunk's sliding-window and conv-state reserves (-3 to -4% decode).
     fast_m = lookup(rows, vision, spec, True, seqs)
     slow_m = lookup(rows, vision, spec, False, seqs) or fast_m
+    if nbt == "2048":
+        fast_m = None
+        slow_m = slow_m and slow_m - NBT2048_COST[spec]
     fast = max_limit(fast_m, spec) or 0
     best = max(fast, max_limit(slow_m, spec) or 0)
     print(f"\n4) Context limit per request (MAX_LEN), in tokens. Up to {fmt_tokens(fast or 0)}"
@@ -224,6 +235,7 @@ def main():
         "SPEC": spec,
         "ASYNC": async_,
         "KV_OFFLOAD_GB": tier,
+        "NBT": int(nbt),
         "GPU_UTIL": round(0.95 - headroom / 24, 3),
     }
     if vision == "none":
