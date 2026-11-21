@@ -1,0 +1,45 @@
+name: Something does not work
+description: A crash, a hang, a wrong answer or numbers far from the README's, on an RTX 3090 / 3090 Ti.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        HyperInkling supports **one RTX 3090 or 3090 Ti** and nothing else. Reports from other
+        GPUs, several GPUs or other models will be closed. A reproduction is what gets a fix.
+  - type: dropdown
+    id: gpu
+    attributes:
+      label: GPU
+      options: [RTX 3090, RTX 3090 Ti]
+    validations: {required: true}
+  - type: input
+    id: system
+    attributes:
+      label: Driver, OS, how it runs
+      placeholder: "driver 590.48, Ubuntu 24.04, Docker 29 / native venv; display on this GPU: no"
+    validations: {required: true}
+  - type: input
+    id: commit
+    attributes:
+      label: HyperInkling commit
+      placeholder: git rev-parse --short HEAD
+    validations: {required: true}
+  - type: textarea
+    id: env
+    attributes:
+      label: Your .env (remove VLLM_API_KEY)
+      render: shell
+    validations: {required: true}
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and how to make it happen again
+      description: The request (or a smaller one that does the same), what you expected, what you got.
+    validations: {required: true}
+  - type: textarea
+    id: log
+    attributes:
+      label: Server log
+      description: From the start banner to the error (docker compose logs hyperinkling).
+      render: text
+    validations: {required: true}

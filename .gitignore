@@ -1,0 +1,13 @@
+.local/
+models/
+vllm/
+data/
+venv/
+__pycache__/
+*.pyc
+bench/kl/**/*.json
+!bench/kl/corpus.json
+bench/perf/
+CLAUDE.local.md
+.env
+bench/quality-data/

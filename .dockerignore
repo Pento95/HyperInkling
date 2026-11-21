@@ -1,0 +1,13 @@
+# Only the launcher layer goes into the image (Dockerfile COPY lines); the vLLM layer is
+# built from ./vllm by scripts/build-image.sh with vllm/.dockerignore.
+*
+!start.sh
+!LICENSE
+!README.md
+!scripts/
+!bench/
+!docs/
+bench/perf/
+bench/kl/*.json
+!bench/kl/corpus.json
+**/__pycache__

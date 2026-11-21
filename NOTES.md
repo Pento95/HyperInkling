@@ -1,0 +1,169 @@
+# Notes
+
+Facts, gotchas and the reasons behind the choices, so they are not re-derived.
+
+## Machine
+
+- RTX 3090 Ti (sm86), 24 GiB, 350 W limit; bf16 tensor cores unlocked: 102 TFLOPS
+  measured on a cuBLAS GEMM (stock ~40), 904 GB/s copy bandwidth. Decode is
+  bandwidth-bound; the unlock helps prefill.
+- 16 cores / 32 threads: builds and servers are pinned to CPUs 0-30 (`taskset`).
+- Fedora 44: gcc 16 is the default and nvcc 13.3 rejects it; everything that compiles
+  CUDA (the vLLM build, FlashInfer's JIT at first use) needs `CC=gcc-15 CXX=g++-15
+  NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++-15"` (set in `start.sh` and the scripts).
+- `/dev/shm` is 52 GB, enough for the 36 GiB KV CPU tier. RAM 62 GB.
+- The GPU drives no display: all 24 GiB are free when nothing runs.
+
+## Model (from config.json and the vLLM PR)
+
+- 24 layers, layers 6-17 run 3 passes with shared weights: 48 layer visits per token.
+  Each pass has its own KV and conv-state caches; passes 2-3 blend the previous pass's
+  messages through rank-64 controllers.
+- 20 sliding-window layers (1024) + 4 global (5, 11, 17, 23): 8 global layer visits
+  hold the long-context KV, 16 KiB/token in FP8.
+- 128 experts, top 8, hidden 2304, expert intermediate 1152 (w13 interleaves gate/up
+  rows). Released experts: NVFP4 layers 0-19, MXFP8 layers 20-23.
+- Reasoning is always on to some degree (`reasoning_effort`, minimum "none" in the
+  chat template still reasons a little); the model reasons in English even for
+  Italian prompts. Tool calls: `--tool-call-parser inkling`; reasoning:
+  `--reasoning-parser inkling`.
+- Images: 40 px patches, 2x2 merge: tokens ~ (w/40)*(h/40). A4 at 147 ppi ~1.3k
+  tokens, at 300 ppi 5.5k.
+
+## Why these choices
+
+- **GPTQ, not AWQ**, for the experts: AWQ's input-channel scaling cannot be folded on
+  this architecture (w13's input is shared by all 128 experts and all 3 passes behind
+  one norm; w2's would fold into the up rows through a tanh softcap). The format is
+  still AWQ-layout INT4 g128 asymmetric for Marlin. No bf16 master exists: GPTQ runs on
+  the dequantized NVFP4/MXFP8 weights, ~10-13% weight-space error, judged by output KL.
+- **FP8 E4M3 KV, emulated, instead of int8 per-token-head**: the model is built for a
+  unit-scale FP8 cache (K L2-clipped, V RMS-normalized), the authors' own default on
+  DGX Spark; reuses their layout and numerics. The decode trick that made it cheap:
+  E4M3 bits shifted into FP16 fields are exactly value * 2^-8 (subnormals too), so the
+  attention MMAs run in fp16 and the 2^8 goes into the softmax scale (K) and the
+  output (V). Two earlier decodes (via fp32, via integer bf16 bits) were 2-7x slower.
+- **INT8 attention on a Triton GEMV, not Marlin**: Marlin W8A16 at one token reached
+  ~45% of bandwidth on these small matrices, slower than the bf16 GEMV it replaced.
+  The Triton kernel (derived from Inkling's own `ops/gemv.py`) reaches 80-90%, and
+  projects a full layer's q/k/v (three different inputs) in one launch.
+- **Marlin for the experts**: the best MoE W4A16 kernel available here (see
+  FOLLOWUPS 9).
+- **Prefill chunk 1024**: the sconv state cache reserves KV per chunk token (60%
+  padding on its blocks per upstream analysis); 2048 does not fit a 262k request.
+- **Embeddings via UVA** (HyperQwen's `qwen3_5-embed-uva` mechanism): only the looked-up
+  rows cross PCIe; frees ~23k tokens of KV.
+
+## DSpark (speculative decoding)
+
+- **It is a block drafter: it always drafts 7 tokens** (`num_speculative_tokens` must be
+  the checkpoint's block size - 1). How many the target *verifies* is set separately with
+  vLLM's dynamic speculative decoding, `num_speculative_tokens_per_batch_size`
+  (`start.sh` `SPEC_K`); the runner truncates the drafts.
+- **A verify step is expensive on this MoE**: 1 + k tokens per request touch far more
+  experts than one token (k=7 at one request: Marlin 6.5 ms vs 2.3 ms; the whole step
+  15.2 ms vs 7.5). Long windows only pay on predictable text (struct, quoting); chat and
+  prose want k=2-3. Hence the per-batch-size schedule.
+- **Drafter cost, one request, before the HyperInkling changes: ~2.5 ms of a 7.5 ms
+  step.** Base logits over the full bf16 head (0.93 GB, ~1 ms), seven Markov steps each
+  reading the folded `(vocab, 256)` projection (7 x 103 MB, 0.85 ms), three dense bf16
+  layers (~0.6 ms). Now: base logits through the shared INT8 head, the fold in INT4
+  (`HYPERINKLING_DSPARK_FOLD=w4`), the layers in INT4 g128 RTN (`HYPERINKLING_DRAFT_W4`,
+  `ops/linear_w4.py`). The bf16 head is no longer kept (0.86 GiB back).
+- **Drafter quantization only moves acceptance, never output** (the target verifies every
+  draft). Measured on counting (bench/copy_test.py): 6.7 tokens/step all-bf16, 6.6 with
+  INT8 head + INT4 layers + INT4 fold.
+- **Do not screen the Markov head on the base logits' top-k.** The base logits of later
+  block positions are weak; the right token comes from the Markov bias and is often
+  outside the base top-64 (counting fell from 6.6 to 2.9 tokens/step). And the head has
+  pad rows past `vocab_size` (200,058 of 201,024) that the full path slices off.
+- **Acceptance on free text is low by nature**, not a port bug: the original NVFP4
+  checkpoint with everything bf16 gives the same 2.3 tokens/step at k=7 as ours, and
+  counting reaches 6.7 of 8. Most served tokens are reasoning (English, free text).
+- **Memory with DSpark**: +0.3 GiB of weights (INT4 drafter and fold; its Markov
+  embedding goes to host RAM) and the draft's global layer in the KV (+2 KiB/token in
+  FP8 on the target's 16).
+- **Decode CUDA graphs must be given in requests**, `decode_cudagraph_capture_request_sizes`:
+  the deprecated token sizes `[1..6]` cover no 8-token speculative decode batch, and vLLM
+  then silently runs decode without graphs. A batch larger than every captured size runs
+  eagerly too: `start.sh` derives the sizes from `MAX_SEQS` (every count to 8, then steps).
+  At 12 requests that is 650 vs 381 tok/s against sizes 1-6, for ~1.5k tokens of KV.
+- **A drafter-only INT4 copy of the LM head for the base logits does not pay** (tried
+  2026-11-21): 393 vs 550 us at 7 rows, worse from 21 rows up (the W4 kernel reaches
+  ~500 GB/s against INT8's ~900 on this 201k x 2304 shape), -1.5% step time at one
+  request for 0.23 GiB (~12k tokens of context). Revisit only with a faster W4 GEMV, or
+  as part of an INT4 GPTQ head shared with the target (FOLLOWUPS: unembed INT4).
+- **Drafter KV in FP8 needed the drafter's `Attention` to get a cache config** (without
+  one it is always bf16, whatever `kv_cache_dtype` the speculative config says) and a
+  FlashAttention impl that only writes KV (FlashAttention refuses fp8 on SM8x; the draft
+  attention runs in `block_decode_attention`, which reads the emulated E4M3 cache). Its
+  pages then pack with the target's instead of being padded to them.
+- **Where a 262k request's KV goes** (DSpark, NBT 1024, blocks of 1.125 MiB): global
+  layers 4.50 GiB, sconv state 1.70 GiB (6 groups x 258 blocks: two in-flight chunks of
+  1024 under async scheduling), SWA windows 0.27, draft windows 0.06. With one step in
+  flight (`--no-async-scheduling`, `start.sh` `ASYNC=0`) the sconv and SWA reserves halve
+  (~55k more tokens) for -3 to -4% decode. With DSpark and the vision tower on the GPU a
+  262k request needs it (213k fits with async on, 268k without; docs/memory_matrix.tsv).
+  The profiled page size barely matters (A4 at 300 ppi: 215k with async on, at 150 ppi
+  213k).
+- **Measure the context limit in two boots.** vLLM checks it before the warmup (without
+  the transient activations and CUDA graphs, ~1.5 GiB here) and after. A limit far too
+  large fails at the first check with an optimistic estimate (315k where 213k is real);
+  boot again at that estimate to get the real one (`bench/memory_matrix.sh`).
+- **Vision tower in host RAM** (`HYPERINKLING_VISION_HOST=1`, each layer copied in before
+  it runs): +27 ms per A4 page at 150 ppi, and as much context as no vision at all.
+- **vLLM's adaptive verification does not run on Inkling**: it needs decode graphs with
+  per-request query lengths, and `InklingSconvBackend` declares none. What would have to
+  change (sconv builder, the decode combine kernel's row bound, ...) is mapped in a code
+  investigation, see FOLLOWUPS. `adaptive_k.py` chooses one length per step instead.
+- basalt (jesdga95/basalt, MIT, Blackwell only) runs the same drafter: its draft policy
+  picks each window by expected tokens per ms, from stated per-draft chances
+  (`include/basalt/spec/draft_policy.hpp`); vLLM's `enable_adaptive_verification` is the
+  same idea.
+
+## Gotchas met
+
+- **Padding rows broke the sconv tile skip** (upstream code): above 256 tokens `_sconv_kernel`
+  skips the cache loads of a tile unless its last row's request starts within W-1 rows, and
+  padding rows had `query_start = 0`. A padded batch whose real tokens end mid-tile lost
+  the cache taps of the last request. Padding rows now start at `num_actual_tokens`
+  (`inkling/nvidia/ops/sconv.py`; `tests/test_sconv_padding.py`).
+- **`git am` drops a bracketed subject prefix**: `scripts/setup-vllm.sh` uses
+  `--keep-non-patch`, or the commit loses `[hyperinkling]` and `build-image.sh` refuses it.
+
+- **Images above the profiled size hang forever.** vLLM accepts an image only if it fits
+  the encoder compute budget, max(prefill chunk, largest profiled image). Inkling
+  profiled 2048 px squares (2704 tokens) and `--limit-mm-per-prompt` width/height can
+  only shrink that, so an A4 page at 300 ppi (5488 tokens) passed validation and then
+  waited with no error. Fixed in `processing.py` (the override can grow the profiled
+  page up to 4096 px); `start.sh` profiles 2480x3508 and sets
+  `--encoder-cache-size 16384`.
+- **The KV CPU tier needs prefix caching on**; it worked first time with Inkling's
+  hybrid groups.
+- **KL: compare medians.** One request at a time the same transcript scored twice on one
+  server still differs from the first positions (~0.003 in logprob; Marlin MoE is bitwise
+  repeatable, `tests/test_determinism.py`); where that flips an expert the difference
+  carries down the sequence. The original against itself: median 0.0003, mean 0.060 (0.069
+  6-way batched). Image-pad positions must be excluded (token id 200054; prompt_logprobs
+  are keyed by token id).
+- **Doubling calibration (332k tokens) changed nothing** measurable vs 166k.
+- **`--uvicorn-log-level warning` hides "Application startup complete"**: wait on
+  `GET /health` instead. Every wait gets a deadline.
+- **`pkill -f '<pattern>'` kills the calling shell** when the pattern is in its own
+  command line: use `pgrep -f '[v]env/bin/vllm serve'`.
+- **Nsight `stop_profile` blocks for a minute or more** while the report is written; the
+  server keeps serving. A killed API server under nsys can linger without the GPU:
+  check `nvidia-smi --query-compute-apps` and the port owner before trusting a restart.
+- **Client-side benchmarks with a shared prefix under-report prefill**: most of the prompt
+  is served by the cache. Use `bench/metrics_window.py` for server-side numbers.
+- **Mean TTFT under 6-way load is mostly queueing** when more than `MAX_SEQS` requests
+  are offered.
+
+## Data
+
+- Calibration sources (one file each, `data/calib-src`): NousResearch/hermes-function-
+  calling-v1 (Apache-2.0), pixparse/docvqa-single-page-questions (MIT),
+  ise-uiuc/Magicoder-Evol-Instruct-110K (Apache-2.0), wikimedia/wikipedia 20231101.it
+  (CC-BY-SA), HuggingFaceH4/ultrachat_200k (MIT).
+- `bench/quality_battery.py` and `bench/extract_bench.py` run on public data
+  (`bench/quality-data/`, downloaded by `quality_battery.py download`).

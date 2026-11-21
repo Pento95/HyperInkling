@@ -1,0 +1,186 @@
+#!/bin/bash
+# HyperInkling: Inkling 2 Mini on one RTX 3090 / 3090 Ti (sm86), single entry point.
+#
+#   ./start.sh                      # foreground; run it inside tmux
+#   PORT=18020 KV_OFFLOAD_GB=0 ./start.sh
+#
+# Every knob below is an env var with the measured default. The weights are
+# models/Inkling-2-Mini-W4A16-g128-gptq (experts INT4 g128 GPTQ, see prepare/);
+# attention, LM head and token embeddings become INT8 at load time.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO"
+
+MODEL=${MODEL:-$REPO/models/Inkling-2-Mini-W4A16-g128-gptq}
+SERVED_NAME=${SERVED_NAME:-inkling-2-mini}
+# Local only by default. HOST=0.0.0.0 serves the network: set VLLM_API_KEY too, or put
+# the server behind something that authenticates (a VPN, a reverse proxy).
+HOST=${HOST:-127.0.0.1}
+PORT=${PORT:-8080}
+MAX_SEQS=${MAX_SEQS:-6}
+# Speculative decoding with the bundled DSpark drafter (on unless SPEC=off). The
+# block drafter always drafts 7 tokens; SPEC_K says how many of them the target
+# verifies, by batch size: [first, last, k] ranges. Measured 2026-11-21: k=4 for
+# 1-2 requests, k=3 for 3-6 (bench/spec_bench.py; a verify step touches ~6x the
+# experts of a plain step, so long windows only pay on predictable text).
+SPEC=${SPEC:-dspark}
+SPEC_K=${SPEC_K:-[[1,2,4],[3,6,3]]}
+# Drafts sampled from the draft distribution (as the reference) rather than
+# greedy: at temperature 0.2-0.5 struct went 264 -> 314 tok/s, 6-way 444 -> 465.
+SPEC_DRAFT=${SPEC_DRAFT:-probabilistic}
+# Experimental: the verify length chosen online per step (adaptive_k.py), from
+# these candidates, e.g. 1,2,3,4,5,7. +1-3% at the cost of ~7k tokens of KV
+# (one CUDA graph per candidate and batch size). Empty = the SPEC_K schedule.
+export HYPERINKLING_SPEC_ADAPTIVE=${HYPERINKLING_SPEC_ADAPTIVE:-}
+# Extra speculative-config fields, as a JSON fragment starting with a comma.
+SPEC_OPTS=${SPEC_OPTS:-}
+MAX_LEN=${MAX_LEN:-262144}       # per request
+# Async scheduling keeps two steps in flight, and every sliding-window and sconv
+# cache reserves both steps' chunk tokens (the sconv state alone: 0.85 GiB per step
+# at NBT 1024). ASYNC=0 keeps one step in flight: ~55k more tokens for the longest
+# request, -3 to -4% decode (measured 2026-11-21; docs/memory_matrix.tsv). ASYNC=auto
+# turns it off with DSpark above 192k; scripts/wizard.py picks from the measured table.
+ASYNC=${ASYNC:-auto}
+if [ "$ASYNC" = auto ]; then
+	if [ "$SPEC" = dspark ] && [ "$MAX_LEN" -gt 196608 ]; then ASYNC=0; else ASYNC=1; fi
+fi
+# Prefill chunk. Measured under 6-way load (2026-11-21): 1024 vs 512 = +22%
+# prefill speed, same decode, KV 281k vs 386k tokens (the sconv cache reserves
+# a slot per chunk token). 2048 no longer fits a 262k request.
+NBT=${NBT:-1024}
+GPU_UTIL=${GPU_UTIL:-0.95}
+KV_DTYPE=${KV_DTYPE:-fp8}        # unit-scale E4M3, emulated on sm86 (ops/fp8_emu.py)
+# CPU prefix-cache tier in /dev/shm, GiB; 0 disables. auto: 60% of RAM minus 8 GiB, at most
+# 36 and at most what /dev/shm has free (the wizard's default).
+KV_OFFLOAD_GB=${KV_OFFLOAD_GB:-auto}
+# SSE comment every N s while a request waits for its first token: a 262k prefill takes
+# over a minute, and clients with a read timeout would drop it. 0 disables.
+SSE_KEEPALIVE=${SSE_KEEPALIVE:-30}
+IMAGES=${IMAGES:-50}             # images per request
+# Largest image profiled: A4 at ~150 ppi (1,333 tokens). Larger images are scaled
+# down to this many 40 px cells (HYPERINKLING_IMAGE_MAX_CELLS) instead of hanging.
+# A4 at 300 ppi: IMAGE_MAX_W=2480 IMAGE_MAX_H=3508 ENCODER_CACHE=16384.
+IMAGE_MAX_W=${IMAGE_MAX_W:-1240}
+IMAGE_MAX_H=${IMAGE_MAX_H:-1760}
+MM_CACHE_GB=${MM_CACHE_GB:-6}
+# Encoder output kept on the GPU, in tokens (~4.6 KB each): ~6 pages. It must hold
+# the largest image; vLLM's default (the prefill chunk) would reject a page.
+ENCODER_CACHE=${ENCODER_CACHE:-8192}
+CPUS=${CPUS:-0-$(( $(nproc) > 1 ? $(nproc) - 2 : 0 ))}   # leave one hardware thread free
+
+[ -d "$MODEL" ] || { echo "[start] model not found: $MODEL" >&2; exit 1; }
+
+# HyperInkling load-time conversions (vllm/models/inkling2/nvidia, branch hyperinkling/sm86).
+export HYPERINKLING_ATTN_W8=${HYPERINKLING_ATTN_W8:-1}
+export HYPERINKLING_HEAD_W8=${HYPERINKLING_HEAD_W8:-1}
+export HYPERINKLING_EMBED_W8=${HYPERINKLING_EMBED_W8:-1}
+export HYPERINKLING_EMBED_UVA=${HYPERINKLING_EMBED_UVA:-1}
+# Vision tower weights in host RAM, copied in layer by layer per image: ~34k tokens of
+# context, +27 ms per A4 page.
+export HYPERINKLING_VISION_HOST=${HYPERINKLING_VISION_HOST:-0}
+export HYPERINKLING_IMAGE_MAX_CELLS=$(( ((IMAGE_MAX_W + 39) / 40) * ((IMAGE_MAX_H + 39) / 40) ))
+# DSpark drafter: layers in INT4 g128 (round to nearest), and its Markov head's
+# folded LM-head projection in INT4; the drafts come from the shared INT8 head.
+export HYPERINKLING_DRAFT_W4=${HYPERINKLING_DRAFT_W4:-1}
+export HYPERINKLING_DSPARK_FOLD=${HYPERINKLING_DSPARK_FOLD:-w4}
+# Log a warning when no engine step completes for this many seconds while requests are
+# live (a wedged engine is otherwise silent); 0 disables.
+export VLLM_ENGINE_STALL_SENTINEL_S=${VLLM_ENGINE_STALL_SENTINEL_S:-60}
+# Drafter KV as the target's unit-scale E4M3 (bf16 otherwise): 2 KiB/token back.
+export HYPERINKLING_DRAFT_KV_FP8=${HYPERINKLING_DRAFT_KV_FP8:-1}
+# nvcc 13.3 rejects gcc 16 (Fedora 44): FlashInfer's JIT builds use gcc-15 where the
+# system compiler is newer and gcc-15 is installed (not needed in the container).
+if command -v gcc-15 > /dev/null && command -v g++-15 > /dev/null; then
+	export CC=gcc-15 CXX=g++-15 NVCC_PREPEND_FLAGS="-ccbin $(command -v g++-15)"
+fi
+
+if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${PORT}$"; then
+	echo "[start] port $PORT is already in use: another server is up. Not starting." >&2
+	exit 1
+fi
+if ! pgrep -f '[v]llm serve' > /dev/null; then
+	for f in /dev/shm/vllm_offload_*.mmap /dev/shm/VLLM_OBJECT_STORAGE_SHM_BUFFER_*; do
+		[ -e "$f" ] || continue
+		echo "[start] removing orphaned $f ($(du -h "$f" | cut -f1))"
+		rm -f "$f"
+	done
+fi
+
+if [ "$KV_OFFLOAD_GB" = auto ]; then
+	ram=$(awk '/^MemTotal:/ {print int($2 / 1048576)}' /proc/meminfo)
+	shm=$(( $(df -B1 --output=avail /dev/shm | tail -n1 | tr -d ' ') / 1073741824 ))
+	KV_OFFLOAD_GB=$(( ram * 6 / 10 - 8 ))
+	[ "$KV_OFFLOAD_GB" -gt 36 ] && KV_OFFLOAD_GB=36
+	[ "$KV_OFFLOAD_GB" -gt "$shm" ] && KV_OFFLOAD_GB=$shm
+	[ "$KV_OFFLOAD_GB" -lt 0 ] && KV_OFFLOAD_GB=0
+fi
+
+args=(--sse-keep-alive-interval "$SSE_KEEPALIVE")
+if [ "$KV_OFFLOAD_GB" != 0 ]; then
+	need=$((KV_OFFLOAD_GB * 1073741824))
+	avail=$(df -B1 --output=avail /dev/shm | tail -n1 | tr -d ' ')
+	if [ "$avail" -lt "$need" ]; then
+		echo "[start] KV_OFFLOAD_GB=$KV_OFFLOAD_GB needs that much free in /dev/shm," \
+			"only $((avail / 1073741824)) GiB is free." >&2
+		exit 1
+	fi
+	args+=(--kv-offloading-size "$KV_OFFLOAD_GB")
+fi
+[ -n "${VLLM_API_KEY:-}" ] && args+=(--api-key "$VLLM_API_KEY")
+# In the container the port mapping (compose BIND) decides who can reach it.
+if [ "$HOST" != 127.0.0.1 ] && [ "$HOST" != localhost ] && [ -z "${VLLM_API_KEY:-}" ] \
+	&& [ ! -f /.dockerenv ]; then
+	echo "[start] warning: serving $HOST without VLLM_API_KEY: anyone who reaches this port can use it." >&2
+fi
+[ "$ASYNC" = 0 ] && args+=(--no-async-scheduling)
+# Decode CUDA graphs by request count: every count up to 8, then coarser steps up to
+# MAX_SEQS (a batch runs in the next larger graph; one without a graph runs eagerly).
+if [ -z "${GRAPH_SIZES:-}" ]; then
+	GRAPH_SIZES=$(for n in 1 2 3 4 5 6 7 8 12 16 24 32 40 48 56 64; do
+		[ "$n" -lt "$MAX_SEQS" ] && echo "$n"; done; echo "$MAX_SEQS")
+	GRAPH_SIZES=$(echo $GRAPH_SIZES | tr ' ' ,)
+fi
+case "$SPEC" in
+dspark) args+=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"num_speculative_tokens_per_batch_size\":$SPEC_K,\"draft_sample_method\":\"$SPEC_DRAFT\"$SPEC_OPTS}") ;;
+off) ;;
+*) echo "[start] SPEC must be dspark or off, not '$SPEC'" >&2; exit 1 ;;
+esac
+
+# PROFILE=<name>: run under Nsight Systems. Nothing is recorded until
+# `curl -X POST http://127.0.0.1:$PORT/start_profile`; `/stop_profile` ends the
+# capture and writes .local/prof/<name>.nsys-rep (CUDA kernels, including the
+# ones replayed inside CUDA graphs, and NVTX).
+wrap=()
+if [ -n "${PROFILE:-}" ]; then
+	mkdir -p "$REPO/.local/prof"
+	wrap=(nsys profile -o "$REPO/.local/prof/$PROFILE" --force-overwrite true
+		--trace cuda,nvtx --cuda-graph-trace node
+		--capture-range cudaProfilerApi --capture-range-end stop)
+	args+=(--profiler-config '{"profiler":"cuda"}')
+fi
+
+echo "=================================================="
+echo "HyperInkling: $(basename "$MODEL") as '$SERVED_NAME' on $HOST:$PORT"
+echo "Context $MAX_LEN/request, $MAX_SEQS concurrent, prefill chunk $NBT, async scheduling $ASYNC"
+echo "KV $KV_DTYPE, prefix cache on, CPU tier ${KV_OFFLOAD_GB} GiB"
+echo "Speculation: $SPEC$([ "$SPEC" = dspark ] && echo ", $SPEC_DRAFT drafts, verify k ${HYPERINKLING_SPEC_ADAPTIVE:+adaptive over $HYPERINKLING_SPEC_ADAPTIVE}${HYPERINKLING_SPEC_ADAPTIVE:-by batch size $SPEC_K}")"
+echo "INT8: attention=$HYPERINKLING_ATTN_W8 head=$HYPERINKLING_HEAD_W8" \
+	"embed=$HYPERINKLING_EMBED_W8 (host RAM: $HYPERINKLING_EMBED_UVA)"
+echo "Images: up to $IMAGES/request, ${IMAGE_MAX_W}x${IMAGE_MAX_H} profiled, larger ones scaled to $HYPERINKLING_IMAGE_MAX_CELLS cells, vision tower $([ "$HYPERINKLING_VISION_HOST" = 1 ] && echo 'in host RAM' || echo 'on the GPU')"
+echo "=================================================="
+
+# The native install's venv; the container has vllm on PATH.
+[ -f "$REPO/venv/bin/activate" ] && source "$REPO/venv/bin/activate"
+exec taskset -c "$CPUS" "${wrap[@]}" vllm serve "$MODEL" \
+	--served-model-name "$SERVED_NAME" --host "$HOST" --port "$PORT" \
+	--max-model-len "$MAX_LEN" --max-num-seqs "$MAX_SEQS" \
+	--max-num-batched-tokens "$NBT" --gpu-memory-utilization "$GPU_UTIL" \
+	--kv-cache-dtype "$KV_DTYPE" --enable-prefix-caching \
+	--reasoning-parser inkling --enable-auto-tool-choice --tool-call-parser inkling \
+	--structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}' \
+	--limit-mm-per-prompt "{\"image\":{\"count\":$IMAGES,\"width\":$IMAGE_MAX_W,\"height\":$IMAGE_MAX_H}}" \
+	--mm-processor-cache-type shm --mm-processor-cache-gb "$MM_CACHE_GB" \
+	--encoder-cache-size "$ENCODER_CACHE" \
+	--compilation-config "{\"mode\":0,\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"decode_cudagraph_capture_request_sizes\":[$GRAPH_SIZES]}" \
+	--disable-uvicorn-access-log --uvicorn-log-level warning \
+	"${args[@]}" ${EXTRA_ARGS:-}

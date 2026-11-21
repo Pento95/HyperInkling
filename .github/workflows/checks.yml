@@ -1,0 +1,28 @@
+# No GPU here: the patch applies to its base, the Python lints, the wizard runs.
+name: checks
+on: [push, pull_request]
+
+jobs:
+  patch-applies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply the patch to patches/BASE
+        run: |
+          git config --global user.email ci@localhost
+          git config --global user.name ci
+          scripts/setup-vllm.sh
+          # scripts/build-image.sh refuses a checkout whose HEAD lost this prefix
+          git -C vllm log -1 --format=%s | grep -q '^\[hyperinkling\]'
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: check bench prepare tests scripts
+      - name: shell syntax
+        run: for f in start.sh scripts/*.sh bench/*.sh prepare/*.sh; do bash -n "$f"; done
+      - name: wizard with every default
+        run: yes '' | python3 scripts/wizard.py --print
