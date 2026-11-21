@@ -21,6 +21,10 @@ x-gpu: &gpu
 services:
   prepare:
     image: ${IMAGE:-ghcr.io/pento95/hyperinkling:0.1.0}
+    # The checkpoint in ./models belongs to the host user (the wizard writes UID/GID).
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      HF_HOME: /app/models/.hf-home
     entrypoint: ["/bin/bash", "-c"]
     command:
       - >-
@@ -29,7 +33,6 @@ services:
         --local-dir /app/models/${CHECKPOINT:-Inkling-2-Mini-W4A16-g128-gptq}
     volumes:
       - ./models:/app/models
-      - hf-cache:/cache
 
   hyperinkling:
     image: ${IMAGE:-ghcr.io/pento95/hyperinkling:0.1.0}
@@ -56,5 +59,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  hf-cache:
   jit-cache:

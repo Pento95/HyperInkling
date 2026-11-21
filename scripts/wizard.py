@@ -13,6 +13,7 @@ Standard library only, so it runs wherever Python 3.9+ does (Linux, macOS, Windo
 
 import argparse
 import csv
+import os
 import secrets
 import sys
 from pathlib import Path
@@ -242,6 +243,8 @@ def main():
         env["IMAGES"] = 0
     if vision == "host":
         env["HYPERINKLING_VISION_HOST"] = 1
+    if hasattr(os, "getuid"):  # compose's prepare writes ./models as this user
+        env["UID"], env["GID"] = os.getuid(), os.getgid()
     if expose == "y":
         env["BIND"] = "0.0.0.0"  # Docker: the published port
         env["HOST"] = "0.0.0.0"  # native start.sh
@@ -258,6 +261,8 @@ def main():
             print("Not written.")
         else:
             dest.write_text(text)
+            # Docker would create a missing bind-mount source as root.
+            (REPO / "models").mkdir(exist_ok=True)
             print(f"Written {dest}")
     print("\nStart it:  docker compose up -d     (logs: docker compose logs -f)")
     exports = " ".join(f"{k}={v}" for k, v in env.items())
