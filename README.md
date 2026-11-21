@@ -52,6 +52,9 @@ should work where CUDA 13 and a gcc it accepts are installed; that is best effor
 
 ## Speed (RTX 3090 Ti, 2026-11-21)
 
+Measured on an RTX 3090 Ti undervolted to 350 W, with
+[gpu-unlock](https://github.com/zagitta/gpu-unlock) active; KV cache FP8 E4M3.
+
 Decode speed of one request, by kind of text (`bench/spec_bench.py`, temperature 0.2 for
 structured output and 0.5 for the rest, reasoning on):
 
@@ -82,10 +85,10 @@ DSpark is lossless: the target verifies every draft. It helps most where the tex
 predictable (structured output, code, quoting) and least on free prose, because a verify step
 on a mixture-of-experts model reads many more experts than a plain step (NOTES.md).
 
-Prefill: ~4,300 tok/s for one request on long prompts. The numbers are with the GPU's bf16
-tensor cores unlocked by [gpu-unlock](https://github.com/zagitta/gpu-unlock) (102 TFLOPS on a
-cuBLAS GEMM instead of ~40): that changes prefill, not decode, which is bandwidth-bound. A
-stock card prefills slower; decode is the same.
+Prefill: ~5,500 tok/s for one 14.5k-token prompt, ~5,600 tok/s aggregate with 6 at once
+(with or without DSpark). gpu-unlock raises the bf16 tensor-core rate (102 TFLOPS on a cuBLAS
+GEMM instead of ~40): that changes prefill, not decode, which is bandwidth-bound. A stock card
+prefills slower; decode is the same.
 
 ## Context and the knobs that trade it
 

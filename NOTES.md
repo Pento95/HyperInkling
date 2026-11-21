@@ -4,7 +4,7 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
 
 ## Machine
 
-- RTX 3090 Ti (sm86), 24 GiB, 350 W limit; bf16 tensor cores unlocked: 102 TFLOPS
+- RTX 3090 Ti (sm86), 24 GiB, undervolted to 350 W; bf16 tensor cores unlocked: 102 TFLOPS
   measured on a cuBLAS GEMM (stock ~40), 904 GB/s copy bandwidth. Decode is
   bandwidth-bound; the unlock helps prefill.
 - 16 cores / 32 threads: builds and servers are pinned to CPUs 0-30 (`taskset`).

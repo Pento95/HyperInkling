@@ -68,26 +68,28 @@ items each; about +-1.3 points of noise):
 
 ## Speed with HyperInkling (RTX 3090 Ti)
 
-| | without speculative decoding | with the bundled DSpark drafter |
+Measured on an RTX 3090 Ti undervolted to 350 W, with
+[gpu-unlock](https://github.com/zagitta/gpu-unlock) active (it raises prefill, not decode).
+KV cache FP8 E4M3.
+
+| | without DSpark | with DSpark (default) |
 |---|---|---|
-| one request, decode (long prompts) | 128 tok/s | 214 tok/s |
-| one request, structured output | 135 tok/s | ~310 tok/s |
+| prefill, one 14.5k-token prompt | 5,550 tok/s | 5,470 tok/s |
+| prefill, 6 prompts at once, aggregate | 5,600 tok/s | 5,570 tok/s |
+| decode, one request, prose | 134 tok/s | 141 tok/s |
+| decode, one request, long documents (13k-token prompts) | 128 tok/s | 214 tok/s |
+| decode, one request, structured output | 135 tok/s | ~310 tok/s |
+| decode, 6 requests, prose, aggregate | 428 tok/s | 436 tok/s |
 
 ## Maximum context with HyperInkling (RTX 3090 Ti)
 
-Longest single request with 6 requests served at once, KV cache at 8 bits. The vision
-tower can run on the GPU, stream from host RAM (+27 ms per A4 page), or be left out (text
-only); turning async scheduling off frees context for -3 to -4% decode.
+Longest single request, 6 requests served at once, KV cache FP8 E4M3 (8 bits).
 
 | vision tower | DSpark, async on | DSpark, async off | no DSpark, async on | no DSpark, async off |
 |---|---|---|---|---|
 | on the GPU | 213k | **268k** (default) | 291k | 345k |
 | in host RAM | 249k | 302k | 331k | 386k |
 | none (text only) | 249k | 302k | 336k | 386k |
-
-Fewer requests at once leave a little more (279k with DSpark and the vision tower on the GPU
-at 1 request). Above ~262k it is best effort, as far as the 24 GiB allow, not the model's 1M.
-HyperInkling's wizard picks the setting from this table.
 
 ## Use
 
