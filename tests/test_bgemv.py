@@ -30,7 +30,7 @@ def _bench(fn, n=200):
 
 
 @pytest.mark.parametrize("streams", [3, 4])
-@pytest.mark.parametrize("tokens", [1, 6, 16])
+@pytest.mark.parametrize("tokens", [1, 6, 16, 32, 48, 64])
 def test_bgemv(streams, tokens):
     torch.manual_seed(0)
     down = (torch.randn(streams, RANK, 2 * WIDTH, device="cuda") * 0.02).to(torch.bfloat16)
@@ -53,7 +53,7 @@ def test_bgemv(streams, tokens):
 
 
 @pytest.mark.parametrize("streams", [3, 4])
-@pytest.mark.parametrize("tokens", [1, 6, 16])
+@pytest.mark.parametrize("tokens", [1, 6, 16, 32, 48, 64])
 def test_controller_gemv(streams, tokens):
     torch.manual_seed(0)
     down = (torch.randn(streams, RANK, 2 * WIDTH, device="cuda") * 0.02).to(torch.bfloat16)

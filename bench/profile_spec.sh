@@ -19,9 +19,9 @@ curl -sf --max-time 2 "localhost:$PORT/health" > /dev/null || { echo "server fai
 steps() { curl -s "localhost:$PORT/metrics" | awk 'index($0,"vllm:iteration_tokens_total_count{")==1 {s+=$NF} END {print s+0}'; }
 venv/bin/python scripts/quick_bench.py "$conc" 64 "$PORT" > /dev/null
 curl -s -X POST "localhost:$PORT/start_profile"
-s0=$(steps)
+s0=$(steps); t0=$(date +%s.%N)
 venv/bin/python scripts/quick_bench.py "$conc" "$tokens" "$PORT" | grep conc
-s1=$(steps)
+s1=$(steps); t1=$(date +%s.%N)
 curl -s -X POST --max-time 600 "localhost:$PORT/stop_profile"
 for p in $(pgrep -f '[v]env/bin/vllm serve'); do kill "$p"; done
 while pgrep -f '[v]env/bin/vllm serve' > /dev/null; do sleep 1; done
@@ -29,7 +29,9 @@ nsys stats -q --report cuda_gpu_kern_sum --format csv ".local/prof/$name.nsys-re
 import csv, sys
 rows = list(csv.DictReader(sys.stdin)); steps = max($s1 - $s0, 1)
 tot = sum(float(r['Total Time (ns)']) for r in rows)
-print(f'{steps} steps, kernels {tot / steps / 1e6:.2f} ms/step')
+wall = ($t1 - $t0) / steps * 1e3
+# Wall time includes the profiler's overhead; the gap to the kernel time is the GPU idle.
+print(f'{steps} steps, wall {wall:.2f} ms/step, kernels {tot / steps / 1e6:.2f} ms/step')
 for r in rows[:${TOP:-25}]:
     print(f\"{float(r['Total Time (ns)']) / steps / 1e3:8.1f} us/step {int(r['Instances']) / steps:6.1f}x {float(r['Avg (ns)']) / 1e3:7.1f}us  {r['Name'][:90]}\")
 "

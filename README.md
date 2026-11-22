@@ -74,6 +74,18 @@ Decode with short prompts (~30 tokens in, 512 out, greedy; `bench/profile_spec.s
 Each step reads the experts the batch routes to: ~17 of 128 per layer visit for one request,
 ~60 for 6, ~90 for 16 (measured on real routing), so more requests cost little more per step.
 
+Prompt processing (prefill), 14.5k-token prompts, context limit 262k:
+
+| prompts at once | 1 | 6 |
+|---|---|---|
+| prefill, aggregate | 5,500 tok/s | 5,600 tok/s |
+| prefill, aggregate, `NBT=2048` (context limit 65k: 2048 does not fit 262k) | 6,050 tok/s | 6,050 tok/s |
+
+One prompt already fills the GPU (prefill is compute-bound), so 6 at once share the same
+~5,600 tok/s. gpu-unlock raises the bf16 tensor-core rate (102 TFLOPS on a cuBLAS GEMM instead
+of ~40): that changes prefill, not decode, which is bandwidth-bound. A stock card prefills
+slower; decode is the same.
+
 Decode of one request, by kind of text (`bench/spec_bench.py`, temperature 0.2 for structured
 output and 0.5 for the rest, reasoning on):
 
@@ -85,12 +97,6 @@ output and 0.5 for the rest, reasoning on):
 | prose | 135 | ~155 |
 | questions over a document, quoting it | 133 | ~275 |
 | copying a 120-line table from a 50k-token document (greedy) | not measured | **~490** |
-
-Prefill: ~5,500 tok/s for one 14.5k-token prompt and ~5,600 tok/s **aggregate** with 6 at once
-(with or without DSpark; context limit 262k): one prompt already fills the GPU. With
-`NBT=2048`: 6,050 tok/s both (at a 65k limit: 2048 does not fit 262k). gpu-unlock raises the
-bf16 tensor-core rate (102 TFLOPS on a cuBLAS GEMM instead of ~40): that changes prefill, not
-decode, which is bandwidth-bound. A stock card prefills slower; decode is the same.
 
 Long prompts are bound by that prefill (AA-LCR documents, 256 to 64k tokens, mean 12k; 512
 tokens out, so 24 prompt tokens per generated one; `bench/evalscope_perf.sh`, 10 minutes each).
