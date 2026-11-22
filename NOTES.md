@@ -43,6 +43,13 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   E4M3 bits shifted into FP16 fields are exactly value * 2^-8 (subnormals too), so the
   attention MMAs run in fp16 and the 2^8 goes into the softmax scale (K) and the
   output (V). Two earlier decodes (via fp32, via integer bf16 bits) were 2-7x slower.
+- **Where a decode step goes** (nsys, `bench/profile_spec.sh`, 2026-11-22, 6 requests, 22.4
+  ms): Marlin experts 12.0 ms (at bandwidth: ~60 of 128 experts per layer visit, measured
+  on captured routing; same-domain requests share only ~7% more), `_w8_kernel` 3.6 ms
+  (qkvr, o, the LM head: the small matrices stay at 300-500 GB/s whatever the tile),
+  drafter W4 1.4 ms, attention 0.8 ms, the loop's small kernels ~3 ms. The GPU is never
+  idle (wall within 1 ms of kernel time) except the 1.5 ms per step of synchronous
+  scheduling at one request (async off at 262k).
 - **INT8 attention on a Triton GEMV, not Marlin**: Marlin W8A16 at one token reached
   ~45% of bandwidth on these small matrices, slower than the bf16 GEMV it replaced.
   The Triton kernel (derived from Inkling's own `ops/gemv.py`) reaches 80-90%, and

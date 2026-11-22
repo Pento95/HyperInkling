@@ -67,6 +67,10 @@ dropped ideas are at the end, with the reason, so they are not re-tried blind.
     which the single launch loses to (`bench/w4_gemv.py`). The remaining cost is the
     nibble unpack and conversion; a faster kernel there helps 11 and 12.
 
+14b. **Release the W8 tiles and bgemv to 64 rows** [NS]: in the patch (-7% step at 6
+    requests, -9% at 16), not in the 0.1.1 image; README speed tables still show 0.1.1.
+    Goes in 0.1.2 with the next changes.
+
 ### Quality and measurement
 
 14. **Run-to-run nondeterminism** [NS]: the same request scored twice on one server differs
