@@ -125,15 +125,15 @@ The wizard reads that table; these are the defaults and what each knob costs or 
 
 | knob | default | what it does | context / VRAM | speed |
 |---|---|---|---|---|
-| `SPEC` | `dspark` | speculative decoding with the bundled drafter | ~80k tokens less for the longest request (213k vs 291k at the same scheduling, vision on the GPU) | 1.3-2.3x decode on one request |
-| `MAX_LEN` | 262144 | longest request | with DSpark, every 100k allowed costs ~3k tokens of KV (the drafter's RoPE table) | none |
-| `ASYNC` | `auto` (off with DSpark above 192k) | async scheduling (two steps in flight) | off: ~55k tokens more for the longest request | off: -3 to -4% decode |
+| `SPEC` | `dspark` | speculative decoding with the bundled drafter | ~90k tokens less for the longest request (291k vs 379k, async on, vision on the GPU) | 1.3-2.3x decode on one request |
+| `MAX_LEN` | `auto` | longest request: `auto` is what the KV cache holds after warmup; a number caps it (and the boot fails if it does not fit) | none | none |
+| `ASYNC` | 1 | async scheduling (two steps in flight) | off: ~12k tokens more for the longest request | off: -3 to -4% decode |
 | `IMAGES` | 50 | images per request; 0 = no vision tower | 0: ~34k tokens more | no images |
 | `HYPERINKLING_VISION_HOST` | 0 | vision tower weights in host RAM, copied to the GPU layer by layer per image | 1: ~34k tokens more (as much as no vision) | +27 ms per A4 page (0.39 s vs 0.37 s to first token for one page) |
 | `IMAGE_MAX_W` / `_H` | 1240 x 1760 | largest image (A4 at 150 ppi, 1,364 tokens); larger ones are scaled down to it | A4 at 300 ppi (2480 x 3508, with `ENCODER_CACHE=16384`): about the same context, but each page costs ~4x the tokens | 300 ppi: ~4x the prefill per page |
 | `MAX_SEQS` | 6 | requests at once | longest request with DSpark: 279k at 1, 268k at 6, 257k at 16, 228k at 64 | 6 -> 16 requests: ~430 -> 785 tok/s decode aggregate |
 | `KV_OFFLOAD_GB` | `auto` (60% of RAM - 8 GiB, at most 36) | prefix-cache tier in host RAM (`/dev/shm`) | host RAM only | evicted prefixes come back in 0.1 s instead of seconds |
-| `NBT` | 1024 | prefill chunk | 2048: ~68k tokens less (268k -> 200k), async off; 512: more | 2048: +7-8% prefill (6,050 vs 5,610 tok/s), same decode; 512: -22% prefill |
+| `NBT` | 1024 | prefill chunk | 2048: ~20k tokens less | 2048: +7-8% prefill (6,050 vs 5,610 tok/s), same decode; 512: -22% prefill |
 | `HYPERINKLING_SPEC_ADAPTIVE` | `2,4,7` | verify length chosen per step from these; empty = the fixed `SPEC_K` schedule | ~5k tokens (1,2,3,4,5,7: ~14k) | with the lookup: +41-43% copying, +20% at 6 requests |
 | `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context, fused with DSpark's (lossless) | 6 MB | +7-13% while copying |
 | `SPEC_K` | `[[1,2,4],[3,6,3]]` | drafts verified per step, by batch size, when the adaptive length is off | none | |

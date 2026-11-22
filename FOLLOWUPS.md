@@ -7,7 +7,8 @@ fetched with `hf download --include` only when chosen.
 | phase | items | then |
 |---|---|---|
 | 2, the checkpoint (alternatives, after the post) | 8, 11, 12, 14, 33 | new files on HF |
-| 3, context (best effort) | 54, 38 | |
+| 3, context (best effort) | 54 (with 53) | |
+| after the post | 38 | |
 | 4, speed and polish | 41, 9, 35, 13 (+37), 10, 34, 53, 51, 52, 50, in this order | Reddit post |
 
 Released: `ghcr.io/pento95/hyperinkling:0.1.1` (compose default), the HF checkpoint (its README
@@ -58,13 +59,11 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     needs a 4-bit column.
 19. **Least-routed experts in host RAM when the context needs room** [BS]: the way toward
     1M without DSpark and without the vision tower on the GPU.
-54. **`MAX_LEN=auto` by default** (proposed): `--max-model-len -1` fits the longest request
-    after warmup, so a boot never fails for context and the wizard no longer computes it.
-    Needs the drafter's RoPE table sized independently of the starting length (today it
-    follows `max_model_len`: ~3k tokens of KV per 100k, ~25k from the model's 1M); `ASYNC`
-    becomes an explicit choice (async on: +3-4% decode, ~12k tokens), and
-    `bench/memory_matrix.sh` one boot per row (today two: the first check is still
-    optimistic).
+54. **`MAX_LEN=auto` in the wizard**: `start.sh` defaults to it (vLLM fits the longest
+    request after warmup; the drafter computes its RoPE angles, so nothing grows with the
+    limit) and `ASYNC` to 1; `bench/memory_matrix.sh` boots once per row. Left: the wizard
+    asks for an optional cap instead of computing `MAX_LEN`, and shows the expected context
+    from the new table (with 53, on the matrix of 50).
 38. **Drafter SWA layers padded into the global groups' size** [NS]: the KV manager groups 9
     layers per block; the drafter's 2 SWA layers pad to 9 (the "350% padding" warning).
     Small real waste per block; merging that bucket with another frees it.

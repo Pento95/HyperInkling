@@ -51,22 +51,17 @@ export HYPERINKLING_SPEC_ADAPTIVE=${HYPERINKLING_SPEC_ADAPTIVE-2,4,7}
 export HYPERINKLING_LOOKUP=${HYPERINKLING_LOOKUP-1}
 # Extra speculative-config fields, as a JSON fragment starting with a comma.
 SPEC_OPTS=${SPEC_OPTS:-}
-MAX_LEN=${MAX_LEN:-262144}       # per request
-# Async scheduling keeps two steps in flight, and every sliding-window and sconv
-# cache reserves both steps' chunk tokens (the sconv state alone: 0.85 GiB per step
-# at NBT 1024). ASYNC=0 keeps one step in flight: ~55k more tokens for the longest
-# request, -3 to -4% decode (measured 2026-11-21; docs/memory_matrix.tsv). ASYNC=auto
-# turns it off with DSpark above 192k; scripts/wizard.py picks from the measured table.
-ASYNC=${ASYNC:-auto}
-if [ "$ASYNC" = auto ]; then
-	if [ "$SPEC" = dspark ] && [ "$MAX_LEN" -gt 196608 ]; then ASYNC=0; else ASYNC=1; fi
-fi
-# Prefill chunk. Measured under 6-way load (2026-11-21): 1024 vs 512 = +22%
-# prefill speed, same decode, KV 281k vs 386k tokens (the sconv cache reserves
-# a slot per chunk token). 2048 no longer fits a 262k request.
+# Longest request: auto = as much as the KV cache holds after warmup (vLLM fits it);
+# a number caps it (the boot then fails if it does not fit).
+MAX_LEN=${MAX_LEN:-auto}
+# Async scheduling keeps two steps in flight: +3-4% decode for ~12k tokens of context
+# (each in-flight step holds its tail of the sliding-window and sconv caches).
+ASYNC=${ASYNC:-1}
+# Prefill chunk: 2048 prefills ~8% faster than 1024 (and encodes two 1024-token images
+# per step) for ~20k tokens of context; 512 is ~22% slower.
 NBT=${NBT:-1024}
 GPU_UTIL=${GPU_UTIL:-0.95}
-KV_DTYPE=${KV_DTYPE:-fp8}        # unit-scale E4M3, emulated on sm86 (ops/fp8_emu.py)
+KV_DTYPE=${KV_DTYPE:-fp8}        # unit-scale E4M3, emulated on sm86 (ops/e4m3.py)
 # CPU prefix-cache tier in /dev/shm, GiB; 0 disables. auto: 60% of RAM minus 8 GiB, at most
 # 36 and at most what /dev/shm has free (the wizard's default).
 KV_OFFLOAD_GB=${KV_OFFLOAD_GB:-auto}
@@ -178,7 +173,7 @@ fi
 
 echo "=================================================="
 echo "HyperInkling: $(basename "$MODEL") as '$SERVED_NAME' on $HOST:$PORT"
-echo "Context $MAX_LEN/request, $MAX_SEQS concurrent, prefill chunk $NBT, async scheduling $ASYNC"
+echo "Context $([ "$MAX_LEN" = auto ] && echo "auto (what the GPU holds)" || echo "$MAX_LEN")/request, $MAX_SEQS concurrent, prefill chunk $NBT, async scheduling $ASYNC"
 echo "KV $KV_DTYPE, prefix cache on, CPU tier ${KV_OFFLOAD_GB} GiB"
 if [ -n "$HYPERINKLING_SPEC_ADAPTIVE" ]; then verify="adaptive over $HYPERINKLING_SPEC_ADAPTIVE"
 else verify="by batch size $SPEC_K"; fi
@@ -192,7 +187,7 @@ echo "=================================================="
 [ -f "$REPO/venv/bin/activate" ] && source "$REPO/venv/bin/activate"
 exec taskset -c "$CPUS" "${wrap[@]}" vllm serve "$MODEL" \
 	--served-model-name "$SERVED_NAME" $SERVED_ALIASES --host "$HOST" --port "$PORT" \
-	--max-model-len "$MAX_LEN" --max-num-seqs "$MAX_SEQS" \
+	--max-model-len "$([ "$MAX_LEN" = auto ] && echo -1 || echo "$MAX_LEN")" --max-num-seqs "$MAX_SEQS" \
 	--max-num-batched-tokens "$NBT" --gpu-memory-utilization "$GPU_UTIL" \
 	--kv-cache-dtype "$KV_DTYPE" --enable-prefix-caching \
 	--reasoning-parser inkling --enable-auto-tool-choice --tool-call-parser inkling \
