@@ -72,15 +72,18 @@ Measured on an RTX 3090 Ti undervolted to 350 W, with
 [gpu-unlock](https://github.com/zagitta/gpu-unlock) active (it raises prefill, not decode).
 KV cache FP8 E4M3.
 
-| | without DSpark | with DSpark (default) |
-|---|---|---|
-| prefill, one 14.5k-token prompt | 5,550 tok/s | 5,470 tok/s |
-| prefill, 6 prompts at once, aggregate | 5,600 tok/s | 5,570 tok/s |
-| decode, one request, prose | 134 tok/s | ~160 tok/s |
-| decode, one request, long documents (13k-token prompts) | 128 tok/s | 217 tok/s |
-| decode, one request, structured output | 135 tok/s | ~295 tok/s |
-| decode, one request, copying a table from a 50k-token document | not measured | ~490 tok/s |
-| decode, 6 requests, prose, aggregate | 428 tok/s | ~435 tok/s |
+Server context limit 262,144 tokens (the default); the NBT 2048 figures at 65,536 (a
+2048-token prefill chunk does not fit 262k). Prompt column: the tokens each request sends.
+
+| | prompt | without DSpark | with DSpark (default) |
+|---|---|---|---|
+| prefill, one prompt | 14.5k | 5,550 tok/s | 5,470 tok/s (NBT 2048: 6,050) |
+| prefill, 6 prompts at once, aggregate | 6 x 14.5k | 5,600 tok/s | 5,570 tok/s (NBT 2048: 6,050) |
+| decode, one request, prose | ~30, 512 out | 134 tok/s | ~160 tok/s |
+| decode, one request, long documents | 13k mean, 512 out | 128 tok/s | 217 tok/s |
+| decode, one request, structured output | ~100 | 135 tok/s | ~295 tok/s |
+| decode, one request, copying a table | 50k | not measured | ~490 tok/s |
+| decode, 6 requests, prose, aggregate | ~30 each, 512 out | 428 tok/s | ~435 tok/s |
 
 Long prompts (AA-LCR documents, mean 12k tokens, 512 out). Mostly prefill: with 6 at once,
 decode steps share the GPU with the others' prefill chunks.
@@ -92,9 +95,8 @@ decode steps share the GPU with the others' prefill chunks.
 | output, aggregate (prefill time included) | 77 tok/s | 102 tok/s | 125 tok/s | 141 tok/s |
 | time to first token (6: queueing included) | 2.66 s | 2.64 s | 4.64 s | 5.29 s |
 
-Prefill chunk (`NBT`, a wizard option): 2048 instead of the default 1024 gives 6,050 instead of
-5,610 tok/s prefill (one prompt and 6 at once, aggregate), the same decode, and ~68k tokens
-less context (200k instead of 268k with DSpark).
+`NBT=2048` (a wizard option) costs ~68k tokens of context: 200k instead of 268k with DSpark,
+6 requests and the vision tower on the GPU.
 
 ## Maximum context with HyperInkling (RTX 3090 Ti)
 

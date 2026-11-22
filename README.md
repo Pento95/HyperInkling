@@ -96,7 +96,8 @@ predictable (structured output, code, quoting) and least on free prose, because 
 on a mixture-of-experts model reads many more experts than a plain step (NOTES.md).
 
 Prefill: ~5,500 tok/s for one 14.5k-token prompt, ~5,600 tok/s aggregate with 6 at once
-(with or without DSpark). gpu-unlock raises the bf16 tensor-core rate (102 TFLOPS on a cuBLAS
+(with or without DSpark; context limit 262k). With `NBT=2048`: 6,050 tok/s both (measured at a
+65k limit: 2048 does not fit 262k). gpu-unlock raises the bf16 tensor-core rate (102 TFLOPS on a cuBLAS
 GEMM instead of ~40): that changes prefill, not decode, which is bandwidth-bound. A stock card
 prefills slower; decode is the same.
 
