@@ -25,6 +25,11 @@ docker compose up -d              # first start pulls the image (~26 GB) and the
 docker compose logs -f hyperinkling
 ```
 
+The wizard's answers are in `.env`, which compose reads at every start: next time, just
+`docker compose up -d`. To keep several setups, save copies and pick one before starting:
+`mkdir -p profiles && cp .env profiles/long-context.env`, later
+`cp profiles/long-context.env .env && docker compose up -d`.
+
 To build the image yourself instead (~1 hour, compiles vLLM for sm86):
 `scripts/setup-vllm.sh && scripts/build-image.sh`, then `IMAGE=hyperinkling:latest` in `.env`.
 

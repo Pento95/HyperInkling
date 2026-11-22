@@ -11,3 +11,4 @@ bench/perf/
 CLAUDE.local.md
 .env
 bench/quality-data/
+profiles/
