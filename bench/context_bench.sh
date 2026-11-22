@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 name=$1; PORT=${PORT:-18030}
 for spec in off dspark; do
 	log=.local/context-bench-$name-$spec.log
-	SPEC=$spec PORT=$PORT KV_OFFLOAD_GB=0 ./start.sh > "$log" 2>&1 &
+	SPEC=$spec PORT=$PORT KV_OFFLOAD_GB=0 WARMUP=0 ./start.sh > "$log" 2>&1 &
 	for _ in $(seq 200); do
 		curl -sf --max-time 2 "localhost:$PORT/health" > /dev/null && break
 		sleep 3

@@ -6,12 +6,12 @@
 #   bench/evalscope_perf.sh <name> [port]     # results in .local/perf/<name>/
 #
 # Env: PARALLEL (6), DURATION (600 s), OUT_TOK (512, fixed: ignore_eos), MODEL (inkling-2-mini),
-#      WARMUP (2 requests, not measured), PROMPTS (bench/perf/varlen.jsonl).
+#      PERF_WARMUP (2 requests, not measured), PROMPTS (bench/perf/varlen.jsonl).
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAME=$1; PORT=${2:-8080}
 PARALLEL=${PARALLEL:-6}; DURATION=${DURATION:-600}; OUT_TOK=${OUT_TOK:-512}
-MODEL=${MODEL:-inkling-2-mini}; WARMUP=${WARMUP:-2}
+MODEL=${MODEL:-inkling-2-mini}; PERF_WARMUP=${PERF_WARMUP:-2}
 PROMPTS=${PROMPTS:-$REPO/bench/perf/varlen.jsonl}
 OUT=$REPO/.local/perf/$NAME; mkdir -p "$OUT"
 URL=http://127.0.0.1:$PORT
@@ -28,8 +28,8 @@ perf() {  # perf <name> <number> [extra evalscope args...]
 		--outputs-dir "$OUT" --name "$n" --no-timestamp --number "$num" "$@"
 }
 
-echo "[perf] warm-up: $WARMUP requests (not measured)"
-perf warmup "$WARMUP" --parallel 1 --dataset-offset 500 > "$OUT/warmup.out" 2>&1
+echo "[perf] warm-up: $PERF_WARMUP requests (not measured)"
+perf warmup "$PERF_WARMUP" --parallel 1 --dataset-offset 500 > "$OUT/warmup.out" 2>&1
 
 echo "[perf] $DURATION s at parallel $PARALLEL, $OUT_TOK output tokens; metrics window alongside"
 "$REPO/venv/bin/python" "$REPO/bench/metrics_window.py" "$((DURATION - 30))" "$PORT" \

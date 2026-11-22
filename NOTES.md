@@ -49,6 +49,13 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   drafter W4 1.4 ms, attention 0.8 ms, the loop's small kernels ~3 ms. The GPU is never
   idle (wall within 1 ms of kernel time) except the 1.5 ms per step of synchronous
   scheduling at one request (async off at 262k).
+- **Decode attention, full layers: at least two CTAs per SM.** One request (8 KV heads) had
+  10 splits, one CTA per SM, ~570 GB/s on the KV; 21 splits: +3% decode at 32k, +10% at
+  128k. 40 or 80 splits gain nothing more.
+- **Warm-up requests at boot** (`scripts/warmup.py`, `WARMUP=1`): vLLM's warmup leaves out
+  prefills of 65-256 tokens, over 256 not a multiple of 16, a full chunk, and the LM head at
+  verify row counts (outside the graphs). Requests at those shapes after `/health`: 14 s on a
+  cold Triton cache, 4 s warm; afterwards real traffic compiled one small kernel.
 - **INT8 attention on a Triton GEMV, not Marlin**: Marlin W8A16 at one token reached
   ~45% of bandwidth on these small matrices, slower than the bf16 GEMV it replaced.
   The Triton kernel (`ops/linear_w8.py`) reaches 80-90%, and

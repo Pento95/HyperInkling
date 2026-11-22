@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 name=$1; conc=$2; tokens=$3; extra=${4:-}
 PORT=${PORT:-18030}; log=.local/prof-$name.log
 mkdir -p .local/prof
-PROFILE=$name PORT=$PORT KV_OFFLOAD_GB=0 MAX_LEN=${MAX_LEN:-131072} EXTRA_ARGS="$extra" ./start.sh > "$log" 2>&1 &
+PROFILE=$name PORT=$PORT KV_OFFLOAD_GB=0 WARMUP=0 MAX_LEN=${MAX_LEN:-131072} EXTRA_ARGS="$extra" ./start.sh > "$log" 2>&1 &
 for _ in $(seq 150); do curl -sf --max-time 2 "localhost:$PORT/health" > /dev/null && break; sleep 3; done
 curl -sf --max-time 2 "localhost:$PORT/health" > /dev/null || { echo "server failed: $log"; exit 1; }
 steps() { curl -s "localhost:$PORT/metrics" | awk 'index($0,"vllm:iteration_tokens_total_count{")==1 {s+=$NF} END {print s+0}'; }

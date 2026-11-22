@@ -185,6 +185,12 @@ echo "=================================================="
 
 # The native install's venv; the container has vllm on PATH.
 [ -f "$REPO/venv/bin/activate" ] && source "$REPO/venv/bin/activate"
+# Requests at the shapes vLLM's warmup leaves out, once /health answers: their kernels
+# compile (first boot after an update) or load from the JIT cache before real traffic.
+WARMUP=${WARMUP:-1}
+if [ "$WARMUP" = 1 ] && [ -z "${PROFILE:-}" ]; then
+	python3 "$REPO/scripts/warmup.py" "$PORT" &
+fi
 exec taskset -c "$CPUS" "${wrap[@]}" vllm serve "$MODEL" \
 	--served-model-name "$SERVED_NAME" $SERVED_ALIASES --host "$HOST" --port "$PORT" \
 	--max-model-len "$([ "$MAX_LEN" = auto ] && echo -1 || echo "$MAX_LEN")" --max-num-seqs "$MAX_SEQS" \

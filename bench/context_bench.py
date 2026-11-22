@@ -121,9 +121,11 @@ def run(args):
     results = {}
     for ctx in args.contexts:
         for conc in args.conc:
-            seed = random.randrange(1 << 30)
-            measure(base, prompts, ctx, conc, seed, args.gen)  # warm-up, unmeasured
-            r = measure(base, prompts, ctx, conc, seed + 1000, args.gen)
+            # The same documents every run (DSpark's acceptance depends on the text); a
+            # server restart and no CPU tier keep runs from hitting each other's prefixes.
+            seed = ctx * 10 + conc
+            measure(base, prompts, ctx, conc, seed + 1000, args.gen)  # warm-up, unmeasured
+            r = measure(base, prompts, ctx, conc, seed, args.gen)
             results[f"{ctx}x{conc}"] = r
             print(f"{ctx:6d} tokens x{conc}: " + ", ".join(
                 f"{k} {v:,.0f}" for k, v in r.items()), flush=True)

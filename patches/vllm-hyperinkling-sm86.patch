@@ -1,4 +1,4 @@
-From 83986f8bc7c2f2e04a7ec4cf226423007869f8a1 Mon Sep 17 00:00:00 2001
+From 4d1d6c15b3c26d3d53ddbfc37a954972b87ee75d Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -20,6 +20,8 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   after DFlashSlidingWindowManager): the window, the drafts in flight and
   one hit alignment; the rest of a prefill chunk is null and the conv skips
   stores into the null block.
+- Decode attention of the full layers: at least two CTAs per SM (21 splits
+  at one request instead of 10), +3% decode at 32k, +10% at 128k.
 - Loop controllers and sconv dynamic taps on Triton GEMVs (ops/bgemv.py,
   split-K down projection, up to 64 rows) instead of cuBLAS wmma kernels at
   decode and verify sizes.
@@ -76,7 +78,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/model.py          |  86 +++++-
  vllm/models/inkling2/nvidia/moe.py            | 111 +++++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  18 ++
- vllm/models/inkling2/nvidia/ops/attention.py  |   2 +-
+ vllm/models/inkling2/nvidia/ops/attention.py  |   8 +-
  .../inkling2/nvidia/ops/attention_sm90.py     |  21 +-
  vllm/models/inkling2/nvidia/ops/bgemv.py      | 180 +++++++++++++
  vllm/models/inkling2/nvidia/ops/dspark.py     |  22 +-
@@ -96,7 +98,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/core/sched/scheduler.py               |  38 ++-
  vllm/v1/engine/core.py                        |  82 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++++
- 33 files changed, 1858 insertions(+), 116 deletions(-)
+ 33 files changed, 1862 insertions(+), 118 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -1186,10 +1188,30 @@ index bc0f45f003..f6381104e7 100644
 +
 +    return current_platform.is_device_capability_family(80)
 diff --git a/vllm/models/inkling2/nvidia/ops/attention.py b/vllm/models/inkling2/nvidia/ops/attention.py
-index c8bc213285..03dd8881c9 100644
+index c8bc213285..a1670a8cc2 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention.py
 +++ b/vllm/models/inkling2/nvidia/ops/attention.py
-@@ -1378,5 +1378,5 @@ def _launch_rel_verify(
+@@ -390,7 +390,7 @@ def plan_decode_attention(
+     gated output without the combine kernel); decode keeps one block per
+     split up to twice the work of verify. Full layers give each request and
+     KV head `num_sms / 8` splits, fewer once that exceeds 6 CTAs per SM,
+-    but never less than one CTA per SM. The count depends only on the batch,
++    but never less than two CTAs per SM. The count depends only on the batch,
+     not the KV lengths, so it holds for every replay of a CUDA graph.
+     """
+     if max_query_len > _VERIFY_BLOCK_M // (num_heads // num_kv_heads):
+@@ -401,7 +401,9 @@ def plan_decode_attention(
+         if work <= (16 if max_query_len <= 2 else 8):
+             return triton.cdiv(rel_extent - 1, _FA4_BLOCK_N) + 1
+         return 5 if work <= 16 else 3 if work <= 32 else 2 if work <= 64 else 1
+-    return max(num_sms // work, min(num_sms // 8, 6 * num_sms // work))
++    # HyperInkling: at least two CTAs per SM (one request: 21 splits instead of 10,
++    # +3% decode at 32k, +10% at 128k on sm86; more splits gain nothing).
++    return max(2 * num_sms // work, min(num_sms // 8, 6 * num_sms // work))
+ 
+ 
+ _EX2_ASM = tl.constexpr("ex2.approx.ftz.f32 $0, $1;")
+@@ -1378,5 +1380,5 @@ def _launch_rel_verify(
          DRAFT=draft,
          WINDOW=window,
          num_warps=4,

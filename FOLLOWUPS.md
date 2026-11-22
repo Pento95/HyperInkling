@@ -9,7 +9,7 @@ fetched with `hf download --include` only when chosen.
 | 2, the checkpoint (alternatives, after the post) | 8, 11, 12, 14, 33 | new files on HF |
 | 3, context (best effort) | 54 (with 53) | |
 | after the post | 38 | |
-| 4, speed and polish | 41, 9, 35, 13 (+37), 10, 34, 53, 51, 52, 50, in this order | Reddit post |
+| 4, speed and polish | 35, 13 (+37), 10, 34, 53, 51, 52, 50, in this order | Reddit post |
 
 Released: `ghcr.io/pento95/hyperinkling:0.1.1` (compose default), the HF checkpoint (its README
 is docs/MODEL_CARD.md: re-upload it when the card changes). A new image goes with a new tag
@@ -79,15 +79,6 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
    changes (sconv builder varlen bound, the decode combine kernel's row bound from the
    device total, the CPU `max_query_len` as an upper bound, a varlen test). Today
    `adaptive_k.py` picks one length per step for the whole batch.
-9. **Kernels compiled at the first requests** [HQ `spec-sampler-prewarm`]: the boot warmup
-   (with the extensible KV cache: decode graphs, <= 54-token steps, a full-budget mixed
-   step) leaves out prefills of 65-256 tokens (`_k_group_kernel`, `_select_kernel`,
-   `_w8_kernel` tiles), prefills over 256 tokens not a multiple of 16 (`_attn_res_kernel`,
-   `_sconv_kernel`, ...), a pure 1024/2048 prefill (`_rel_attention_kernel`), and the LM head
-   outside the graphs at verify row counts (15-40). ~5 s once per Triton cache, then disk
-   hits (the monitor's warnings at every boot). Cheapest fix: `start.sh` sends warm-up
-   requests at the real shapes once `/health` answers (100, 200, 700, 1500 tokens; 6 at
-   once with speculation) before printing ready.
 10. **Small-kernel fusion in the loop** [IK, AX `labs/lab1`, `csrc/convmix_sm86.cu`]: ~3 ms
     of a 22 ms step at 6 requests (48 layer visits x ~15 kernels of 2-5 us):
     `_attn_res_row_kernel`, `_sconv_kernel`, `_k_group_kernel` (router), `_attn_prologue`,
@@ -113,9 +104,6 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     path, or a persistent kernel over a layer's projections. A single-launch kernel over a
     global layer's three q/k/v inputs helps only the 8 global visits (not worth it alone).
 37. **Drafter W4 time** [NS nsys]: 1.1-1.8 ms per step; follows 13.
-41. **Decode split-KV at long context** [AX `labs/lab2`]: with 8 KV heads one request gives
-    8 CTAs on 82 SMs unless KV is split; check `attention_sm90.py`'s `num_splits` choice at
-    1 request and 100k+ tokens (decode speed against a short context).
 51. **Against club-3090's image** [C3]: once its single-GPU profile ships, run the same
     benches on both for the post (it serves the release checkpoint, bf16 KV).
 52. **Release guards** [C3 `build.sh`]: `scripts/build-image.sh` refuses to retag a published

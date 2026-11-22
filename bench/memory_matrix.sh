@@ -16,7 +16,7 @@ COMBOS=${COMBOS:-"gpu:dspark:1:6 gpu:dspark:0:6 gpu:off:1:6 host:dspark:1:6 host
 for c in $COMBOS; do
 	IFS=: read -r vision spec async seqs <<< "$c"
 	log=.local/memmatrix/$vision-$spec-a$async-s$seqs.log
-	env_args=(PORT=$PORT KV_OFFLOAD_GB=0 SPEC=$spec ASYNC=$async MAX_SEQS=$seqs ${EXTRA_ENV:-})
+	env_args=(PORT=$PORT KV_OFFLOAD_GB=0 WARMUP=0 SPEC=$spec ASYNC=$async MAX_SEQS=$seqs ${EXTRA_ENV:-})
 	case $vision in
 	host) env_args+=(HYPERINKLING_VISION_HOST=1) ;;
 	none) env_args+=(IMAGES=0) ;;

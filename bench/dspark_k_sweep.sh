@@ -12,7 +12,7 @@ stop() { local p; p=$(pgrep -f '[v]env/bin/vllm serve'); [ -n "$p" ] && kill $p
 metric() { curl -s "localhost:$PORT/metrics" | awk -v k="$1" 'index($0,k"{")==1 {s+=$NF} END {print s+0}'; }
 for k in $KS; do
 	stop
-	KV_OFFLOAD_GB=0 PORT=$PORT MAX_LEN=${MAX_LEN:-131072} SPEC_K="[[1,6,$k]]" \
+	KV_OFFLOAD_GB=0 WARMUP=0 PORT=$PORT MAX_LEN=${MAX_LEN:-131072} SPEC_K="[[1,6,$k]]" \
 		./start.sh > "$OUT/server-k$k.log" 2>&1 &
 	sp=$!
 	ok=0; for _ in $(seq 120); do curl -sf --max-time 3 "localhost:$PORT/health" >/dev/null && { ok=1; break; }; kill -0 $sp 2>/dev/null || break; sleep 5; done
