@@ -1,125 +1,149 @@
 # Follow-ups
 
-Where the work stopped on 2026-11-21, in the order to pick it up.
-
-## Plan
-
-Any item that trades something for something else ships as a wizard option, not a default.
+What comes next, by phase. Any item that trades something for something else ships as a
+wizard option, not a default. Alternative tensors go in the same HF repo as separate files,
+fetched with `hf download --include` only when chosen.
 
 | phase | items | then |
 |---|---|---|
-| 2, the checkpoint | 6, 8, 11, 12, 13, 14 | checkpoint on Hugging Face (2) |
-| 3, context | 17, 18, 19, 30 | |
-| 4, speed and polish | 7, 9, 10, 21, 22, 31 | Reddit post |
+| 2, the checkpoint (alternatives to the published one) | 8, 11, 12, 13, 14, 33 | new files on HF |
+| 3, context (best effort) | 17, 18, 19, 30, 36, 38, 39 | |
+| 4, speed and polish | 7, 9, 10, 21, 22, 32, 34, 35, 37, 41, 50 | Reddit post |
 
-Phase 2 holds everything that changes the published checkpoint, so it is uploaded once. Wizard
-alternatives to the default tensors go in the same HF repo as separate files, fetched
-with `hf download --include` only when chosen.
+Released: `ghcr.io/pento95/hyperinkling:0.1.1` (compose default), the HF checkpoint (its README
+is docs/MODEL_CARD.md: re-upload it when the card changes). A new image goes with a new tag
+and the compose default.
 
-## Release (in progress)
+Where each idea comes from: **[HQ]** HyperQwen (github.com/syv-ai/HyperQwen, `patches/`, docs),
+**[BS]** basalt (github.com/jesdga95/basalt, MIT), **[AR]** Ar4ikov's vLLM PRs
+[#69165](https://github.com/vllm-project/vllm/pull/69165) (Inkling 2 on SM80/86/89) and
+[#69141](https://github.com/vllm-project/vllm/pull/69141) (compressed-tensors experts),
+**[AX]** github.com/agent2x0r/inkling2-sm86-kernels (2x3090 bring-up, `labs/`, `csrc/`),
+**[LC]** [llm-compressor](https://github.com/vllm-project/llm-compressor), **[IK]** the model's
+own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 
-2. **Published 0.1.1** (GitHub release, `ghcr.io/pento95/hyperinkling:0.1.1`, the HF checkpoint;
-   re-upload the HF README from docs/MODEL_CARD.md when the card changes; a new image goes
-   with a new tag and the compose default).
+## Phase 2: the checkpoint
 
-## Still to try
-
-Where each idea comes from: **[HQ]** HyperQwen (github.com/syv-ai/HyperQwen, its
-`patches/` and docs), **[BS]** basalt (github.com/jesdga95/basalt, MIT), **[IK]** the
-structure of Inkling 2 Mini itself, **[NS]** ours (measurements in this repo). Tried and
-dropped ideas are at the end, with the reason, so they are not re-tried blind.
-
-### DSpark
-
-6. **Lookup drafting from the context** [HQ `dflash2-lookup-drafting`, BS suffix drafter]:
-   `ops/lookup.py`, `HYPERINKLING_LOOKUP`, on by default with the adaptive length; lossless (greedy text equals
-   `SPEC=off`). Copying a 120-line table from a 2-50k document (`bench/copy_test.py`): at
-   the default k it adds 2% (4.88 -> 5.00 tokens per step, the ceiling); at k=7 7-13%
-   (7.07-7.43 -> 8.00; 438 -> 494 tok/s at 50k). The drafter copies tables well on its own;
-   the verify length is the bigger lever (k=7: +33% while copying, -14 to -21% on chat and
-   code), hence 7. On spec_bench and the extraction bench the lookup is within noise.
-7. **Per-request verify length** [BS draft policy, vLLM adaptive verification]: needs decode
-   graphs with per-request query lengths. docs/varlen-decode-investigation.md has the map,
-   with file:line references and open doubts;
-   mapped the changes: the sconv metadata builder's varlen bound, the decode combine kernel
-   zeroing rows from the device total, the CPU `max_query_len` as an upper bound, and a
-   varlen test (the `SKIP_IDLE_CACHE` padding bug it found is fixed). Today `adaptive_k.py` picks one length per step for the whole batch (default, candidates 2,4,7).
 8. **Drafter GPTQ** [NS]: low priority, INT4 RTN accepts like bf16 on counting (6.6 vs 6.7).
-9. **Kernels compiled at boot** [HQ `spec-sampler-prewarm`]: vLLM's warmup prefills
-   9-token requests only, so the first long prefill and first mixed batches compile ~10
-   Triton variants (`_sconv_kernel` above 256 tokens, `_rel_attention_kernel`, ...): a
-   ~5 s first TTFT, once per Triton cache (a compose volume). A long-prompt warmup step
-   in `v1/worker/gpu/warmup.py` would move it to boot.
+11. **Unembed INT4 GPTQ** [HQ fast variant]: ~0.25 ms per step, and the drafter's base
+    logits read half as much. Judge by the KL median. Needs 13 (the W4 kernel reaches ~500
+    GB/s on 201k x 2304, INT8 ~900).
+12. **Attention 4-bit** [NS] (GPTQ + int4 GEMV): halves the bytes, but the small attention
+    matrices are latency-bound (35): measure the step, not GB/s.
+13. **A faster W4A16 GEMV** [NS, AX]: `ops/linear_w4.py` reaches 400-550 GB/s at decode
+    (outputs of 16k columns or more take the single-launch kernel, the rest split-K;
+    `bench/w4_gemv.py`). The cost is the nibble unpack: try the bit-shift pair unpack of
+    `csrc/nvfp4_moe_sm86.cu` [AX] (two weights to bf16x2 in three integer ops, `lop3`).
+    Unblocks 11, 12 and the drafter (1.1-1.8 ms per step, 37).
+14. **Run-to-run nondeterminism** [NS]: the same request scored twice differs from position 1
+    (~0.003 in logprob); an expert flip carries it down the sequence (KL mean floor 0.060,
+    median 0.0003). Bitwise repeatable (`tests/test_determinism.py`): Marlin MoE, the W8
+    linear, `bgemv`, `short_conv`. Not yet tested: `_rel_attention_kernel` (prefill),
+    the router (`_k_group_kernel`, `select_experts`), `attn_res`, cuBLAS.
+33. **llm-compressor / compressed-tensors** [LC, AR #69141]: llm-compressor calibrates GPTQ,
+    AWQ and SmoothQuant schemes on the HF model and writes compressed-tensors checkpoints;
+    #69141 runs such experts (W4A16, W4A8, W8A8, FP8) on Humming. Three uses here:
+    (a) a second calibration of the experts, attention and head (11, 12) to compare with
+    `prepare/gptq_experts.py` by KL median; (b) loading compressed-tensors W4A16 experts by
+    repacking to the Marlin layout, so community quantizations run unchanged;
+    (c) W8A8 INT8 for prefill: sm86's INT8 tensor cores run at twice the bf16 rate and
+    prefill is compute-bound (vLLM has W8A8 int8 GEMMs for sm80; the MoE side needs a kernel).
+    #69141 also fixes the DSpark draft quantization config and casts fp32 checkpoint tensors
+    to bf16: check both against our drafter loader at the rebase (32).
 
-### Speed
-
-10. **Small-kernel fusion in the loop** [IK: 48 layer visits x ~15 kernels of 2-5 us]
-    (~1.5 ms of a 7.5 ms step at one request): `_attn_res_row_kernel`, `_sconv_kernel`,
-    `_k_group_kernel` (router), `_attn_prologue`, `_blend_rms_norm`, routing. The reference
-    numerics (fixed summation orders, no FMA contraction) live in these kernels: fuse with
-    bitwise checks against the unfused path.
-11. **Unembed INT4 GPTQ** [HQ fast variant: int4 GPTQ lm_head]: ~0.25 ms per step, and the
-    drafter's base logits would read half as much. Judge by the KL median.
-12. **Attention 4-bit** [NS] (GPTQ + int4 GEMV): ~0.7 ms per step at one request.
-13. **A faster W4A16 GEMV** [NS]: `ops/linear_w4.py` reaches 400-550 GB/s at decode (INT8
-    ~900). Outputs of 16k columns or more now take the single-launch kernel (Markov fold
-    786 vs 660 GB/s at 1 row, 679 vs 431 at 7; gate_up 724 vs 554), the rest keep split-K,
-    which the single launch loses to (`bench/w4_gemv.py`). The remaining cost is the
-    nibble unpack and conversion; a faster kernel there helps 11 and 12.
-
-14b. **Release the W8 tiles and bgemv to 64 rows** [NS]: in the patch (-7% step at 6
-    requests, -9% at 16), not in the 0.1.1 image; README speed tables still show 0.1.1.
-    Goes in 0.1.2 with the next changes.
-
-### Quality and measurement
-
-14. **Run-to-run nondeterminism** [NS]: the same request scored twice on one server differs
-    from position 1 (~0.003 in logprob), and an expert flip carries it down the sequence
-    (KL mean floor 0.060; the median, 0.0003, is what decisions use). Bitwise repeatable
-    (`tests/test_determinism.py`): Marlin MoE, the W8 linear, `bgemv`, `short_conv`. Not yet
-    tested: `_rel_attention_kernel` (prefill attention), the router (`_k_group_kernel`,
-    `select_experts`), `attn_res`, cuBLAS.
-
-### Context, best effort (no DSpark, vision off the GPU)
+## Phase 3: context (best effort: no DSpark, vision off the GPU)
 
 17. **sconv state cache** as a fixed 3-token state instead of a fake sliding window [IK]:
-    frees the per-chunk-token reserve (0.85 GiB per step in flight at NBT 1024).
+    frees the per-chunk-token reserve (0.85 GiB per step in flight at NBT 1024). With it,
+    async scheduling may fit 262k with DSpark (36).
 18. **4-bit KV for the global layers** [HQ KVarN]: halves the per-token KV. Then the wizard
     needs a 4-bit column.
-19. **Least-routed experts in host RAM when the context needs room** [BS]: the way to
-    approach 1M without DSpark and without the vision tower on the GPU.
+19. **Least-routed experts in host RAM when the context needs room** [BS]: the way toward
+    1M without DSpark and without the vision tower on the GPU.
+30. **Memory profile after warmup** [HQ `memory-profile-after-warmup`]: vLLM checks the
+    context limit before the warmup, hence the two-boot measurement (NOTES). Profiling after
+    it makes the first boot's estimate the real one.
+36. **Synchronous scheduling at one request** [NS nsys]: with async off (needed for 262k with
+    DSpark and the vision tower on the GPU) each step waits ~1.5 ms on the CPU (12.8 ms
+    steps). Either shrink the CPU side (profile input prep, sampler, drafter metadata) or
+    free enough KV that async fits (17, 38).
+38. **Drafter SWA layers padded into the global groups' size** [NS]: the KV manager groups 9
+    layers per block; the drafter's 2 SWA layers pad to 9 (the "350% padding" warning).
+    Small real waste per block; merging that bucket with another frees it.
+39. **Fewer bits for the least-routed experts** [NS, BS]: captured routing gives each
+    expert's frequency; 3-bit (or 2-bit) for the tail frees GiBs of context. Marlin is 4/8
+    bit only: needs a mixed-bit MoE kernel. KL median decides.
 
-### Other
+## Phase 4: speed and polish
 
+7. **Per-request verify length** [BS draft policy, vLLM adaptive verification]: needs decode
+   graphs with per-request query lengths; docs/varlen-decode-investigation.md maps the
+   changes (sconv builder varlen bound, the decode combine kernel's row bound from the
+   device total, the CPU `max_query_len` as an upper bound, a varlen test). Today
+   `adaptive_k.py` picks one length per step for the whole batch.
+9. **Kernels compiled at boot** [HQ `spec-sampler-prewarm`]: vLLM's warmup prefills 9-token
+   requests and decodes up to 48 tokens, so the first real requests compile ~10 Triton
+   variants (~5 s on the first TTFT, once per Triton cache): `_sconv_kernel` above 256
+   tokens (with and without a multiple of 16) and in 129-256, `_rel_attention_kernel` at
+   BLOCK_M 64, mixed prefill+decode steps. A warmup step at those shapes in
+   `v1/worker/gpu/warmup.py` moves it to boot. The "JIT" warnings at every boot are disk-cache
+   hits (ms), not compiles.
+10. **Small-kernel fusion in the loop** [IK, AX `labs/lab1`, `csrc/convmix_sm86.cu`]: ~3 ms
+    of a 22 ms step at 6 requests (48 layer visits x ~15 kernels of 2-5 us):
+    `_attn_res_row_kernel`, `_sconv_kernel`, `_k_group_kernel` (router), `_attn_prologue`,
+    `_blend_rms_norm`, routing. AX fuses short conv + residual + RMSNorm in one kernel
+    (`cp.async` staging) and blend + RMSNorm with the row kept in registers. The reference
+    numerics (fixed summation orders, no FMA contraction, exact `tanh`: AX measured
+    `tanh.approx` flipping 0.23% of bf16 outputs) must hold: check bitwise against the
+    unfused path.
 21. **Rust frontend** for the native build: vendored OpenSSL needs Perl `FindBin` (the
     container builds it).
-22. **Upstream**: the processing.py dummy-size fix and the oversized-image downscale are real
-    upstream bugs; worth a vLLM PR.
-### Added with the plan
+22. **Upstream PRs**: the processing.py dummy-size fix and the oversized-image downscale are
+    real upstream bugs; so is the sconv padding-row fix (NOTES).
+32. **Rebase BASE on vLLM main** [AR #69165]: #69028 is merged; when #69165 (SM80/86/89:
+    PDL gating, integer e4m3 conversions, conv_mix Triton fallback, FA2 vision) lands, drop
+    our overlapping sm8x gating and keep only what it lacks (Marlin experts, INT8, emulated
+    FP8 KV, DSpark changes). Main also carries security fixes; the auth root_path one
+    (#52794) conflicts with our deny-by-default `authenticate.py`. #69165 hit a sampler-warmup
+    OOM at `max_num_seqs` 256: keep the wizard's cap.
+34. **SiTU fused into the experts' w13 epilogue** [AX `labs/lab3b`]: today Marlin writes
+    gate_up, a separate kernel applies the softcapped SiTU, w2 reads it back: one launch and
+    a round trip per visit, 48 per token. AX fuses it in registers (and the top-8 w2
+    reduction). Needs a Marlin epilogue change, bitwise against the unfused output.
+35. **W8 small matrices are latency-bound** [NS nsys]: `_w8_kernel` takes 2.8/3.6/5.5 ms per
+    step at 1/6/16 requests; qkvr (8600 x 2304) and o (2304 x 3072) stay at 300-500 GB/s
+    whatever the tile. Fewer launches, not fewer bytes: o fused with the next qkvr input
+    path, or a persistent kernel over a layer's projections. A single-launch kernel over a
+    global layer's three q/k/v inputs helps only the 8 global visits (not worth it alone).
+37. **Drafter W4 time** [NS nsys]: 1.1-1.8 ms per step; follows 13.
+41. **Decode split-KV at long context** [AX `labs/lab2`]: with 8 KV heads one request gives
+    8 CTAs on 82 SMs unless KV is split; check `attention_sm90.py`'s `num_splits` choice at
+    1 request and 100k+ tokens (decode speed against a short context).
+50. **Final measurements** (once, after phases 3-4, before the Reddit post), for README and
+    the model card: `bench/profile_spec.sh` at 1/6/16; prefill 14.5k at 1/6 and NBT 2048;
+    `bench/spec_bench.py 8080 512 user`; `bench/copy_test.py` at 50k; `bench/evalscope_perf.sh`
+    (4 configurations); `bench/extract_bench.py`; `bench/memory_matrix.sh`; `bench/kl_eval.py`;
+    `bench/quality_battery.py` against the original. The post credits HyperQwen, basalt,
+    AR, AX and invites field reports (`.github/ISSUE_TEMPLATE/field-report.yml`).
 
-
-30. **Memory profile after warmup** [HQ `memory-profile-after-warmup`]: vLLM checks the
-    context limit before the warmup, hence the two-boot measurement (NOTES). Profiling
-    after it makes the first boot's estimate the real one.
-31. **Field-report issue template** [HQ]: for the Reddit post's invitation to share results.
-
-### Tried and dropped (2026-11-21)
+## Tried and dropped
 
 - Verify-side MoE kernel work [NS]: Marlin already reads ~900 GB/s; a second verified token
-  costs less than double because tokens share experts.
-- Screening the Markov head on the base logits' top-k [BS-inspired]: acceptance collapsed
-  (counting 6.6 -> 2.9 tokens/step); the right token comes from the Markov bias.
-- A drafter-only INT4 copy of the LM head for base logits [HQ fast variant / BS 2-bit
-  screen]: -1.5% step time for 0.23 GiB; revisit with item 13.
-- Adaptive verification as shipped by vLLM [BS/vLLM]: the sconv backend refuses varlen
-  decode graphs (item 7 is the way).
+  costs less than double because tokens share experts. A warp-GEMV MoE for 1-4 tokens [AX]
+  reaches ~390 GB/s per expert: below Marlin here.
+- Screening the Markov head on the base logits' top-k [BS]: acceptance collapsed (counting
+  6.6 -> 2.9 tokens/step); the right token comes from the Markov bias.
+- A drafter-only INT4 copy of the LM head [HQ / BS 2-bit screen]: -1.5% step time for 0.23
+  GiB; revisit with 13.
+- vLLM's adaptive verification as shipped: the sconv backend refuses varlen decode graphs
+  (7 is the way).
 - HyperQwen's `kv-cache-seat-budget` (its `KVCacheGroup` API differs here),
   `terminal-request-progress` (does not apply), `tokenize-v1-route` (not needed).
-- The release's MXFP8 experts on layers 20-23 [BS] (`prepare/mix_experts.py`, 2026-11-21):
-  KL median 0.0027 vs 0.0030 (the noise floor is 0.0003), top-1 92.5% vs 92.35%, for
-  +1.94 GiB (~110k tokens of context); layer 23 alone changes nothing.
-- A draft vocabulary subset [HQ `qwen3_5-mtp-draft-vocab`] (2026-11-22): base logits and the
-  Markov fold on 32k or 48k head rows (the most frequent in the model's own calibration
-  output, 9.5k distinct, filled by lowest id). Steps 5% shorter, but acceptance fell
-  (extraction bench 42.5% -> 34-35%, 419 -> 394-400 tok/s; struct -5 to -12%); only chat
-  gained (+3-7%). Document text needs the full vocabulary.
+- The release's MXFP8 experts on layers 20-23 [BS] (`prepare/mix_experts.py`): KL median
+  0.0027 vs 0.0030 (noise floor 0.0003), top-1 92.5% vs 92.35%, for +1.94 GiB (~110k tokens
+  of context); layer 23 alone changes nothing.
+- A draft vocabulary subset [HQ `qwen3_5-mtp-draft-vocab`]: base logits and Markov fold on
+  the 32k or 48k most frequent head rows. Steps 5% shorter, acceptance lower (extraction
+  bench 42.5% -> 34-35%, struct -5 to -12%); document text needs the full vocabulary.
+- Context lookup at the default verify length: +2% while copying (the drafter copies tables
+  well on its own); it pays with the adaptive length (on by default, `ops/lookup.py`).

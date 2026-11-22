@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A port of Inkling 2 Mini (upstream vLLM supports it only on Hopper/Blackwell, PR #69028) to
+A port of Inkling 2 Mini (upstream vLLM runs it on Hopper/Blackwell; Ampere is PR #69165, open) to
 one RTX 3090 Ti (sm86, 24 GiB), plus a requantized checkpoint that fits. Three parts: a pinned
 vLLM with one patch, a model-preparation pipeline (`prepare/`), and a server with measured
 defaults (`start.sh`). README.md has the numbers, NOTES.md the reasons behind every choice and
-the gotchas already met, FOLLOWUPS.md where work stopped and what comes next. Read NOTES.md
+the gotchas already met, FOLLOWUPS.md what comes next, by phase. Read NOTES.md
 before changing a design decision: most alternatives were already tried and measured.
 
 ## The vLLM checkout and the patch (most important workflow)
@@ -96,6 +96,7 @@ Benchmarks and quality (all need a running server):
 - `bench/extract_bench.py`: document extraction on public data (shared Italian system
   prompt, 1-3 DocVQA pages, JSON or summary), closed loop with `metrics_window.py` alongside.
 - `bench/greedy_ref.py save|compare`, `bench/copy_test.py`: output and acceptance checks.
+- `bench/w4_gemv.py`, `bench/w8_gemv.py`: W4/W8 GEMV tiles against a grid search (no server).
 - `bench/long_decode.py`, `bench/offload_test.py`, `bench/moe_kernels.py`, `bench/profile_decode.sh`.
 
 Model preparation (`prepare/`): `build_calib.py` → `replay_capture.py` → `gptq_experts.py`

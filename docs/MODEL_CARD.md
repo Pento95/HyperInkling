@@ -124,4 +124,8 @@ The server is OpenAI-compatible (`/v1`, model `inkling-2-mini`), with tool calls
 ## License and credits
 
 Apache-2.0, as the base model. Model and DSpark drafter by Thinking Machines Lab; vLLM support
-from PR #69028; the porting approach follows [HyperQwen](https://github.com/syv-ai/HyperQwen).
+from [#69028](https://github.com/vllm-project/vllm/pull/69028); the porting approach follows
+[HyperQwen](https://github.com/syv-ai/HyperQwen). Ideas for the next steps from Ar4ikov's vLLM PRs
+[#69165](https://github.com/vllm-project/vllm/pull/69165) and
+[#69141](https://github.com/vllm-project/vllm/pull/69141), and
+[inkling2-sm86-kernels](https://github.com/agent2x0r/inkling2-sm86-kernels).

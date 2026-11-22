@@ -5,10 +5,9 @@ Lab, Apache-2.0) on one RTX 3090 / 3090 Ti, with vLLM.** Text and images (docume
 tool calls, strict JSON output, 262k tokens of context per request, several requests at once,
 and the model's own DSpark drafter for speculative decoding.
 
-Upstream vLLM runs Inkling 2 Mini only on Hopper and Blackwell (PR
-[#69028](https://github.com/vllm-project/vllm/pull/69028)). This repository is the port to
-Ampere (sm86) plus a requantized checkpoint that fits in 24 GB: a pinned vLLM with one patch,
-a model-preparation pipeline, and a launcher with measured defaults.
+Upstream vLLM runs Inkling 2 Mini on Hopper and Blackwell. This repository is the port to
+one Ampere card (sm86) plus a requantized checkpoint that fits in 24 GB: a pinned vLLM with
+one patch, a model-preparation pipeline, and a launcher with measured defaults.
 
 > **Scope, honestly.** This is a personal project, written almost entirely with an AI coding
 > assistant ("vibe coded"), published because it may be useful to other 3090 owners. It
@@ -47,7 +46,7 @@ works; 64 GB lets the prefix-cache CPU tier hold long shared prompts.
 ### Without Docker
 
 ```bash
-scripts/setup-vllm.sh            # vllm/ = PR #69028 at patches/BASE + our patch
+scripts/setup-vllm.sh            # vllm/ = vLLM at patches/BASE + our patch
 scripts/build-vllm.sh            # venv/, sm86 only (~30-60 min)
 hf download Pentium95/Inkling-2-Mini-W4A16-g128-gptq --local-dir models/Inkling-2-Mini-W4A16-g128-gptq
 python3 scripts/wizard.py         # the same questions, writes .env
@@ -132,7 +131,7 @@ The wizard reads that table; these are the defaults and what each knob costs or 
 | `IMAGES` | 50 | images per request; 0 = no vision tower | 0: ~34k tokens more | no images |
 | `HYPERINKLING_VISION_HOST` | 0 | vision tower weights in host RAM, copied to the GPU layer by layer per image | 1: ~34k tokens more (as much as no vision) | +27 ms per A4 page (0.39 s vs 0.37 s to first token for one page) |
 | `IMAGE_MAX_W` / `_H` | 1240 x 1760 | largest image (A4 at 150 ppi, 1,364 tokens); larger ones are scaled down to it | A4 at 300 ppi (2480 x 3508, with `ENCODER_CACHE=16384`): about the same context, but each page costs ~4x the tokens | 300 ppi: ~4x the prefill per page |
-| `MAX_SEQS` | 6 | requests at once | longest request with DSpark: 279k at 1, 268k at 6, 257k at 16, 228k at 64 | 6 -> 16 requests: ~430 -> 740 tok/s decode in total |
+| `MAX_SEQS` | 6 | requests at once | longest request with DSpark: 279k at 1, 268k at 6, 257k at 16, 228k at 64 | 6 -> 16 requests: ~430 -> 785 tok/s decode aggregate |
 | `KV_OFFLOAD_GB` | `auto` (60% of RAM - 8 GiB, at most 36) | prefix-cache tier in host RAM (`/dev/shm`) | host RAM only | evicted prefixes come back in 0.1 s instead of seconds |
 | `NBT` | 1024 | prefill chunk | 2048: ~68k tokens less (268k -> 200k), async off; 512: more | 2048: +7-8% prefill (6,050 vs 5,610 tok/s), same decode; 512: -22% prefill |
 | `HYPERINKLING_SPEC_ADAPTIVE` | `2,4,7` | verify length chosen per step from these; empty = the fixed `SPEC_K` schedule | ~5k tokens (1,2,3,4,5,7: ~14k) | with the lookup: +41-43% copying, +20% at 6 requests |
@@ -233,8 +232,14 @@ $V prepare/gptq_experts.py models/Inkling-2-Mini data/capture models/Inkling-2-M
   wizard style, the one-step-in-flight trade for context).
 - [basalt](https://github.com/jesdga95/basalt) (MIT): its DSpark draft policy (verify window
   by expected tokens per millisecond) and its handling of oversized images informed ours.
-- vLLM PR [#69028](https://github.com/vllm-project/vllm/pull/69028) for Inkling 2 support,
-  and Thinking Machines Lab for the model and its drafter.
+- vLLM's Inkling 2 support ([#69028](https://github.com/vllm-project/vllm/pull/69028)), and
+  Thinking Machines Lab for the model and its drafter.
+- Ar4ikov's vLLM PRs [#69165](https://github.com/vllm-project/vllm/pull/69165) (Inkling 2 on
+  SM80/86/89) and [#69141](https://github.com/vllm-project/vllm/pull/69141) (compressed-tensors
+  experts), and [inkling2-sm86-kernels](https://github.com/agent2x0r/inkling2-sm86-kernels)
+  (a 2x3090 bring-up with SM86 kernel labs): ideas for the next steps (FOLLOWUPS.md).
+- [llm-compressor](https://github.com/vllm-project/llm-compressor): the route for calibrated
+  quantization of the parts we quantize at load today.
 
 ## License
 

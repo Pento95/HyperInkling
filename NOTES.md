@@ -14,7 +14,7 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
 - `/dev/shm` is 52 GB, enough for the 36 GiB KV CPU tier. RAM 62 GB.
 - The GPU drives no display: all 24 GiB are free when nothing runs.
 
-## Model (from config.json and the vLLM PR)
+## Model (config.json, vLLM's inkling2 code)
 
 - 24 layers, layers 6-17 run 3 passes with shared weights: 48 layer visits per token.
   Each pass has its own KV and conv-state caches; passes 2-3 blend the previous pass's
@@ -43,8 +43,7 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   E4M3 bits shifted into FP16 fields are exactly value * 2^-8 (subnormals too), so the
   attention MMAs run in fp16 and the 2^8 goes into the softmax scale (K) and the
   output (V). Two earlier decodes (via fp32, via integer bf16 bits) were 2-7x slower.
-- **Where a decode step goes** (nsys, `bench/profile_spec.sh`, 2026-11-22, 6 requests, 22.4
-  ms): Marlin experts 12.0 ms (at bandwidth: ~60 of 128 experts per layer visit, measured
+- **Where a decode step goes** (nsys, `bench/profile_spec.sh`, 6 requests, 22.4 ms): Marlin experts 12.0 ms (at bandwidth: ~60 of 128 experts per layer visit, measured
   on captured routing; same-domain requests share only ~7% more), `_w8_kernel` 3.6 ms
   (qkvr, o, the LM head: the small matrices stay at 300-500 GB/s whatever the tile),
   drafter W4 1.4 ms, attention 0.8 ms, the loop's small kernels ~3 ms. The GPU is never
@@ -54,8 +53,8 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   ~45% of bandwidth on these small matrices, slower than the bf16 GEMV it replaced.
   The Triton kernel (derived from Inkling's own `ops/gemv.py`) reaches 80-90%, and
   projects a full layer's q/k/v (three different inputs) in one launch.
-- **Marlin for the experts**: the best MoE W4A16 kernel available here (see
-  FOLLOWUPS 9).
+- **Marlin for the experts**: the best MoE W4A16 kernel available here; at decode it reads
+  ~900 GB/s.
 - **Prefill chunk 1024**: the sconv state cache reserves KV per chunk token (60%
   padding on its blocks per upstream analysis); 2048 does not fit a 262k request.
 - **Embeddings via UVA** (HyperQwen's `qwen3_5-embed-uva` mechanism): only the looked-up
@@ -95,11 +94,11 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   then silently runs decode without graphs. A batch larger than every captured size runs
   eagerly too: `start.sh` derives the sizes from `MAX_SEQS` (every count to 8, then steps).
   At 12 requests that is 650 vs 381 tok/s against sizes 1-6, for ~1.5k tokens of KV.
-- **A drafter-only INT4 copy of the LM head for the base logits does not pay** (tried
-  2026-11-21): 393 vs 550 us at 7 rows, worse from 21 rows up (the W4 kernel reaches
+- **A drafter-only INT4 copy of the LM head for the base logits does not pay**:
+  393 vs 550 us at 7 rows, worse from 21 rows up (the W4 kernel reaches
   ~500 GB/s against INT8's ~900 on this 201k x 2304 shape), -1.5% step time at one
   request for 0.23 GiB (~12k tokens of context). Revisit only with a faster W4 GEMV, or
-  as part of an INT4 GPTQ head shared with the target (FOLLOWUPS: unembed INT4).
+  as part of an INT4 GPTQ head shared with the target (FOLLOWUPS 11).
 - **Drafter KV in FP8 needed the drafter's `Attention` to get a cache config** (without
   one it is always bf16, whatever `kv_cache_dtype` the speculative config says) and a
   FlashAttention impl that only writes KV (FlashAttention refuses fp8 on SM8x; the draft
@@ -122,7 +121,7 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
 - **vLLM's adaptive verification does not run on Inkling**: it needs decode graphs with
   per-request query lengths, and `InklingSconvBackend` declares none. What would have to
   change (sconv builder, the decode combine kernel's row bound, ...) is mapped in a code
-  investigation, see FOLLOWUPS. `adaptive_k.py` chooses one length per step instead,
+  investigation (docs/varlen-decode-investigation.md, FOLLOWUPS 7). `adaptive_k.py` chooses one length per step instead,
   on by default with candidates 2,4,7 (~5k tokens of decode graphs; 1,2,3,4,5,7 costs
   ~14k and no longer fits 262k with the vision tower on the GPU, for little more speed).
 - basalt (jesdga95/basalt, MIT, Blackwell only) runs the same drafter: its draft policy
