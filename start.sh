@@ -58,8 +58,8 @@ MAX_LEN=${MAX_LEN:-auto}
 # (each in-flight step holds its tail of the sliding-window and sconv caches).
 ASYNC=${ASYNC:-1}
 # Prefill chunk: 2048 prefills ~8% faster than 1024 (and encodes two 1024-token images
-# per step) for ~20k tokens of context; 512 is ~22% slower.
-NBT=${NBT:-1024}
+# per step); 1024 frees ~20k tokens of context.
+NBT=${NBT:-2048}
 GPU_UTIL=${GPU_UTIL:-0.95}
 KV_DTYPE=${KV_DTYPE:-fp8}        # unit-scale E4M3, emulated on sm86 (ops/e4m3.py)
 # CPU prefix-cache tier in /dev/shm, GiB; 0 disables. auto: 60% of RAM minus 8 GiB, at most

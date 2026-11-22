@@ -63,7 +63,8 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     request after warmup; the drafter computes its RoPE angles, so nothing grows with the
     limit) and `ASYNC` to 1; `bench/memory_matrix.sh` boots once per row. Left: the wizard
     asks for an optional cap instead of computing `MAX_LEN`, and shows the expected context
-    from the new table (with 53, on the matrix of 50).
+    from the new table (with 53, on the matrix of 50). Its `NBT` question still has the old
+    logic (2048 forced async off at -68k): `NBT=2048` is now the default.
 38. **Drafter SWA layers padded into the global groups' size** [NS]: the KV manager groups 9
     layers per block; the drafter's 2 SWA layers pad to 9 (the "350% padding" warning).
     Small real waste per block; merging that bucket with another frees it.
@@ -128,11 +129,13 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     and prefill of `NBT=2048` with 1024-token images after 17, in the memory matrix, and
     move the owner's profile to it (a little under 262k is acceptable).
 50. **Final measurements** (once, after phases 3-4, before the Reddit post), for README and
-    the model card: `bench/profile_spec.sh` at 1/6/16; prefill 14.5k at 1/6 and NBT 2048;
-    `bench/spec_bench.py 8080 512 user`; `bench/copy_test.py` at 50k; `bench/evalscope_perf.sh`
-    (4 configurations); `bench/extract_bench.py`; `bench/memory_matrix.sh`; `bench/kl_eval.py`;
-    `bench/quality_battery.py` against the original. The post credits HyperQwen, basalt,
-    AR, AX and invites field reports (`.github/ISSUE_TEMPLATE/field-report.yml`).
+    the model card, with the defaults (`NBT=2048`): the speed table is one table from
+    `bench/context_bench.sh` (8k and 32k context; prefill per request and aggregate, decode
+    per request and aggregate without prefill; 1 and 6 requests, with and without DSpark);
+    plus `bench/spec_bench.py 8080 512 user`, `bench/copy_test.py` at 50k,
+    `bench/extract_bench.py`, `bench/memory_matrix.sh`, `bench/kl_eval.py`,
+    `bench/quality_battery.py` against the original. The post credits HyperQwen, basalt, AR,
+    AX, C3 and invites field reports (`.github/ISSUE_TEMPLATE/field-report.yml`).
 
 ## Tried and dropped
 
