@@ -31,6 +31,12 @@ DECODE_1 = {"dspark": 254, "off": 131}
 ADAPTIVE_COST = 5_120
 CELL = 40  # px per image token side (40 px patches, 2x2 merge)
 A4_WIDTH_IN = 8.27
+# (HF repo, local directory under models/) of each checkpoint.
+CHECKPOINTS = {
+    "original": ("Pentium95/Inkling-2-Mini-W4A16-g128-gptq", "Inkling-2-Mini-W4A16-g128-gptq"),
+    "uncensored": ("Pentium95/Inkling-2-Mini-Uncensored-W4A16-g128-gptq",
+                   "Inkling-2-Mini-Uncensored-W4A16-g128-gptq"),
+}
 
 
 def load_table():
@@ -137,7 +143,13 @@ def main():
         n = expected(rows, *a)
         return fmt_tokens(n) if n else "?"
 
-    seqs = ask("1) How many requests should run at the same time? (1-64)", default=6,
+    print("0) Which checkpoint?")
+    print("   a) Inkling 2 Mini as released by Thinking Machines")
+    print("   b) Inkling 2 Mini Uncensored (OpenUncensored's abliteration: refusals removed, only")
+    print("      the attention output projections edited), quantized the same way")
+    checkpoint = "uncensored" if ask("   choice", "ab", "a") == "b" else "original"
+
+    seqs = ask("\n1) How many requests should run at the same time? (1-64)", default=6,
                cast=int, check=lambda v: 1 <= v <= 64 or print("  1 to 64"))
 
     print("\n2) Where should the vision tower (images) run?")
@@ -232,6 +244,9 @@ def main():
         "KV_OFFLOAD_GB": tier,
         "GPU_UTIL": round(0.95 - headroom / 24, 3),
     }
+    repo, local = CHECKPOINTS[checkpoint]
+    if checkpoint != "original":  # compose downloads HF_REPO into models/CHECKPOINT
+        env["HF_REPO"], env["CHECKPOINT"], env["MODEL"] = repo, local, f"models/{local}"
     if width:
         env["IMAGE_MAX_W"], env["IMAGE_MAX_H"] = width, height
         if (width // CELL) * (height // CELL) > 2048:
@@ -264,7 +279,9 @@ def main():
             # Docker would create a missing bind-mount source as root.
             (REPO / "models").mkdir(exist_ok=True)
             print(f"Written {dest}")
-    print("\nStart it:  docker compose up -d     (logs: docker compose logs -f)")
+    print("\nStart it:  docker compose up -d     (logs: docker compose logs -f; the first start"
+          " downloads the checkpoint)")
+    print(f"Native:    hf download {repo} --local-dir models/{local}   (once)")
     exports = " ".join(f"{k}={v}" for k, v in env.items())
     print(f"Native:    {exports} ./start.sh")
 

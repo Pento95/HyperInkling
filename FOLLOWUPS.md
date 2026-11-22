@@ -66,12 +66,9 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     GeForce; for the drafter it moves only acceptance (est. +2-3% at 6-16 requests).
     Building bf16 from bits (`code | 0x4300` = 128 + code, the zero point corrected per
     group from the row sums) gave +15-20% at 1-7 rows on split-K, worth ~0.03 ms a step.
-55. **Uncensored checkpoint** (in progress): `OpenUncensored/Inkling-2-Mini-Uncensored` is the
-    release's format with only the 20 `attn.wo_ud` (bf16) edited; GPTQ it from its own
-    corpus (two rounds, `SRC=... prepare/calib_round.sh`), KL against it, a separate HF repo,
-    and a wizard question that sets `HF_REPO`/`CHECKPOINT`. Sources in bf16 (other
-    fine-tunes) are still unsupported: `quantize_experts.py`/`gptq_experts.py` read only
-    NVFP4/MXFP8 experts, and a bf16 Inkling 2 Mini does not fit 24 GiB to generate and capture.
+55. **Sources in bf16** (other fine-tunes): `prepare/quantize_experts.py` and
+    `gptq_experts.py` read only the release's NVFP4/MXFP8 experts (as the uncensored source
+    is), and a bf16 Inkling 2 Mini does not fit 24 GiB to generate the corpus and capture.
 38. **Drafter SWA layers padded into the global groups' size** [NS]: the KV manager groups 9
     layers per block; the drafter's 2 SWA layers pad to 9 (the "350% padding" warning).
     Small real waste per block; merging that bucket with another frees it.

@@ -24,10 +24,17 @@ that still pays at 6 requests.
 
 ```bash
 git clone https://github.com/Pento95/HyperInkling hyperinkling && cd hyperinkling
-python3 scripts/wizard.py         # a few questions -> .env (context, vision, DSpark, ...)
+python3 scripts/wizard.py         # a few questions -> .env (checkpoint, vision, DSpark, ...)
 docker compose up -d              # first start pulls the image (~26 GB) and the checkpoint (~16 GB)
 docker compose logs -f hyperinkling
 ```
+
+The first question picks the checkpoint: Inkling 2 Mini as released
+([Pentium95/Inkling-2-Mini-W4A16-g128-gptq](https://huggingface.co/Pentium95/Inkling-2-Mini-W4A16-g128-gptq)),
+or [OpenUncensored's abliterated version](https://huggingface.co/OpenUncensored/Inkling-2-Mini-Uncensored)
+quantized the same way
+([Pentium95/Inkling-2-Mini-Uncensored-W4A16-g128-gptq](https://huggingface.co/Pentium95/Inkling-2-Mini-Uncensored-W4A16-g128-gptq),
+KL median 0.0027 against its source as served). Compose downloads it at the first start.
 
 The wizard's answers are in `.env`, which compose reads at every start: next time, just
 `docker compose up -d`. To keep several setups, save copies and pick one before starting:
