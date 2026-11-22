@@ -17,7 +17,8 @@ PROFILE=$name PORT=$PORT KV_OFFLOAD_GB=0 MAX_LEN=${MAX_LEN:-131072} EXTRA_ARGS="
 for _ in $(seq 150); do curl -sf --max-time 2 "localhost:$PORT/health" > /dev/null && break; sleep 3; done
 curl -sf --max-time 2 "localhost:$PORT/health" > /dev/null || { echo "server failed: $log"; exit 1; }
 steps() { curl -s "localhost:$PORT/metrics" | awk 'index($0,"vllm:iteration_tokens_total_count{")==1 {s+=$NF} END {print s+0}'; }
-venv/bin/python scripts/quick_bench.py "$conc" 64 "$PORT" > /dev/null
+# Warm-up at the measured shapes: new kernel variants compile on first use.
+for _ in 1 2; do venv/bin/python scripts/quick_bench.py "$conc" "$tokens" "$PORT" > /dev/null; done
 curl -s -X POST "localhost:$PORT/start_profile"
 s0=$(steps); t0=$(date +%s.%N)
 venv/bin/python scripts/quick_bench.py "$conc" "$tokens" "$PORT" | grep conc

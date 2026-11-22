@@ -1,4 +1,4 @@
-From 8768abec41f16bfa77405ff55c65ac242207afc4 Mon Sep 17 00:00:00 2001
+From 023cd09532e0c0a8b6cee9d22bb0074260fca346 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -10,12 +10,14 @@ Runs Inkling2Loop on RTX 3090-class GPUs (on top of vllm#69028):
   HyperInkling INT4 (AWQ layout, g128 asym, quant format "int4_awq").
 - INT8 W8A16 Triton linears (ops/linear_w8.py) for attention, LM head
   (fp32 logits) and token embeddings (optionally in pinned host RAM, UVA),
-  behind HYPERINKLING_{ATTN,HEAD,EMBED}_W8 / HYPERINKLING_EMBED_UVA; own
-  tiles for verify-size batches (2-64 rows).
+  behind HYPERINKLING_{ATTN,HEAD,EMBED}_W8 / HYPERINKLING_EMBED_UVA; tiles
+  by output width (k/v, o, qkvr, LM head) for decode and verify batches
+  (1-128 rows).
 - Unit-scale E4M3 KV cache emulated in software (ops/fp8_emu.py): uint8
   bytes, fp16 MMAs on value * 2^-8, bit-exact with the hardware converts.
 - Loop controllers and sconv dynamic taps on Triton GEMVs (ops/bgemv.py,
-  split-K down projection) instead of cuBLAS wmma kernels at decode sizes.
+  split-K down projection, up to 64 rows) instead of cuBLAS wmma kernels at
+  decode and verify sizes.
 - Image dummy size follows --limit-mm-per-prompt width/height up to
   4096 px, so pages above 2048 px fit the encoder budget instead of
   waiting forever.
@@ -70,13 +72,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/attention.py  |  12 +-
  .../inkling2/nvidia/ops/attention_sm90.py     |  21 ++
  vllm/models/inkling2/nvidia/ops/attn_res.py   |   8 +-
- vllm/models/inkling2/nvidia/ops/bgemv.py      | 170 ++++++++++++++
+ vllm/models/inkling2/nvidia/ops/bgemv.py      | 176 +++++++++++++++
  vllm/models/inkling2/nvidia/ops/conv_mix.py   |   4 +-
  vllm/models/inkling2/nvidia/ops/fp8_emu.py    |  76 +++++++
  vllm/models/inkling2/nvidia/ops/gemv.py       |   5 +-
  vllm/models/inkling2/nvidia/ops/linear.py     |  19 +-
  vllm/models/inkling2/nvidia/ops/linear_w4.py  | 209 ++++++++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 132 +++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 135 +++++++++++
  vllm/models/inkling2/nvidia/ops/lookup.py     | 192 ++++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe.py        |  28 +--
  vllm/models/inkling2/nvidia/ops/moe_marlin.py | 209 ++++++++++++++++++
@@ -93,7 +95,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/core/sched/scheduler.py               |  38 +++-
  vllm/v1/engine/core.py                        |  82 +++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++++
- 39 files changed, 1856 insertions(+), 127 deletions(-)
+ 39 files changed, 1865 insertions(+), 127 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/fp8_emu.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
@@ -1223,26 +1225,31 @@ index 31590036a..bceb6b25e 100644
      grid = (num_q, num_tokens)
 diff --git a/vllm/models/inkling2/nvidia/ops/bgemv.py b/vllm/models/inkling2/nvidia/ops/bgemv.py
 new file mode 100644
-index 000000000..d0fd0f8da
+index 000000000..f18f0fc07
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/bgemv.py
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,176 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling batched low-M GEMV: `out[s] = x[s] @ w[s].T` for a few
-+streams `s`, at most MAX_M rows each (decode), with an fp32 or bf16 result.
++streams `s`, at most MAX_M rows each (decode and verify steps), with an fp32 or bf16
++result.
 +
 +`ops.gemv`'s kernel with the stream as a second grid axis. It replaces the
 +loop controllers' `torch.bmm`s (rank-64 down / up projections): at decode
-+sizes cuBLAS runs them on its wmma kernels, latency-bound at 20-30 us for
-+well under a megabyte of weights.
++and verify sizes cuBLAS runs them on its wmma kernels, latency-bound at 20-30 us for
++well under a megabyte of weights. A tile holds all rows (16, 32 or 64).
 +"""
 +
 +import torch
 +
 +from vllm.triton_utils import tl, triton
 +
-+MAX_M = 16
++MAX_M = 64
++
++
++def _rows_tile(m: int) -> int:
++    return max(16, triton.next_power_of_2(m))
 +
 +
 +@triton.jit
@@ -1360,17 +1367,18 @@ index 000000000..d0fd0f8da
 +    out = torch.empty((s, m, n), dtype=torch.float32, device=x.device)
 +    if m == 0:
 +        return out
-+    partials = torch.empty((DOWN_SPLITS, s, 16, r), dtype=torch.float32, device=x.device)
++    mp = _rows_tile(m)
++    partials = torch.empty((DOWN_SPLITS, s, mp, r), dtype=torch.float32, device=x.device)
 +    ks = triton.cdiv(triton.cdiv(k, DOWN_SPLITS), 64) * 64
 +    _down_split_kernel[(triton.cdiv(r, 16), s, DOWN_SPLITS)](
 +        x, down, partials, m, r, k, ks,
 +        x.stride(0), x.stride(1), down.stride(0), down.stride(1),
-+        BN=16, BK=64, MP=16, num_warps=4,
++        BN=16, BK=64, MP=mp, num_warps=4,
 +    )  # fmt: skip
 +    _up_from_partials_kernel[(triton.cdiv(n, 64), s)](
 +        partials, up, out, m, n, r, DOWN_SPLITS,
 +        up.stride(0), up.stride(1), out.stride(0), out.stride(1),
-+        BN=64, BR=triton.next_power_of_2(r), MP=16, num_warps=4,
++        BN=64, BR=triton.next_power_of_2(r), MP=mp, num_warps=4,
 +    )  # fmt: skip
 +    return out
 +
@@ -1394,7 +1402,7 @@ index 000000000..d0fd0f8da
 +        x, w, out, m, n, k,
 +        x.stride(0), x.stride(1), w.stride(0), w.stride(1),
 +        out.stride(0), out.stride(1),
-+        BN=bn, BK=bk, MP=16, num_warps=4,
++        BN=bn, BK=bk, MP=_rows_tile(m), num_warps=4,
 +    )  # fmt: skip
 +    return out
 diff --git a/vllm/models/inkling2/nvidia/ops/conv_mix.py b/vllm/models/inkling2/nvidia/ops/conv_mix.py
@@ -1824,10 +1832,10 @@ index 000000000..5a2217db9
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 000000000..93a740e96
+index 000000000..bd2816fb2
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,135 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W8A16 linears: bf16 weights quantized at load time to int8
@@ -1906,22 +1914,25 @@ index 000000000..93a740e96
 +        out = torch.empty((m, n), dtype=x.dtype, device=x.device)
 +    if m == 0:
 +        return out
-+    # Tiles tuned on an RTX 3090 Ti (L2-cold weights; tests/test_linear_w8.py
-+    # covers every branch). Decode: one row tile, column tiles narrow enough
-+    # to spread the weight over every SM.
-+    # Verify steps (2-64 rows: requests x (1 + drafts)) have their own tiles:
-+    # the prefill tile at 48 rows ran `wo` at 84 GB/s instead of 334.
-+    wide = n >= 4096
++    # Tiles tuned on an RTX 3090 Ti (L2-cold weights, bench/w8_gemv.py; tests/test_linear_w8.py
++    # covers every branch). Decode: one row tile, column tiles narrow enough to spread the
++    # weight over every SM. Verify steps (requests x (1 + drafts): 3-128 rows) have their own
++    # tiles; above 128 rows, the prefill tile.
++    # Four widths: k/v (<= 1024), o (< 4096), qkvr and the query side (< 32768), the LM head.
++    size = 0 if n <= 1024 else 1 if n < 4096 else 2 if n < 32768 else 3
 +    if m == 1:
-+        bm, bn, warps, stages = (16, 32, 4, 3) if wide else (16, 16, 2, 4)
-+    elif m <= 16:
-+        bm, bn, warps, stages = (16, 128, 8, 3) if wide else (16, 32, 4, 4)
++        tiles = ((16, 16, 2, 4), (16, 16, 2, 4), (16, 32, 4, 3), (16, 128, 8, 5))
++    elif m <= 12:
++        tiles = ((16, 32, 4, 4), (16, 32, 4, 4), (16, 32, 4, 3), (16, 128, 8, 5))
 +    elif m <= 32:
-+        bm, bn, warps, stages = (32, 128, 8, 3) if wide else (32, 32, 8, 3)
++        tiles = ((16, 32, 4, 3), (16, 64, 8, 3), (32, 128, 8, 3), (32, 64, 4, 2))
 +    elif m <= 64:
-+        bm, bn, warps, stages = (64, 128, 8, 3) if wide else (64, 32, 4, 4)
++        tiles = ((32, 32, 8, 3), (32, 64, 4, 3), (32, 128, 4, 3), (64, 128, 4, 2))
++    elif m <= 128:
++        tiles = ((32, 64, 4, 3), (32, 128, 8, 3), (64, 256, 8, 3), (128, 128, 8, 2))
 +    else:
-+        bm, bn, warps, stages = 64, 256, 8, 3
++        tiles = ((64, 256, 8, 3),) * 4
++    bm, bn, warps, stages = tiles[size]
 +    grid = (triton.cdiv(n, bn), triton.cdiv(m, bm))
 +    _w8_kernel[grid](
 +        x, q, scale, out, m, n, k,

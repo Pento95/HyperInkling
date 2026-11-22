@@ -37,7 +37,7 @@ def _weights():
     return out
 
 
-@pytest.mark.parametrize("tokens", [1, 6, 48, 512, 2048])
+@pytest.mark.parametrize("tokens", [1, 6, 18, 48, 96, 512, 2048])
 def test_w8_linear(tokens):
     torch.manual_seed(0)
     weights = _weights()
