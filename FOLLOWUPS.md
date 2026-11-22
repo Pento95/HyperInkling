@@ -11,9 +11,10 @@ fetched with `hf download --include` only when chosen.
 | after the post | 55, 10, 13, 38 | |
 | 4, release | 53, 50, then 51 if its image is public | Reddit post |
 
-Released: `ghcr.io/pento95/hyperinkling:0.1.1` (compose default), the HF checkpoint (its README
-is docs/MODEL_CARD.md: re-upload it when the card changes). A new image goes with a new tag
-and the compose default.
+Released: `ghcr.io/pento95/hyperinkling:0.1.2` (compose default) and two HF checkpoints, the
+original (README = docs/MODEL_CARD.md) and the uncensored one (README =
+docs/MODEL_CARD_UNCENSORED.md): re-upload a card when it changes. A new image goes with a new
+tag (`scripts/build-image.sh` refuses a published one) and the compose default.
 
 Where each idea comes from: **[HQ]** HyperQwen (github.com/syv-ai/HyperQwen, `patches/`, docs),
 **[BS]** basalt (github.com/jesdga95/basalt, MIT), **[AR]** Ar4ikov's vLLM PRs
