@@ -7,7 +7,7 @@ fetched with `hf download --include` only when chosen.
 | phase | items | then |
 |---|---|---|
 | 2, the checkpoint (alternatives, after the post) | 8, 11, 12, 14, 33 | new files on HF |
-| 3, context (best effort) | 32 first, then 17, 30, 38, 36 | |
+| 3, context (best effort) | 54, 38 | |
 | 4, speed and polish | 41, 9, 35, 13 (+37), 10, 34, 53, 51, 52, 50, in this order | Reddit post |
 
 Released: `ghcr.io/pento95/hyperinkling:0.1.1` (compose default), the HF checkpoint (its README
@@ -54,23 +54,17 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 
 ## Phase 3: context (best effort: no DSpark, vision off the GPU)
 
-17. **sconv state cache** as a fixed 3-token state instead of a fake sliding window [IK]:
-    frees the per-chunk-token reserve (0.85 GiB per step in flight at NBT 1024). With it,
-    async scheduling may fit 262k with DSpark (36).
 18. **4-bit KV for the global layers** [HQ KVarN]: halves the per-token KV. Then the wizard
     needs a 4-bit column.
 19. **Least-routed experts in host RAM when the context needs room** [BS]: the way toward
     1M without DSpark and without the vision tower on the GPU.
-30. **One boot for the context limit**: with the extensible KV cache (vLLM's default now)
-    the limit is checked again after warmup and graph capture; the first check is still
-    optimistic, so `bench/memory_matrix.sh` keeps its two boots (the second one's error is
-    the post-warmup limit). `--max-model-len -1` would fit it in one boot, but the drafter's
-    RoPE table is sized from the starting length (the model's 1M), ~25k tokens of KV.
-    Worth it only if the table could follow the fitted length.
-36. **Synchronous scheduling at one request** [NS nsys]: with async off (needed for 262k with
-    DSpark and the vision tower on the GPU) each step waits ~1.5 ms on the CPU (12.8 ms
-    steps). Either shrink the CPU side (profile input prep, sampler, drafter metadata) or
-    free enough KV that async fits (17, 38).
+54. **`MAX_LEN=auto` by default** (proposed): `--max-model-len -1` fits the longest request
+    after warmup, so a boot never fails for context and the wizard no longer computes it.
+    Needs the drafter's RoPE table sized independently of the starting length (today it
+    follows `max_model_len`: ~3k tokens of KV per 100k, ~25k from the model's 1M); `ASYNC`
+    becomes an explicit choice (async on: +3-4% decode, ~12k tokens), and
+    `bench/memory_matrix.sh` one boot per row (today two: the first check is still
+    optimistic).
 38. **Drafter SWA layers padded into the global groups' size** [NS]: the KV manager groups 9
     layers per block; the drafter's 2 SWA layers pad to 9 (the "350% padding" warning).
     Small real waste per block; merging that bucket with another frees it.
@@ -106,15 +100,9 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     container builds it).
 22. **Upstream PRs**: the processing.py dummy-size fix and the oversized-image downscale are
     real upstream bugs; so is the sconv padding-row fix (NOTES).
-32. **BASE on #69165** [AR] (in progress): its single commit on vLLM main replaces our sm8x
-    gating (`use_pdl`, `pdl.py`, `e4m3_arg`/`cast_store`, `use_native_conv_mix`, FA2 vision).
-    Ours stays: `use_sm12x_path` (Marlin experts, Triton attention), the scaled fp16 KV decode
-    in `attention_sm90.py`, INT8/INT4, DSpark, lookup. `ll_gemm_sm120` (#69168) now also
-    serves sm8x in place of the old `gemv.py`: compare the step with `bench/profile_spec.sh`
-    (before: 12.81/22.36/30.80 ms at 1/6/16). Test `ops/e4m3.py`'s encoder on inputs one fp32
-    ulp past every e4m3 tie (the double-rounding case of #69199/#69200, SM89 only, but cheap
-    to rule out). When #69165 merges, BASE moves to main. #69165 hit a sampler-warmup OOM at
-    `max_num_seqs` 256: keep the wizard's cap.
+32. **BASE to vLLM main when #69165 merges** [AR]: `patches/BASE` is its head today
+    (`scripts/setup-vllm.sh` stops if a force-push removed it). #69165 hit a sampler-warmup
+    OOM at `max_num_seqs` 256: keep the wizard's cap.
 34. **SiTU fused into the experts' w13 epilogue** [AX `labs/lab3b`]: today Marlin writes
     gate_up, a separate kernel applies the softcapped SiTU, w2 reads it back: one launch and
     a round trip per visit, 48 per token. AX fuses it in registers (and the top-8 w2

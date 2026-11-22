@@ -55,8 +55,10 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   projects a full layer's q/k/v (three different inputs) in one launch.
 - **Marlin for the experts**: the best MoE W4A16 kernel available here; at decode it reads
   ~900 GB/s.
-- **Prefill chunk 1024**: the sconv state cache reserves KV per chunk token (60%
-  padding on its blocks per upstream analysis); 2048 does not fit a 262k request.
+- **The sconv conv-state cache holds only each step's tail** (`SconvStateManager`): the
+  conv reads cached taps only for a step's first 3 tokens, so a step needs real blocks for
+  the window, the drafts in flight and one prefix-hit alignment (64 tokens), not for its
+  whole prefill chunk. Prefix hits land where a step ended (a prompt's end, chunk ends).
 - **Embeddings via UVA** (HyperQwen's `qwen3_5-embed-uva` mechanism): only the looked-up
   rows cross PCIe; frees ~23k tokens of KV.
 
@@ -104,14 +106,10 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   FlashAttention impl that only writes KV (FlashAttention refuses fp8 on SM8x; the draft
   attention runs in `block_decode_attention`, which reads the emulated E4M3 cache). Its
   pages then pack with the target's instead of being padded to them.
-- **Where a 262k request's KV goes** (DSpark, NBT 1024, blocks of 1.125 MiB): global
-  layers 4.50 GiB, sconv state 1.70 GiB (6 groups x 258 blocks: two in-flight chunks of
-  1024 under async scheduling), SWA windows 0.27, draft windows 0.06. With one step in
-  flight (`--no-async-scheduling`, `start.sh` `ASYNC=0`) the sconv and SWA reserves halve
-  (~55k more tokens) for -3 to -4% decode. With DSpark and the vision tower on the GPU a
-  262k request needs it (213k fits with async on, 268k without; docs/memory_matrix.tsv).
-  The profiled page size barely matters (A4 at 300 ppi: 215k with async on, at 150 ppi
-  213k).
+- **Longest request** (DSpark, vision tower on the GPU, 6 requests, FP8 KV): 303k with
+  async off, 291k with async on; with `NBT=2048` and 1024-token images 283k / 267k
+  The global layers hold almost all of it; async scheduling
+  now costs ~12k tokens (two in-flight tails) for +3-4% decode.
 - **Measure the context limit in two boots.** vLLM checks it before the warmup (without
   the transient activations and CUDA graphs, ~1.5 GiB here) and after. A limit far too
   large fails at the first check with an optimistic estimate (315k where 213k is real);
