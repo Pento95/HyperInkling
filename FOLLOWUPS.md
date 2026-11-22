@@ -32,7 +32,7 @@ dropped ideas are at the end, with the reason, so they are not re-tried blind.
 ### DSpark
 
 6. **Lookup drafting from the context** [HQ `dflash2-lookup-drafting`, BS suffix drafter]:
-   `ops/lookup.py`, `HYPERINKLING_LOOKUP=1`, off by default; lossless (greedy text equals
+   `ops/lookup.py`, `HYPERINKLING_LOOKUP`, on by default with the adaptive length; lossless (greedy text equals
    `SPEC=off`). Copying a 120-line table from a 2-50k document (`bench/copy_test.py`): at
    the default k it adds 2% (4.88 -> 5.00 tokens per step, the ceiling); at k=7 7-13%
    (7.07-7.43 -> 8.00; 438 -> 494 tok/s at 50k). The drafter copies tables well on its own;
@@ -43,7 +43,7 @@ dropped ideas are at the end, with the reason, so they are not re-tried blind.
    with file:line references and open doubts;
    mapped the changes: the sconv metadata builder's varlen bound, the decode combine kernel
    zeroing rows from the device total, the CPU `max_query_len` as an upper bound, and a
-   varlen test (the `SKIP_IDLE_CACHE` padding bug it found is fixed). Today `adaptive_k.py` picks one length per step (+1-3%, opt-in).
+   varlen test (the `SKIP_IDLE_CACHE` padding bug it found is fixed). Today `adaptive_k.py` picks one length per step for the whole batch (default, candidates 2,4,7).
 8. **Drafter GPTQ** [NS]: low priority, INT4 RTN accepts like bf16 on counting (6.6 vs 6.7).
 9. **Kernels compiled at boot** [HQ `spec-sampler-prewarm`]: vLLM's warmup prefills
    9-token requests only, so the first long prefill and first mixed batches compile ~10

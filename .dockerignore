@@ -8,6 +8,7 @@
 !bench/
 !docs/
 bench/perf/
-bench/kl/*.json
+bench/quality-data/
+bench/kl/**/*.json
 !bench/kl/corpus.json
 **/__pycache__

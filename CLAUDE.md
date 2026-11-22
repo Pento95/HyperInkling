@@ -45,7 +45,9 @@ Key mechanisms of the port (spread across several files):
   `SPEC_K` sets how many the target verifies per batch size (vLLM dynamic speculative
   decoding). Drafter layers and Markov fold INT4 (`ops/linear_w4.py`), base logits from the
   shared INT8 head, draft KV FP8 through a KV-write-only FlashAttention impl (`dspark.py`).
-  Opt-in online verify length: `vllm/v1/spec_decode/dynamic/adaptive_k.py`.
+  Online verify length (`HYPERINKLING_SPEC_ADAPTIVE`, default 2,4,7):
+  `vllm/v1/spec_decode/dynamic/adaptive_k.py`. Context lookup drafts (`HYPERINKLING_LOOKUP`,
+  default on): `ops/lookup.py`.
 - Images over the profiled page are scaled down in `processing.py` (`fit_to_budget`);
   `HYPERINKLING_VISION_HOST=1` streams the vision tower from host RAM per layer (`model.py`).
 - The small loop kernels carry the reference numerics (fixed summation orders, no FMA

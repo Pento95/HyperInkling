@@ -1,0 +1,55 @@
+name: Field report (your numbers)
+description: Speed or quality measured on your RTX 3090 / 3090 Ti, to set next to the README's.
+labels: [field report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for measuring. The README's numbers are one RTX 3090 Ti undervolted to 350 W with
+        gpu-unlock; yours tell other owners what to expect. The fields below make two runs
+        comparable. With a running server (default port 8080):
+
+        ```bash
+        venv/bin/python bench/quality_battery.py download     # once, ~0.4 GB
+        venv/bin/python bench/spec_bench.py 8080 512 user
+        venv/bin/python bench/extract_bench.py --port 8080 --seconds 300
+        venv/bin/python bench/quality_battery.py run --label mycard
+        ```
+        (In Docker: `docker compose exec hyperinkling python3 bench/...`.)
+  - type: dropdown
+    id: gpu
+    attributes:
+      label: GPU
+      options: [RTX 3090, RTX 3090 Ti]
+    validations: {required: true}
+  - type: input
+    id: power
+    attributes:
+      label: Power limit, clocks, gpu-unlock
+      placeholder: "350 W, stock clocks, gpu-unlock off"
+    validations: {required: true}
+  - type: input
+    id: system
+    attributes:
+      label: Driver, OS, Docker or native, RAM
+      placeholder: "driver 590.48, Ubuntu 24.04, Docker, 64 GB"
+    validations: {required: true}
+  - type: input
+    id: commit
+    attributes:
+      label: HyperInkling commit or image tag
+      placeholder: "git rev-parse --short HEAD, or ghcr.io/pento95/hyperinkling:0.1.1"
+    validations: {required: true}
+  - type: textarea
+    id: env
+    attributes:
+      label: Your .env (remove VLLM_API_KEY)
+      render: shell
+    validations: {required: true}
+  - type: textarea
+    id: results
+    attributes:
+      label: Output of the commands above
+      description: Paste it as printed. Ran something else? Say what, and paste that.
+      render: text
+    validations: {required: true}

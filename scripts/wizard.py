@@ -35,6 +35,10 @@ DECODE_1 = {"dspark": 214, "off": 128}
 # async scheduling off (measured 2026-11-21, 6 requests, vision on the GPU). With async on
 # it costs far more (213k -> 94k), so 2048 runs with async off.
 NBT2048_COST = {"dspark": 67_712, "off": 73_728}
+# The adaptive verify length (its CUDA graphs) and the context lookup, both on by default
+# with DSpark (candidates 2,4,7): context they take, by async scheduling (measured
+# 2026-11-22 at 6 requests with async off; the async-on cost is assumed the same).
+ADAPTIVE_COST = {False: 5_120, True: 5_120}
 
 
 def load_table():
@@ -174,6 +178,13 @@ def main():
     print(f"   n) no: longest request {fmt_tokens(off) if off else '?'}")
     spec = "dspark" if ask("   choice", "yn", "y") == "y" else "off"
 
+    adaptive = "n"
+    if spec == "dspark":
+        print("\n3a) Adaptive verify length and drafts from the context: +41-43% while the "
+              "answer copies the prompt, +20% at 6 requests, +4-6% on chat, "
+              f"for ~{fmt_tokens(ADAPTIVE_COST[False])} of context.")
+        adaptive = ask("   enable", "yn", "y")
+
     print("\n3b) Prefill chunk (NBT): 1024, or 2048 for +7-8% prefill (same decode) at "
           f"~{fmt_tokens(NBT2048_COST[spec])} less context, async scheduling off.")
     nbt = ask("   chunk", ("1024", "2048"), "1024")
@@ -185,6 +196,9 @@ def main():
     if nbt == "2048":
         fast_m = None
         slow_m = slow_m and slow_m - NBT2048_COST[spec]
+    if adaptive == "y":
+        fast_m = fast_m and fast_m - ADAPTIVE_COST[True]
+        slow_m = slow_m and slow_m - ADAPTIVE_COST[False]
     fast = max_limit(fast_m, spec) or 0
     best = max(fast, max_limit(slow_m, spec) or 0)
     print(f"\n4) Context limit per request (MAX_LEN), in tokens. Up to {fmt_tokens(fast or 0)}"
@@ -243,6 +257,9 @@ def main():
         env["IMAGES"] = 0
     if vision == "host":
         env["HYPERINKLING_VISION_HOST"] = 1
+    if spec == "dspark" and adaptive == "n":
+        env["HYPERINKLING_SPEC_ADAPTIVE"] = ""
+        env["HYPERINKLING_LOOKUP"] = 0
     if hasattr(os, "getuid"):  # compose's prepare writes ./models as this user
         env["UID"], env["GID"] = os.getuid(), os.getgid()
     if expose == "y":

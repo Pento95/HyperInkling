@@ -28,10 +28,15 @@ SPEC_K=${SPEC_K:-[[1,2,4],[3,6,3]]}
 # Drafts sampled from the draft distribution (as the reference) rather than
 # greedy: at temperature 0.2-0.5 struct went 264 -> 314 tok/s, 6-way 444 -> 465.
 SPEC_DRAFT=${SPEC_DRAFT:-probabilistic}
-# Experimental: the verify length chosen online per step (adaptive_k.py), from
-# these candidates, e.g. 1,2,3,4,5,7. +1-3% at the cost of ~7k tokens of KV
-# (one CUDA graph per candidate and batch size). Empty = the SPEC_K schedule.
-export HYPERINKLING_SPEC_ADAPTIVE=${HYPERINKLING_SPEC_ADAPTIVE:-}
+# The verify length chosen online per step (adaptive_k.py) from these candidates;
+# empty = the fixed SPEC_K schedule. Each candidate costs the context of one CUDA graph
+# per batch size: 2,4,7 ~5k tokens (still 262k with 6 requests and vision on the GPU),
+# 1,2,3,4,5,7 ~14k. With the lookup, against SPEC_K (2026-11-22): +41-43% copying,
+# +20% at 6 requests, +4-6% chat and prose, the rest within noise.
+export HYPERINKLING_SPEC_ADAPTIVE=${HYPERINKLING_SPEC_ADAPTIVE-2,4,7}
+# Drafts from the request's own context fused with DSpark's (ops/lookup.py): +7-13% on
+# top of a long verify length while the answer copies the prompt; lossless. 0 disables.
+export HYPERINKLING_LOOKUP=${HYPERINKLING_LOOKUP-1}
 # Extra speculative-config fields, as a JSON fragment starting with a comma.
 SPEC_OPTS=${SPEC_OPTS:-}
 MAX_LEN=${MAX_LEN:-262144}       # per request
@@ -163,7 +168,9 @@ echo "=================================================="
 echo "HyperInkling: $(basename "$MODEL") as '$SERVED_NAME' on $HOST:$PORT"
 echo "Context $MAX_LEN/request, $MAX_SEQS concurrent, prefill chunk $NBT, async scheduling $ASYNC"
 echo "KV $KV_DTYPE, prefix cache on, CPU tier ${KV_OFFLOAD_GB} GiB"
-echo "Speculation: $SPEC$([ "$SPEC" = dspark ] && echo ", $SPEC_DRAFT drafts, verify k ${HYPERINKLING_SPEC_ADAPTIVE:+adaptive over $HYPERINKLING_SPEC_ADAPTIVE}${HYPERINKLING_SPEC_ADAPTIVE:-by batch size $SPEC_K}")"
+if [ -n "$HYPERINKLING_SPEC_ADAPTIVE" ]; then verify="adaptive over $HYPERINKLING_SPEC_ADAPTIVE"
+else verify="by batch size $SPEC_K"; fi
+echo "Speculation: $SPEC$([ "$SPEC" = dspark ] && echo ", $SPEC_DRAFT drafts, verify k $verify, context lookup $HYPERINKLING_LOOKUP")"
 echo "INT8: attention=$HYPERINKLING_ATTN_W8 head=$HYPERINKLING_HEAD_W8" \
 	"embed=$HYPERINKLING_EMBED_W8 (host RAM: $HYPERINKLING_EMBED_UVA)"
 echo "Images: up to $IMAGES/request, ${IMAGE_MAX_W}x${IMAGE_MAX_H} profiled, larger ones scaled to $HYPERINKLING_IMAGE_MAX_CELLS cells, vision tower $([ "$HYPERINKLING_VISION_HOST" = 1 ] && echo 'in host RAM' || echo 'on the GPU')"

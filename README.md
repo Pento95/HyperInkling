@@ -52,7 +52,7 @@ python3 scripts/wizard.py --print   # the same questions, prints the env line
 Tested on Fedora 44 (gcc 15 next to the default gcc 16, CUDA 13.3). Other distributions
 should work where CUDA 13 and a gcc it accepts are installed; that is best effort.
 
-## Speed (RTX 3090 Ti, 2026-11-21)
+## Speed (RTX 3090 Ti, 2026-11-22)
 
 Measured on an RTX 3090 Ti undervolted to 350 W, with
 [gpu-unlock](https://github.com/zagitta/gpu-unlock) active; KV cache FP8 E4M3.
@@ -62,26 +62,27 @@ structured output and 0.5 for the rest, reasoning on):
 
 | | without DSpark | with DSpark (default) |
 |---|---|---|
-| chat (Italian, English) | 136 tok/s | ~145 |
-| code | 135 | ~230 |
-| structured output (JSON from text) | 135 | **~310** |
-| prose | 135 | ~145 |
-| questions over a document, quoting it | 133 | ~250 |
+| chat (Italian, English) | 136 tok/s | ~150 |
+| code | 135 | ~220 |
+| structured output (JSON from text) | 135 | **~295** |
+| prose | 135 | ~155 |
+| questions over a document, quoting it | 133 | ~275 |
+| copying a 120-line table from a 50k-token document (greedy) | not measured | **~490** |
 
 Long prompts of varied length (AA-LCR documents, 256 to 64k tokens, mean 13k; 512 tokens out;
 `bench/evalscope_perf.sh`, 10 minutes each):
 
 | | without DSpark | with DSpark |
 |---|---|---|
-| 1 request: decode | 128 tok/s | **214 tok/s** (1.68x) |
-| 1 request: time to first token | 2.66 s | 2.56 s |
-| 6 requests: time per output token | 38.9 ms | 33.4 ms |
-| 6 requests: output throughput | 125 tok/s | 142 tok/s |
+| 1 request: decode | 128 tok/s | **217 tok/s** (1.70x) |
+| 1 request: time to first token | 2.66 s | 2.64 s |
+| 6 requests: time per output token | 38.9 ms | 32.1 ms |
+| 6 requests: output throughput, aggregate | 125 tok/s | 141 tok/s |
 
 Document extraction, 6 requests at once (`bench/extract_bench.py`, 10 minutes: a shared ~3.5k
 token Italian system prompt, 1-3 DocVQA pages, half strict JSON at temperature 0.2, half
-Italian summaries at 0.5; prompts 6.4k tokens, answers 1.8k): 388 tok/s decode in total,
-time to first token 0.84 s median and 2.8 s p90, 2.3 tokens per verify step.
+Italian summaries at 0.5; prompts 6.4k tokens, answers 1.6k): 377 tok/s decode aggregate,
+time to first token 0.84 s median and 1.45 s p90, 2.4 tokens per verify step.
 
 DSpark is lossless: the target verifies every draft. It helps most where the text is
 predictable (structured output, code, quoting) and least on free prose, because a verify step
@@ -108,7 +109,9 @@ The wizard reads that table; these are the defaults and what each knob costs or 
 | `MAX_SEQS` | 6 | requests at once | longest request with DSpark: 279k at 1, 268k at 6, 257k at 16, 228k at 64 | 6 -> 16 requests: ~430 -> 740 tok/s decode in total |
 | `KV_OFFLOAD_GB` | `auto` (60% of RAM - 8 GiB, at most 36) | prefix-cache tier in host RAM (`/dev/shm`) | host RAM only | evicted prefixes come back in 0.1 s instead of seconds |
 | `NBT` | 1024 | prefill chunk | 2048: ~68k tokens less (268k -> 200k), async off; 512: more | 2048: +7-8% prefill (6,050 vs 5,610 tok/s), same decode; 512: -22% prefill |
-| `SPEC_K` | `[[1,2,4],[3,6,3]]` | drafts verified per step, by batch size | none | measured best |
+| `HYPERINKLING_SPEC_ADAPTIVE` | `2,4,7` | verify length chosen per step from these; empty = the fixed `SPEC_K` schedule | ~5k tokens (1,2,3,4,5,7: ~14k) | with the lookup: +41-43% copying, +20% at 6 requests |
+| `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context, fused with DSpark's (lossless) | 6 MB | +7-13% while copying |
+| `SPEC_K` | `[[1,2,4],[3,6,3]]` | drafts verified per step, by batch size, when the adaptive length is off | none | |
 | `SPEC_DRAFT` | `probabilistic` | drafts sampled from the draft distribution | none | +15-20% on structured output at temperature > 0 |
 | `HOST` / `VLLM_API_KEY` | 127.0.0.1 / none | who can connect | none | none |
 
@@ -120,7 +123,8 @@ Longest single request, 6 requests at once, KV at 8 bits:
 | in host RAM | 249k | 302k | 331k | 386k |
 | none | 249k | 302k | 336k | 386k |
 
-A long context without DSpark and without the vision tower on the GPU is best effort: it
+With DSpark the adaptive verify length (the default) takes ~5k tokens of these: 263k in the
+default column. A long context without DSpark and without the vision tower on the GPU is best effort: it
 grows as far as the 24 GiB allow (386k), not to the model's 1M.
 
 ## What runs where

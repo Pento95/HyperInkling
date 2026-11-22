@@ -76,10 +76,11 @@ KV cache FP8 E4M3.
 |---|---|---|
 | prefill, one 14.5k-token prompt | 5,550 tok/s | 5,470 tok/s |
 | prefill, 6 prompts at once, aggregate | 5,600 tok/s | 5,570 tok/s |
-| decode, one request, prose | 134 tok/s | 141 tok/s |
-| decode, one request, long documents (13k-token prompts) | 128 tok/s | 214 tok/s |
-| decode, one request, structured output | 135 tok/s | ~310 tok/s |
-| decode, 6 requests, prose, aggregate | 428 tok/s | 436 tok/s |
+| decode, one request, prose | 134 tok/s | ~160 tok/s |
+| decode, one request, long documents (13k-token prompts) | 128 tok/s | 217 tok/s |
+| decode, one request, structured output | 135 tok/s | ~295 tok/s |
+| decode, one request, copying a table from a 50k-token document | not measured | ~490 tok/s |
+| decode, 6 requests, prose, aggregate | 428 tok/s | ~435 tok/s |
 
 Prefill chunk (`NBT`, a wizard option): 2048 instead of the default 1024 gives 6,050 instead of
 5,610 tok/s prefill (one prompt and 6 at once, aggregate), the same decode, and ~68k tokens
@@ -94,6 +95,8 @@ Longest single request, 6 requests served at once, KV cache FP8 E4M3 (8 bits).
 | on the GPU | 213k | **268k** (default) | 291k | 345k |
 | in host RAM | 249k | 302k | 331k | 386k |
 | none (text only) | 249k | 302k | 336k | 386k |
+
+With DSpark, HyperInkling's adaptive verify length (on by default) takes ~5k tokens of these.
 
 ## Use
 

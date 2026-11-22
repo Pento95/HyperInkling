@@ -115,7 +115,9 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
 - **vLLM's adaptive verification does not run on Inkling**: it needs decode graphs with
   per-request query lengths, and `InklingSconvBackend` declares none. What would have to
   change (sconv builder, the decode combine kernel's row bound, ...) is mapped in a code
-  investigation, see FOLLOWUPS. `adaptive_k.py` chooses one length per step instead.
+  investigation, see FOLLOWUPS. `adaptive_k.py` chooses one length per step instead,
+  on by default with candidates 2,4,7 (~5k tokens of decode graphs; 1,2,3,4,5,7 costs
+  ~14k and no longer fits 262k with the vision tower on the GPU, for little more speed).
 - basalt (jesdga95/basalt, MIT, Blackwell only) runs the same drafter: its draft policy
   picks each window by expected tokens per ms, from stated per-draft chances
   (`include/basalt/spec/draft_policy.hpp`); vLLM's `enable_adaptive_verification` is the
