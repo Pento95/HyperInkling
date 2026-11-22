@@ -8,7 +8,7 @@ fetched with `hf download --include` only when chosen.
 |---|---|---|
 | 2, the checkpoint (alternatives, after the post) | 8, 11, 12, 14, 33 | new files on HF |
 | 3, context (best effort) | 54 (with 53) | |
-| after the post | 10, 13, 38 | |
+| after the post | 55, 10, 13, 38 | |
 | 4, release | 53, 50, then 51 if its image is public | Reddit post |
 
 Released: `ghcr.io/pento95/hyperinkling:0.1.1` (compose default), the HF checkpoint (its README
@@ -66,6 +66,12 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     GeForce; for the drafter it moves only acceptance (est. +2-3% at 6-16 requests).
     Building bf16 from bits (`code | 0x4300` = 128 + code, the zero point corrected per
     group from the row sums) gave +15-20% at 1-7 rows on split-K, worth ~0.03 ms a step.
+55. **Uncensored checkpoint** (in progress): `OpenUncensored/Inkling-2-Mini-Uncensored` is the
+    release's format with only the 20 `attn.wo_ud` (bf16) edited; GPTQ it from its own
+    corpus (two rounds, `SRC=... prepare/calib_round.sh`), KL against it, a separate HF repo,
+    and a wizard question that sets `HF_REPO`/`CHECKPOINT`. Sources in bf16 (other
+    fine-tunes) are still unsupported: `quantize_experts.py`/`gptq_experts.py` read only
+    NVFP4/MXFP8 experts, and a bf16 Inkling 2 Mini does not fit 24 GiB to generate and capture.
 38. **Drafter SWA layers padded into the global groups' size** [NS]: the KV manager groups 9
     layers per block; the drafter's 2 SWA layers pad to 9 (the "350% padding" warning).
     Small real waste per block; merging that bucket with another frees it.

@@ -53,63 +53,51 @@ run-to-run noise flips an expert dominate the mean.
 | the original against itself (run-to-run noise) | 0.0003 | 0.060 | 95.8% |
 | INT4 round-to-nearest experts | 0.0039 | 0.133 | 91.2% |
 | **INT4 GPTQ experts (this checkpoint)** | **0.0028** | **0.112** | **92.7%** |
-| + INT8 attention, head, embeddings, FP8 KV (HyperInkling's defaults) | 0.0030 | 0.117 | 92.4% |
+| + INT8 attention, head, embeddings, FP8 KV (HyperInkling's defaults) | 0.0032 | 0.123 | 92.0% |
 
 Document pages are close to the noise floor (mean 0.009).
 
 Task accuracy, the same server settings for both (`bench/quality_battery.py`, greedy, 200
-items each; about +-1.3 points of noise):
+items each; about +-1 to +-3 points of noise):
 
 | | original checkpoint | this checkpoint, served by HyperInkling |
 |---|---|---|
-| GSM8K | 0.965 | 0.970 |
-| tool calls, exact (names only) | 0.595 (0.685) | 0.610 (0.700) |
-| DocVQA as strict JSON, ANLS (valid JSON) | 0.926 (99.5%) | 0.930 (99.0%) |
+| GSM8K | 0.970 | 0.970 |
+| tool calls, exact (names only) | 0.645 (0.735) | 0.615 (0.710) |
+| DocVQA as strict JSON, ANLS (valid JSON) | 0.938 (99.5%) | 0.935 (99.5%) |
 
 ## Speed with HyperInkling (RTX 3090 Ti)
 
-Measured on an RTX 3090 Ti undervolted to 350 W, with
-[gpu-unlock](https://github.com/zagitta/gpu-unlock) active (it raises prefill, not decode).
-KV cache FP8 E4M3.
-
-Server context limit 262,144 tokens (the default); the NBT 2048 figures at 65,536 (a
-2048-token prefill chunk does not fit 262k). Prompt column: the tokens each request sends.
-
-| | prompt | without DSpark | with DSpark (default) |
-|---|---|---|---|
-| prefill, one prompt | 14.5k | 5,550 tok/s | 5,470 tok/s (NBT 2048: 6,050) |
-| prefill, 6 prompts at once, **aggregate** | 6 x 14.5k | 5,600 tok/s | 5,570 tok/s (NBT 2048: 6,050) |
-| decode, one request, prose | ~30, 512 out | 134 tok/s | ~160 tok/s |
-| decode, one request, long documents | 13k mean, 512 out | 128 tok/s | 217 tok/s |
-| decode, one request, structured output | ~100 | 135 tok/s | ~295 tok/s |
-| decode, one request, copying a table | 50k | not measured | ~490 tok/s |
-| decode, 6 requests, prose, **aggregate** | ~30 each, 512 out | 428 tok/s | ~435 tok/s |
-| decode, 16 requests, prose, **aggregate** | ~30 each, 512 out | not measured | ~785 tok/s |
-
-Long prompts are bound by the prefill (AA-LCR documents, mean 12k tokens, 512 out: 24 prompt
-tokens per generated one). With 6 at once the output cannot exceed ~5,600 / 24 = ~230 tok/s
-aggregate, and decode steps share the GPU with the others' prefill chunks.
+RTX 3090 Ti undervolted to 350 W with [gpu-unlock](https://github.com/zagitta/gpu-unlock)
+active (it raises prefill, not decode); HyperInkling's defaults (KV cache FP8 E4M3, prefill
+chunk 2048, async scheduling). Prompts of exactly 8k or 32k tokens, 512 tokens out, greedy;
+decode measured on prefix-cache hits while every request generates, so no prefill is inside
+it. "Aggregate" is the sum over the requests running at once.
 
 | | 1 request, no DSpark | 1 request, DSpark | 6 requests, no DSpark | 6 requests, DSpark |
 |---|---|---|---|---|
-| decode, per request | 128 tok/s | 217 tok/s | 26 tok/s | 31 tok/s |
-| output, **aggregate**, prefill time included | 77 tok/s | 102 tok/s | 125 tok/s | 141 tok/s |
-| time to first token (6: queueing included) | 2.66 s | 2.64 s | 4.64 s | 5.29 s |
-
-`NBT=2048` (a wizard option) costs ~68k tokens of context: 200k instead of 268k with DSpark,
-6 requests and the vision tower on the GPU.
+| prefill, per request, 8k context | 6,283 tok/s | 6,191 tok/s | 2,292 tok/s | 2,417 tok/s |
+| prefill, aggregate, 8k context | 6,283 tok/s | 6,191 tok/s | 6,243 tok/s | 6,191 tok/s |
+| decode, per request, 8k context | 131 tok/s | 267 tok/s | 68 tok/s | 114 tok/s |
+| decode, aggregate, 8k context | 131 tok/s | 267 tok/s | **407 tok/s** | **686 tok/s** |
+| prefill, per request, 32k context | 5,255 tok/s | 5,209 tok/s | 2,123 tok/s | 2,114 tok/s |
+| prefill, aggregate, 32k context | 5,255 tok/s | 5,209 tok/s | 5,267 tok/s | 5,223 tok/s |
+| decode, per request, 32k context | 124 tok/s | 188 tok/s | 58 tok/s | 108 tok/s |
+| decode, aggregate, 32k context | 124 tok/s | 188 tok/s | **350 tok/s** | **646 tok/s** |
 
 ## Maximum context with HyperInkling (RTX 3090 Ti)
 
-Longest single request, 6 requests served at once, KV cache FP8 E4M3 (8 bits).
+Longest single request, 6 requests served at once, KV cache FP8 E4M3 (8 bits), fitted by the
+server at boot.
 
-| vision tower | DSpark, async on | DSpark, async off | no DSpark, async on | no DSpark, async off |
-|---|---|---|---|---|
-| on the GPU | 213k | **268k** (default) | 291k | 345k |
-| in host RAM | 249k | 302k | 331k | 386k |
-| none (text only) | 249k | 302k | 336k | 386k |
+| vision tower | DSpark (default) | no DSpark |
+|---|---|---|
+| on the GPU (default) | **274k** | 357k |
+| in host RAM | 310k | 397k |
+| none (text only) | 311k | 390k |
 
-With DSpark, HyperInkling's adaptive verify length (on by default) takes ~5k tokens of these.
+Async scheduling off gives ~17k more, a 1024-token prefill chunk ~25k more. Without DSpark and
+the vision tower, async off, chunk 1024: 432k.
 
 ## Use
 
@@ -124,8 +112,8 @@ The server is OpenAI-compatible (`/v1`, model `inkling-2-mini`), with tool calls
 ## License and credits
 
 Apache-2.0, as the base model. Model and DSpark drafter by Thinking Machines Lab; vLLM support
-from [#69028](https://github.com/vllm-project/vllm/pull/69028); the porting approach follows
-[HyperQwen](https://github.com/syv-ai/HyperQwen). Ideas for the next steps from Ar4ikov's vLLM PRs
-[#69165](https://github.com/vllm-project/vllm/pull/69165) and
-[#69141](https://github.com/vllm-project/vllm/pull/69141), and
+from [#69028](https://github.com/vllm-project/vllm/pull/69028) and, on Ampere, Ar4ikov's
+[#69165](https://github.com/vllm-project/vllm/pull/69165); the porting approach follows
+[HyperQwen](https://github.com/syv-ai/HyperQwen). Ideas for the next steps from
+[#69141](https://github.com/vllm-project/vllm/pull/69141) and
 [inkling2-sm86-kernels](https://github.com/agent2x0r/inkling2-sm86-kernels).

@@ -80,10 +80,13 @@ CI (`.github/workflows/checks.yml`, no GPU): the patch applies to BASE, ruff, sh
 the wizard. Release side: `scripts/wizard.py` (questions -> `.env`, from `docs/memory_matrix.tsv`),
 `Dockerfile` + `docker-compose.yml` + `scripts/build-image.sh` (vLLM's own Dockerfile on
 `./vllm`, sm86 only),
-`bench/memory_matrix.sh` (longest request per knob combination, two boots each: vLLM's
-first, pre-warmup estimate is optimistic).
+`bench/memory_matrix.sh` (longest request per knob combination: one boot each with
+`MAX_LEN=auto`, which vLLM fits after warmup). Benches that boot `start.sh` pass `ENV_FILE=`
+(measure the defaults, not the `.env`) and `WARMUP=0`.
 
 Benchmarks and quality (all need a running server):
+- `bench/context_bench.sh <name>`: the README speed table (8k/32k context, 1 and 6 requests,
+  with and without DSpark; prefill on unseen prompts, decode on prefix hits).
 - `bench/metrics_window.py [seconds] [port]`: server-side throughput/TTFT; use this, not
   client-side numbers (client TTFT hides prefix-cache hits).
 - `scripts/quick_bench.py [concurrency] [max_tokens]`: quick client-side decode check.

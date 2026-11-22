@@ -2,12 +2,17 @@
 
 **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Thinking Machines
 Lab, Apache-2.0) on one RTX 3090 / 3090 Ti, with vLLM.** Text and images (document pages),
-tool calls, strict JSON output, 262k tokens of context per request, several requests at once,
-and the model's own DSpark drafter for speculative decoding.
+tool calls, strict JSON output, ~274k tokens of context per request, several requests at
+once, and the model's own DSpark drafter for speculative decoding.
 
 Upstream vLLM runs Inkling 2 Mini on Hopper and Blackwell. This repository is the port to
 one Ampere card (sm86) plus a requantized checkpoint that fits in 24 GB: a pinned vLLM with
 one patch, a model-preparation pipeline, and a launcher with measured defaults.
+
+It does not aim to beat other inference engines on one request at a time. It is a solid base
+for serving the new Inkling 2 Mini to **several requests in parallel** on one 3090: vLLM's
+batching, prefix cache and CPU tier, a long context next to the vision tower, and DSpark
+that still pays at 6 requests.
 
 > **Scope, honestly.** This is a personal project, written almost entirely with an AI coding
 > assistant ("vibe coded"), published because it may be useful to other 3090 owners. It
@@ -46,7 +51,7 @@ works; 64 GB lets the prefix-cache CPU tier hold long shared prompts.
 ### Without Docker
 
 ```bash
-scripts/setup-vllm.sh            # vllm/ = vLLM at patches/BASE + our patch
+scripts/setup-vllm.sh            # vllm/ = vLLM PR #69165 at patches/BASE + our patch
 scripts/build-vllm.sh            # venv/, sm86 only (~30-60 min)
 hf download Pentium95/Inkling-2-Mini-W4A16-g128-gptq --local-dir models/Inkling-2-Mini-W4A16-g128-gptq
 python3 scripts/wizard.py         # the same questions, writes .env
@@ -56,101 +61,66 @@ python3 scripts/wizard.py         # the same questions, writes .env
 Tested on Fedora 44 (gcc 15 next to the default gcc 16, CUDA 13.3). Other distributions
 should work where CUDA 13 and a gcc it accepts are installed; that is best effort.
 
-## Speed (RTX 3090 Ti, 2026-11-22)
+## Speed
 
-Measured on an RTX 3090 Ti undervolted to 350 W, with
-[gpu-unlock](https://github.com/zagitta/gpu-unlock) active; KV cache FP8 E4M3; DSpark on
-(the default). "Aggregate" is the sum over all requests running at once.
-
-Decode with short prompts (~30 tokens in, 512 out, greedy; `bench/profile_spec.sh`):
-
-| requests at once | 1 | 6 | 16 |
-|---|---|---|---|
-| decode, per request | 124 tok/s | 72 tok/s | 49 tok/s |
-| decode, aggregate | 124 tok/s | **434 tok/s** | **785 tok/s** |
-| time per step | 12.6 ms | 24.0 ms | 33.8 ms |
-
-Each step reads the experts the batch routes to: ~17 of 128 per layer visit for one request,
-~60 for 6, ~90 for 16 (measured on real routing), so more requests cost little more per step.
-
-Prompt processing (prefill), 14.5k-token prompts, context limit 262k:
-
-| prompts at once | 1 | 6 |
-|---|---|---|
-| prefill, aggregate | 5,500 tok/s | 5,600 tok/s |
-| prefill, aggregate, `NBT=2048` (context limit 65k: 2048 does not fit 262k) | 6,050 tok/s | 6,050 tok/s |
-
-One prompt already fills the GPU (prefill is compute-bound), so 6 at once share the same
-~5,600 tok/s. gpu-unlock raises the bf16 tensor-core rate (102 TFLOPS on a cuBLAS GEMM instead
-of ~40): that changes prefill, not decode, which is bandwidth-bound. A stock card prefills
-slower; decode is the same.
-
-Decode of one request, by kind of text (`bench/spec_bench.py`, temperature 0.2 for structured
-output and 0.5 for the rest, reasoning on):
-
-| | without DSpark | with DSpark (default) |
-|---|---|---|
-| chat (Italian, English) | 136 tok/s | ~150 |
-| code | 135 | ~220 |
-| structured output (JSON from text) | 135 | **~295** |
-| prose | 135 | ~155 |
-| questions over a document, quoting it | 133 | ~275 |
-| copying a 120-line table from a 50k-token document (greedy) | not measured | **~490** |
-
-Long prompts are bound by that prefill (AA-LCR documents, 256 to 64k tokens, mean 12k; 512
-tokens out, so 24 prompt tokens per generated one; `bench/evalscope_perf.sh`, 10 minutes each).
-With 6 at once the GPU prefills 6 x 12k tokens per round: the output cannot exceed
-~5,600 / 24 = ~230 tok/s aggregate however fast the decode, and each request's decode steps
-share the GPU with the others' prefill chunks.
+RTX 3090 Ti undervolted to 350 W with [gpu-unlock](https://github.com/zagitta/gpu-unlock)
+active; the defaults (KV cache FP8 E4M3, prefill chunk 2048, async scheduling). Prompts of
+exactly 8k or 32k tokens (AA-LCR documents, a detailed summary asked), 512 tokens out, greedy.
+Prefill on prompts never seen; decode on the same prompts again as prefix-cache hits,
+counted only while every request generates, so no prefill is inside it. "Aggregate" is the
+sum over the requests running at once (`bench/context_bench.sh`).
 
 | | 1 request, no DSpark | 1 request, DSpark | 6 requests, no DSpark | 6 requests, DSpark |
 |---|---|---|---|---|
-| decode, per request | 128 tok/s | **217 tok/s** | 26 tok/s | 31 tok/s |
-| output, aggregate, prefill time included | 77 tok/s | 102 tok/s | 125 tok/s | 141 tok/s |
-| time to first token (6: queueing included) | 2.66 s | 2.64 s | 4.64 s | 5.29 s |
+| prefill, per request, 8k context | 6,283 tok/s | 6,191 tok/s | 2,292 tok/s | 2,417 tok/s |
+| prefill, aggregate, 8k context | 6,283 tok/s | 6,191 tok/s | 6,243 tok/s | 6,191 tok/s |
+| decode, per request, 8k context | 131 tok/s | 267 tok/s | 68 tok/s | 114 tok/s |
+| decode, aggregate, 8k context | 131 tok/s | 267 tok/s | **407 tok/s** | **686 tok/s** |
+| prefill, per request, 32k context | 5,255 tok/s | 5,209 tok/s | 2,123 tok/s | 2,114 tok/s |
+| prefill, aggregate, 32k context | 5,255 tok/s | 5,209 tok/s | 5,267 tok/s | 5,223 tok/s |
+| decode, per request, 32k context | 124 tok/s | 188 tok/s | 58 tok/s | 108 tok/s |
+| decode, aggregate, 32k context | 124 tok/s | 188 tok/s | **350 tok/s** | **646 tok/s** |
 
-Document extraction, 6 requests at once (`bench/extract_bench.py`, 10 minutes: a shared ~3.5k
-token Italian system prompt, 1-3 DocVQA pages, half strict JSON at temperature 0.2, half
-Italian summaries at 0.5; prompts 6.4k tokens, answers 1.6k): 377 tok/s decode aggregate,
-time to first token 0.84 s median and 1.45 s p90, 2.4 tokens per verify step.
-
-DSpark is lossless: the target verifies every draft. It helps most where the text is
-predictable (structured output, code, quoting) and least on free prose, because a verify step
-on a mixture-of-experts model reads many more experts than a plain step (NOTES.md).
+One prompt already fills the GPU (prefill is compute-bound), so 6 at once share the same
+~6,200 tok/s. gpu-unlock raises the bf16 tensor-core rate (102 TFLOPS on a cuBLAS GEMM instead
+of ~40): it changes prefill, not decode, which is bandwidth-bound. DSpark is lossless (the
+target verifies every draft); how much it gains depends on the text: most on code, structured
+output and answers that quote the prompt, least on free prose like these summaries.
 
 ## Context and the knobs that trade it
 
-All measured with the 8-bit KV cache (`docs/memory_matrix.tsv`, `bench/memory_matrix.sh`).
-The wizard reads that table; these are the defaults and what each knob costs or frees.
+Longest single request, 6 requests at once, KV at 8 bits, the defaults otherwise
+(`docs/memory_matrix.tsv`, `bench/memory_matrix.sh`). The server fits it at boot
+(`MAX_LEN=auto`); the wizard shows it for every choice.
+
+| vision tower | DSpark (default) | no DSpark |
+|---|---|---|
+| on the GPU (default) | **274k** | 357k |
+| in host RAM | 310k | 397k |
+| none (text only) | 311k | 390k |
+
+With DSpark and the vision tower on the GPU: 289k at 1 request, 256k at 16, 235k at 32,
+197k at 64. Async scheduling off gives ~17k more; a prefill chunk of 1024 ~25k more. Without
+DSpark, without the vision tower, with async scheduling off and a 1024 prefill chunk: **432k**
+at 1 request (427k at 6), as far as the 24 GiB allow, not to the model's 1M.
 
 | knob | default | what it does | context / VRAM | speed |
 |---|---|---|---|---|
-| `SPEC` | `dspark` | speculative decoding with the bundled drafter | ~90k tokens less for the longest request (291k vs 379k, async on, vision on the GPU) | 1.3-2.3x decode on one request |
+| `SPEC` | `dspark` | speculative decoding with the bundled drafter | ~83k tokens less (274k vs 357k) | 1.5-2x decode at one request, 1.7-1.8x aggregate at 6 |
 | `MAX_LEN` | `auto` | longest request: `auto` is what the KV cache holds after warmup; a number caps it (and the boot fails if it does not fit) | none | none |
-| `ASYNC` | 1 | async scheduling (two steps in flight) | off: ~12k tokens more for the longest request | off: -3 to -4% decode |
-| `IMAGES` | 50 | images per request; 0 = no vision tower | 0: ~34k tokens more | no images |
-| `HYPERINKLING_VISION_HOST` | 0 | vision tower weights in host RAM, copied to the GPU layer by layer per image | 1: ~34k tokens more (as much as no vision) | +27 ms per A4 page (0.39 s vs 0.37 s to first token for one page) |
-| `IMAGE_MAX_W` / `_H` | 1240 x 1760 | largest image (A4 at 150 ppi, 1,364 tokens); larger ones are scaled down to it | A4 at 300 ppi (2480 x 3508, with `ENCODER_CACHE=16384`): about the same context, but each page costs ~4x the tokens | 300 ppi: ~4x the prefill per page |
-| `MAX_SEQS` | 6 | requests at once | longest request with DSpark: 279k at 1, 268k at 6, 257k at 16, 228k at 64 | 6 -> 16 requests: ~430 -> 785 tok/s decode aggregate |
+| `ASYNC` | 1 | async scheduling (two steps in flight) | off: ~17k tokens more | off: -3 to -4% decode |
+| `NBT` | 2048 | prefill chunk (and image encodings per step) | 1024: ~25k tokens more | 1024: -8% prefill, same decode |
+| `IMAGES` | 50 | images per request; 0 = no vision tower | 0: ~37k tokens more | no images |
+| `HYPERINKLING_VISION_HOST` | 0 | vision tower weights in host RAM, copied to the GPU layer by layer per image | 1: ~36k tokens more | +27 ms per A4 page |
+| `IMAGE_MAX_W` / `_H` | 1040 x 1560 | largest image: 1,014 tokens, an A4 page at ~126 ppi (two per 2048 chunk); larger ones are scaled down to it | A4 at 300 ppi (2480 x 3508, with `ENCODER_CACHE=16384`): ~5.5x the tokens per page | 300 ppi: ~5.5x the prefill per page |
+| `MAX_SEQS` | 6 | requests at once | 289k at 1, 274k at 6, 256k at 16, 197k at 64 | more aggregate decode |
 | `KV_OFFLOAD_GB` | `auto` (60% of RAM - 8 GiB, at most 36) | prefix-cache tier in host RAM (`/dev/shm`) | host RAM only | evicted prefixes come back in 0.1 s instead of seconds |
-| `NBT` | 1024 | prefill chunk | 2048: ~20k tokens less | 2048: +7-8% prefill (6,050 vs 5,610 tok/s), same decode; 512: -22% prefill |
-| `HYPERINKLING_SPEC_ADAPTIVE` | `2,4,7` | verify length chosen per step from these; empty = the fixed `SPEC_K` schedule | ~5k tokens (1,2,3,4,5,7: ~14k) | with the lookup: +41-43% copying, +20% at 6 requests |
+| `HYPERINKLING_SPEC_ADAPTIVE` | `2,4,7` | verify length chosen per step from these; empty = the fixed `SPEC_K` schedule | ~5k tokens | with the lookup: +41-43% copying, +20% at 6 requests |
 | `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context, fused with DSpark's (lossless) | 6 MB | +7-13% while copying |
 | `SPEC_K` | `[[1,2,4],[3,6,3]]` | drafts verified per step, by batch size, when the adaptive length is off | none | |
 | `SPEC_DRAFT` | `probabilistic` | drafts sampled from the draft distribution | none | +15-20% on structured output at temperature > 0 |
+| `WARMUP` | 1 | requests at the shapes vLLM's warmup leaves out, right after `/health` | none | no compile stalls on the first requests (4 s at boot, 14 s after an update) |
 | `HOST` / `VLLM_API_KEY` | 127.0.0.1 / none | who can connect | none | none |
-
-Longest single request, 6 requests at once, KV at 8 bits:
-
-| vision tower | DSpark, async on | DSpark, async off | no DSpark, async on | no DSpark, async off |
-|---|---|---|---|---|
-| on the GPU | 213k | **268k** (the default) | 291k | 345k |
-| in host RAM | 249k | 302k | 331k | 386k |
-| none | 249k | 302k | 336k | 386k |
-
-With DSpark the adaptive verify length (the default) takes ~5k tokens of these: 263k in the
-default column. A long context without DSpark and without the vision tower on the GPU is best effort: it
-grows as far as the 24 GiB allow (386k), not to the model's 1M.
 
 ## What runs where
 
@@ -162,6 +132,7 @@ grows as far as the 24 GiB allow (386k), not to the model's 1M.
 | token embeddings | INT8 g128, in pinned host RAM (UVA) | lookup |
 | KV cache | unit-scale FP8 E4M3, emulated (sm86 has no FP8) | Triton attention, fp16 MMAs |
 | loop controllers, sconv taps | bf16 | Triton batched GEMV |
+| short-conv state | only each step's last tokens hold real blocks | Triton |
 | DSpark drafter | layers INT4 g128; Markov fold INT4; KV FP8 | Triton W4A16 split-K |
 | vision tower | bf16, on the GPU (or streamed from host RAM) | FlashAttention-2 + cuBLAS |
 | prefix cache | GPU + CPU tier | vLLM OffloadingConnector |
@@ -181,35 +152,69 @@ dominate the mean.
 | the original against itself (noise) | 0.0003 | 0.060 | 95.8% |
 | experts INT4, round to nearest | 0.0039 | 0.133 | 91.2% |
 | experts INT4 GPTQ | 0.0028 | 0.112 | 92.7% |
-| **as served**: + INT8 attention, head, embeddings, FP8 KV | **0.0030** | 0.117 | 92.4% |
+| **as served**: + INT8 attention, head, embeddings, FP8 KV | **0.0032** | 0.123 | 92.0% |
 
 Document pages are close to the noise floor (mean 0.009). Speculative decoding does not
 change the output distribution.
 
 Task accuracy, the same server settings for both (`bench/quality_battery.py`, greedy, 200
-items each; about +-1.3 points of noise):
+items each; about +-1 to +-3 points of noise):
 
 | | original checkpoint | HyperInkling as served |
 |---|---|---|
-| GSM8K | 0.965 | 0.970 |
-| tool calls, exact (names only) | 0.595 (0.685) | 0.610 (0.700) |
-| DocVQA as strict JSON, ANLS (valid JSON) | 0.926 (99.5%) | 0.930 (99.0%) |
+| GSM8K | 0.970 | 0.970 |
+| tool calls, exact (names only) | 0.645 (0.735) | 0.615 (0.710) |
+| DocVQA as strict JSON, ANLS (valid JSON) | 0.938 (99.5%) | 0.935 (99.5%) |
 
-## Model preparation
+## Quantizing a model for HyperInkling
 
-The published checkpoint is the output of this pipeline; you only need it to redo the
-quantization.
+The published checkpoint is the output of this pipeline. It turns a checkpoint with Inkling 2
+Mini's architecture into one HyperInkling serves: routed experts INT4, group 128, asymmetric,
+GPTQ-calibrated on the model's own text (AWQ layout, for Marlin); every other tensor and the
+DSpark drafter unchanged (attention, LM head and embeddings become INT8 at load time).
+
+The source must be in the release's format (experts NVFP4 on layers 0-19, MXFP8 on 20-23,
+`hf_quant_config.json` from modelopt), like `thinkingmachines/Inkling-2-Mini`; other formats
+(a bf16 fine-tune) are not supported yet. Needs the native install, one RTX 3090 and ~75 GB of
+disk (source ~20, captured activations ~35, output ~17).
 
 ```bash
 V=venv/bin/python
-# 1. calibration corpus from public datasets (data/calib-src, see NOTES.md), answers
-#    generated by the original checkpoint (needs a server on :18030 with tool/reasoning parsers)
-$V prepare/build_calib.py data/calib/calib.jsonl data/calib/eval.jsonl
-# 2. capture MoE inputs + routing (eager server with HYPERINKLING_CAPTURE_DIR set)
-$V prepare/replay_capture.py data/calib/calib.jsonl data/capture
-# 3. GPTQ the experts into the INT4 checkpoint (~5 min, GPU)
-$V prepare/gptq_experts.py models/Inkling-2-Mini data/capture models/Inkling-2-Mini-W4A16-g128-gptq
+SRC=models/Inkling-2-Mini        # the source checkpoint
+OUT=models/Inkling-2-Mini-W4A16-g128-gptq
+# 0. the public datasets the prompts come from (licenses in NOTES.md)
+hf download --repo-type dataset NousResearch/hermes-function-calling-v1 \
+    func-calling.json func-calling-singleturn.json --local-dir data/calib-src/hermes-fc
+hf download --repo-type dataset ise-uiuc/Magicoder-Evol-Instruct-110K \
+    data-evol_instruct-decontaminated.jsonl --local-dir data/calib-src/magicoder
+hf download --repo-type dataset pixparse/docvqa-single-page-questions \
+    data/train-00002-of-00036.parquet --local-dir data/calib-src/docvqa
+hf download --repo-type dataset HuggingFaceH4/ultrachat_200k \
+    data/test_gen-00000-of-00001-3d4cd8309148a71f.parquet --local-dir data/calib-src/ultrachat
+hf download --repo-type dataset wikimedia/wikipedia \
+    20231101.it/train-00002-of-00010.parquet --local-dir data/calib-src/wiki-it
+# 1. the source answers the prompts itself: 82 calibration transcripts (~166k tokens) and
+#    22 held out for the check (server on :18030 with the tool and reasoning parsers)
+MODEL=$SRC MM_LIMIT='{"image":1}' MAX_LEN=16384 MAX_SEQS=6 EAGER= scripts/serve-try.sh gen \
+    --max-num-batched-tokens 512 --reasoning-parser inkling --enable-auto-tool-choice \
+    --tool-call-parser inkling &        # wait for curl -sf 127.0.0.1:18030/health
+$V prepare/build_calib.py data/calib/calib.jsonl data/calib/eval.jsonl   # then stop the server
+# 2. capture the experts' inputs and routing while the source rereads them (eager server)
+HYPERINKLING_CAPTURE_DIR=$PWD/data/capture MODEL=$SRC MM_LIMIT='{"image":1}' MAX_LEN=16384 \
+    MAX_SEQS=2 scripts/serve-try.sh capture --max-num-batched-tokens 512 \
+    --reasoning-parser inkling --enable-auto-tool-choice --tool-call-parser inkling &   # wait
+$V prepare/replay_capture.py data/calib/calib.jsonl data/capture          # then stop it
+# 3. GPTQ every layer's experts (~5 min on the GPU)
+$V prepare/gptq_experts.py $SRC data/capture $OUT
+# 4. check: teacher-forced KL against the source on the held-out transcripts
+bench/kl_sweep.sh data/calib/eval.jsonl bench/kl/mine ref=$SRC int4=$OUT
+$V bench/kl_eval.py compare bench/kl/mine/ref.json bench/kl/mine/int4.json data/calib/eval.jsonl
 ```
+
+Serve the result with `MODEL=$OUT ./start.sh`. For reference, the published checkpoint scores
+a KL median of 0.0028 against the release (0.0003 is the run-to-run noise; round to nearest,
+`prepare/quantize_experts.py`, 0.0039). `prepare/calib_round.sh` runs steps 1-4 for a further
+round with a new seed; a second round of 166k tokens changed nothing measurable here.
 
 ## Repository
 
@@ -219,9 +224,9 @@ $V prepare/gptq_experts.py models/Inkling-2-Mini data/capture models/Inkling-2-M
 | `scripts/wizard.py` | asks the questions, writes `.env` |
 | `Dockerfile`, `docker-compose.yml`, `scripts/build-image.sh` | the container |
 | `patches/` | the vLLM patch and its base commit (`BASE`) |
-| `scripts/` | `setup-vllm.sh`, `build-vllm.sh`, `serve-try.sh`, `quick_bench.py` |
+| `scripts/` | `setup-vllm.sh`, `build-vllm.sh`, `serve-try.sh`, `quick_bench.py`, `warmup.py`, `verify-image.py` |
 | `prepare/` | INT4 packing, RTN and GPTQ converters, calibration corpus and capture |
-| `bench/` | speed (per kind of text, long prompts, server-side metrics), memory matrix, KL eval, profiles |
+| `bench/` | speed (fixed contexts, per kind of text, long prompts, server-side metrics), memory matrix, KL eval, quality battery, profiles |
 | `tests/` | kernel and processor tests (`venv/bin/python -m pytest -q tests/`) |
 | `docs/` | measured tables |
 
@@ -234,10 +239,13 @@ $V prepare/gptq_experts.py models/Inkling-2-Mini data/capture models/Inkling-2-M
   by expected tokens per millisecond) and its handling of oversized images informed ours.
 - vLLM's Inkling 2 support ([#69028](https://github.com/vllm-project/vllm/pull/69028)), and
   Thinking Machines Lab for the model and its drafter.
-- Ar4ikov's vLLM PRs [#69165](https://github.com/vllm-project/vllm/pull/69165) (Inkling 2 on
-  SM80/86/89) and [#69141](https://github.com/vllm-project/vllm/pull/69141) (compressed-tensors
-  experts), and [inkling2-sm86-kernels](https://github.com/agent2x0r/inkling2-sm86-kernels)
-  (a 2x3090 bring-up with SM86 kernel labs): ideas for the next steps (FOLLOWUPS.md).
+- Ar4ikov's vLLM PR [#69165](https://github.com/vllm-project/vllm/pull/69165) (Inkling 2 on
+  SM80/86/89), our vLLM base; his [#69141](https://github.com/vllm-project/vllm/pull/69141)
+  (compressed-tensors experts) and
+  [inkling2-sm86-kernels](https://github.com/agent2x0r/inkling2-sm86-kernels) (a 2x3090
+  bring-up with SM86 kernel labs): ideas for the next steps (FOLLOWUPS.md).
+- [club-3090](https://github.com/noonghunna/club-3090), which serves Inkling 2 Mini on 3090s
+  too: its release guards (a published tag never moves, the compiled ops checked on the GPU).
 - [llm-compressor](https://github.com/vllm-project/llm-compressor): the route for calibrated
   quantization of the parts we quantize at load today.
 

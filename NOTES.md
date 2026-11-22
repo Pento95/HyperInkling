@@ -117,10 +117,11 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   async off, 291k with async on; with `NBT=2048` and 1024-token images 283k / 267k
   The global layers hold almost all of it; async scheduling
   now costs ~12k tokens (two in-flight tails) for +3-4% decode.
-- **Measure the context limit in two boots.** vLLM checks it before the warmup (without
-  the transient activations and CUDA graphs, ~1.5 GiB here) and after. A limit far too
-  large fails at the first check with an optimistic estimate (315k where 213k is real);
-  boot again at that estimate to get the real one (`bench/memory_matrix.sh`).
+- **Measure the context limit with `MAX_LEN=auto`.** vLLM checks a fixed limit before the
+  warmup (without the transient activations and CUDA graphs, ~1.5 GiB here, so its estimate
+  is optimistic) and again after it; `--max-model-len -1` fits the limit after warmup in one
+  boot. That needs nothing sized by `max_model_len`: the drafter computes its RoPE angles
+  instead of a table (a 1M table would cost ~25k tokens).
 - **Vision tower in host RAM** (`HYPERINKLING_VISION_HOST=1`, each layer copied in before
   it runs): +27 ms per A4 page at 150 ppi, and as much context as no vision at all.
 - **vLLM's adaptive verification does not run on Inkling**: it needs decode graphs with
