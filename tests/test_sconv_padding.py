@@ -17,21 +17,22 @@ H, WS, W, N = 8, 128, 4, 16  # heads, stream width, taps, cache block size
 
 
 def _batch(lens, ctx, pad, blocks_per_req):
-    """Metadata for requests of `lens` new tokens after `ctx` cached ones."""
+    """Metadata for requests of `lens` new tokens after `ctx` cached ones; block 0
+    is the null block, as in vLLM (the conv never stores there)."""
     qsl = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32)
     total = int(qsl[-1])
     positions, slots = [], []
     for r, (q, c) in enumerate(zip(lens, ctx)):
         for p in range(c, c + q):
             positions.append(p)
-            slots.append((r * blocks_per_req + p // N) * N + p % N)
+            slots.append((1 + r * blocks_per_req + p // N) * N + p % N)
     positions += [0] * pad
     slots += [-1] * pad
     T = total + pad
     seq_idx = torch.empty(T, dtype=torch.int32, device="cuda")
     qstart = torch.empty(T, dtype=torch.int32, device="cuda")
     sconv_seq_metadata(qsl.cuda(), len(lens), total, seq_idx, qstart, T)
-    bt = torch.arange(len(lens) * blocks_per_req, dtype=torch.int32, device="cuda")
+    bt = 1 + torch.arange(len(lens) * blocks_per_req, dtype=torch.int32, device="cuda")
     return (
         torch.tensor(positions, dtype=torch.int64, device="cuda"),
         bt.view(len(lens), blocks_per_req),
@@ -47,7 +48,7 @@ def test_padded_decode_over_256(q):
     reqs, blocks_per_req, pad = 95, 4, 13  # real tokens not a multiple of the tile
     lens = [q] * reqs
     ctx = torch.randint(W, blocks_per_req * N - q, (reqs,)).tolist()
-    cache = torch.randn(reqs * blocks_per_req, H, N, WS, device="cuda").to(torch.bfloat16)
+    cache = torch.randn(1 + reqs * blocks_per_req, H, N, WS, device="cuda").to(torch.bfloat16)
     weight = (torch.randn(H * WS, W, device="cuda") * 0.5).to(torch.bfloat16)
     x = torch.randn(reqs * q, H * WS, device="cuda").to(torch.bfloat16)
     assert reqs * q + pad > 256

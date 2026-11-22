@@ -4,6 +4,7 @@
 # it does), in two boots (see below). Feeds the wizard's table (scripts/wizard.py).
 #
 #   bench/memory_matrix.sh [out.tsv]        # ~3 min per combination, GPU must be free
+#   EXTRA_ENV="NBT=2048 IMAGE_MAX_W=1040 IMAGE_MAX_H=1560" bench/memory_matrix.sh x.tsv
 #
 # Columns: vision spec async max_seqs  max_len_fits  pool_tokens  weights_gib  measured_at
 # (max_len_fits is vLLM's estimate at MAX_LEN = measured_at; the drafter's RoPE table
@@ -17,7 +18,7 @@ COMBOS=${COMBOS:-"gpu:dspark:1:6 gpu:dspark:0:6 gpu:off:1:6 host:dspark:1:6 host
 for c in $COMBOS; do
 	IFS=: read -r vision spec async seqs <<< "$c"
 	log=.local/memmatrix/$vision-$spec-a$async-s$seqs.log
-	env_args=(PORT=$PORT KV_OFFLOAD_GB=0 SPEC=$spec ASYNC=$async MAX_SEQS=$seqs)
+	env_args=(PORT=$PORT KV_OFFLOAD_GB=0 SPEC=$spec ASYNC=$async MAX_SEQS=$seqs ${EXTRA_ENV:-})
 	case $vision in
 	host) env_args+=(HYPERINKLING_VISION_HOST=1) ;;
 	none) env_args+=(IMAGES=0) ;;

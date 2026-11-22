@@ -51,7 +51,7 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   scheduling at one request (async off at 262k).
 - **INT8 attention on a Triton GEMV, not Marlin**: Marlin W8A16 at one token reached
   ~45% of bandwidth on these small matrices, slower than the bf16 GEMV it replaced.
-  The Triton kernel (derived from Inkling's own `ops/gemv.py`) reaches 80-90%, and
+  The Triton kernel (`ops/linear_w8.py`) reaches 80-90%, and
   projects a full layer's q/k/v (three different inputs) in one launch.
 - **Marlin for the experts**: the best MoE W4A16 kernel available here; at decode it reads
   ~900 GB/s.

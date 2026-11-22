@@ -6,9 +6,9 @@ fetched with `hf download --include` only when chosen.
 
 | phase | items | then |
 |---|---|---|
-| 2, the checkpoint (alternatives to the published one) | 8, 11, 12, 13, 14, 33 | new files on HF |
-| 3, context (best effort) | 17, 18, 19, 30, 36, 38, 39 | |
-| 4, speed and polish | 7, 9, 10, 21, 22, 32, 34, 35, 37, 41, 50 | Reddit post |
+| 2, the checkpoint (alternatives, after the post) | 8, 11, 12, 14, 33 | new files on HF |
+| 3, context (best effort) | 32 first, then 17, 30, 38, 36 | |
+| 4, speed and polish | 41, 9, 35, 13 (+37), 10, 34, 53, 51, 52, 50, in this order | Reddit post |
 
 Released: `ghcr.io/pento95/hyperinkling:0.1.1` (compose default), the HF checkpoint (its README
 is docs/MODEL_CARD.md: re-upload it when the card changes). A new image goes with a new tag
@@ -19,6 +19,7 @@ Where each idea comes from: **[HQ]** HyperQwen (github.com/syv-ai/HyperQwen, `pa
 [#69165](https://github.com/vllm-project/vllm/pull/69165) (Inkling 2 on SM80/86/89) and
 [#69141](https://github.com/vllm-project/vllm/pull/69141) (compressed-tensors experts),
 **[AX]** github.com/agent2x0r/inkling2-sm86-kernels (2x3090 bring-up, `labs/`, `csrc/`),
+**[C3]** club-3090 (github.com/noonghunna/club-3090, its `vllm-inkling` image recipe),
 **[LC]** [llm-compressor](https://github.com/vllm-project/llm-compressor), **[IK]** the model's
 own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 
@@ -60,9 +61,12 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     needs a 4-bit column.
 19. **Least-routed experts in host RAM when the context needs room** [BS]: the way toward
     1M without DSpark and without the vision tower on the GPU.
-30. **Memory profile after warmup** [HQ `memory-profile-after-warmup`]: vLLM checks the
-    context limit before the warmup, hence the two-boot measurement (NOTES). Profiling after
-    it makes the first boot's estimate the real one.
+30. **One boot for the context limit**: with the extensible KV cache (vLLM's default now)
+    the limit is checked again after warmup and graph capture; the first check is still
+    optimistic, so `bench/memory_matrix.sh` keeps its two boots (the second one's error is
+    the post-warmup limit). `--max-model-len -1` would fit it in one boot, but the drafter's
+    RoPE table is sized from the starting length (the model's 1M), ~25k tokens of KV.
+    Worth it only if the table could follow the fitted length.
 36. **Synchronous scheduling at one request** [NS nsys]: with async off (needed for 262k with
     DSpark and the vision tower on the GPU) each step waits ~1.5 ms on the CPU (12.8 ms
     steps). Either shrink the CPU side (profile input prep, sampler, drafter metadata) or
@@ -81,13 +85,15 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
    changes (sconv builder varlen bound, the decode combine kernel's row bound from the
    device total, the CPU `max_query_len` as an upper bound, a varlen test). Today
    `adaptive_k.py` picks one length per step for the whole batch.
-9. **Kernels compiled at boot** [HQ `spec-sampler-prewarm`]: vLLM's warmup prefills 9-token
-   requests and decodes up to 48 tokens, so the first real requests compile ~10 Triton
-   variants (~5 s on the first TTFT, once per Triton cache): `_sconv_kernel` above 256
-   tokens (with and without a multiple of 16) and in 129-256, `_rel_attention_kernel` at
-   BLOCK_M 64, mixed prefill+decode steps. A warmup step at those shapes in
-   `v1/worker/gpu/warmup.py` moves it to boot. The "JIT" warnings at every boot are disk-cache
-   hits (ms), not compiles.
+9. **Kernels compiled at the first requests** [HQ `spec-sampler-prewarm`]: the boot warmup
+   (with the extensible KV cache: decode graphs, <= 54-token steps, a full-budget mixed
+   step) leaves out prefills of 65-256 tokens (`_k_group_kernel`, `_select_kernel`,
+   `_w8_kernel` tiles), prefills over 256 tokens not a multiple of 16 (`_attn_res_kernel`,
+   `_sconv_kernel`, ...), a pure 1024/2048 prefill (`_rel_attention_kernel`), and the LM head
+   outside the graphs at verify row counts (15-40). ~5 s once per Triton cache, then disk
+   hits (the monitor's warnings at every boot). Cheapest fix: `start.sh` sends warm-up
+   requests at the real shapes once `/health` answers (100, 200, 700, 1500 tokens; 6 at
+   once with speculation) before printing ready.
 10. **Small-kernel fusion in the loop** [IK, AX `labs/lab1`, `csrc/convmix_sm86.cu`]: ~3 ms
     of a 22 ms step at 6 requests (48 layer visits x ~15 kernels of 2-5 us):
     `_attn_res_row_kernel`, `_sconv_kernel`, `_k_group_kernel` (router), `_attn_prologue`,
@@ -100,12 +106,15 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     container builds it).
 22. **Upstream PRs**: the processing.py dummy-size fix and the oversized-image downscale are
     real upstream bugs; so is the sconv padding-row fix (NOTES).
-32. **Rebase BASE on vLLM main** [AR #69165]: #69028 is merged; when #69165 (SM80/86/89:
-    PDL gating, integer e4m3 conversions, conv_mix Triton fallback, FA2 vision) lands, drop
-    our overlapping sm8x gating and keep only what it lacks (Marlin experts, INT8, emulated
-    FP8 KV, DSpark changes). Main also carries security fixes; the auth root_path one
-    (#52794) conflicts with our deny-by-default `authenticate.py`. #69165 hit a sampler-warmup
-    OOM at `max_num_seqs` 256: keep the wizard's cap.
+32. **BASE on #69165** [AR] (in progress): its single commit on vLLM main replaces our sm8x
+    gating (`use_pdl`, `pdl.py`, `e4m3_arg`/`cast_store`, `use_native_conv_mix`, FA2 vision).
+    Ours stays: `use_sm12x_path` (Marlin experts, Triton attention), the scaled fp16 KV decode
+    in `attention_sm90.py`, INT8/INT4, DSpark, lookup. `ll_gemm_sm120` (#69168) now also
+    serves sm8x in place of the old `gemv.py`: compare the step with `bench/profile_spec.sh`
+    (before: 12.81/22.36/30.80 ms at 1/6/16). Test `ops/e4m3.py`'s encoder on inputs one fp32
+    ulp past every e4m3 tie (the double-rounding case of #69199/#69200, SM89 only, but cheap
+    to rule out). When #69165 merges, BASE moves to main. #69165 hit a sampler-warmup OOM at
+    `max_num_seqs` 256: keep the wizard's cap.
 34. **SiTU fused into the experts' w13 epilogue** [AX `labs/lab3b`]: today Marlin writes
     gate_up, a separate kernel applies the softcapped SiTU, w2 reads it back: one launch and
     a round trip per visit, 48 per token. AX fuses it in registers (and the top-8 w2
@@ -119,6 +128,18 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 41. **Decode split-KV at long context** [AX `labs/lab2`]: with 8 KV heads one request gives
     8 CTAs on 82 SMs unless KV is split; check `attention_sm90.py`'s `num_splits` choice at
     1 request and 100k+ tokens (decode speed against a short context).
+51. **Against club-3090's image** [C3]: once its single-GPU profile ships, run the same
+    benches on both for the post (it serves the release checkpoint, bf16 KV).
+52. **Release guards** [C3 `build.sh`]: `scripts/build-image.sh` refuses to retag a published
+    tag and the push pushes the image it built and checked; a `--verify` that the compiled
+    libraries carry sm86 code (stock libraries without it leave `moe_align_block_size`'s
+    buffers unwritten, silently).
+53. **Image budget in the wizard** [NS]: ask the largest image as tokens per image (default
+    1024, shown also as megapixels: 1024 tokens = 1024 cells of 40 x 40 px = 1.64 MP, an A4
+    page at ~128 ppi), and set `IMAGE_MAX_W`/`_H` from it. With `NBT=2048` a step then
+    encodes two such pages (the encoder budget is the prefill chunk). Measure the context
+    and prefill of `NBT=2048` with 1024-token images after 17, in the memory matrix, and
+    move the owner's profile to it (a little under 262k is acceptable).
 50. **Final measurements** (once, after phases 3-4, before the Reddit post), for README and
     the model card: `bench/profile_spec.sh` at 1/6/16; prefill 14.5k at 1/6 and NBT 2048;
     `bench/spec_bench.py 8080 512 user`; `bench/copy_test.py` at 50k; `bench/evalscope_perf.sh`

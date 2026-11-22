@@ -30,15 +30,19 @@ git format-patch -1 --stdout > ../patches/vllm-hyperinkling-sm86.patch
 The commit message is the authoritative list of what the port changes; keep it current.
 
 Key mechanisms of the port (spread across several files):
-- sm8x takes the SM12x (consumer Blackwell) Triton path (`use_sm12x_path`); programmatic
-  dependent launch is compiled out on sm8x.
+- `patches/BASE` is the head of vLLM PR #69165 (Inkling 2 on SM80/86/89: PDL/TMA gating,
+  software e4m3 `ops/e4m3.py`, Triton conv/mix fallback, FA2 vision). On top, sm8x takes
+  the SM12x (consumer Blackwell) Triton path (`use_sm12x_path`).
 - Routed experts: INT4 g128 asymmetric in AWQ layout (quant format `int4_awq`), GPTQ-calibrated,
   run by Marlin MoE (`ops/moe_marlin.py`).
 - Attention, LM head and token embeddings are converted to INT8 **at load time**
   (`ops/linear_w8.py`, `model.py`), toggled by `HYPERINKLING_{ATTN,HEAD,EMBED}_W8` and
   `HYPERINKLING_EMBED_UVA` (embeddings in pinned host RAM).
-- FP8 E4M3 KV cache emulated in software (`ops/fp8_emu.py`): bytes shifted into fp16 are
-  value·2⁻⁸, so MMAs run in fp16 and the 2⁸ goes into the softmax scale / output.
+- FP8 E4M3 KV cache emulated in software (`ops/e4m3.py`; decode `e4m3_f16_scaled`): bytes
+  shifted into fp16 are value·2⁻⁸, so MMAs run in fp16 and the 2⁸ goes into the softmax
+  scale / output.
+- sconv conv-state cache: only each step's tail has real blocks (`SconvStateManager` in
+  `inkling/nvidia/sconv_swa_attn.py`); the conv skips stores into the null block.
 - Loop controllers and sconv taps on Triton batched GEMVs (`ops/bgemv.py`).
 - `HYPERINKLING_CAPTURE_DIR` enables the MoE input/routing capture hook used by GPTQ.
 - DSpark speculative decoding (on by default, `SPEC`): the block drafter always drafts 7;

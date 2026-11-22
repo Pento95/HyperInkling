@@ -1,11 +1,12 @@
-From 023cd09532e0c0a8b6cee9d22bb0074260fca346 Mon Sep 17 00:00:00 2001
+From e7b0a45562abe9ebee62fd21142a971506ace68a Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
 
-Runs Inkling2Loop on RTX 3090-class GPUs (on top of vllm#69028):
-- sm8x takes the SM12x Triton path (use_sm12x_path); min capability 80;
-  programmatic dependent launch compiled out on sm8x (PDL / gdc helpers).
+Runs Inkling2Loop on RTX 3090-class GPUs (on top of vllm#69165, which
+gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
+- sm8x takes the SM12x Triton path (use_sm12x_path): Triton relative
+  attention and the SM12x low-M bf16 GEMMs (ll_gemm_sm120).
 - Routed experts on Marlin MoE (ops/moe_marlin.py): NVFP4, MXFP8 and
   HyperInkling INT4 (AWQ layout, g128 asym, quant format "int4_awq").
 - INT8 W8A16 Triton linears (ops/linear_w8.py) for attention, LM head
@@ -13,8 +14,12 @@ Runs Inkling2Loop on RTX 3090-class GPUs (on top of vllm#69028):
   behind HYPERINKLING_{ATTN,HEAD,EMBED}_W8 / HYPERINKLING_EMBED_UVA; tiles
   by output width (k/v, o, qkvr, LM head) for decode and verify batches
   (1-128 rows).
-- Unit-scale E4M3 KV cache emulated in software (ops/fp8_emu.py): uint8
-  bytes, fp16 MMAs on value * 2^-8, bit-exact with the hardware converts.
+- E4M3 KV decode on sm8x as fp16 holding value * 2^-8 (e4m3_f16_scaled):
+  the 2^8 goes into the softmax scale and the output, fp16 MMAs.
+- sconv conv-state cache backs only each step's tail (SconvStateManager,
+  after DFlashSlidingWindowManager): the window, the drafts in flight and
+  one hit alignment; the rest of a prefill chunk is null and the conv skips
+  stores into the null block.
 - Loop controllers and sconv dynamic taps on Triton GEMVs (ops/bgemv.py,
   split-K down projection, up to 64 rows) instead of cuBLAS wmma kernels at
   decode and verify sizes.
@@ -45,7 +50,7 @@ Runs Inkling2Loop on RTX 3090-class GPUs (on top of vllm#69028):
   HyperQwen's dflash2-lookup-drafting): the longest suffix match in the
   request's history is fused with the DSpark drafts, point masses in the
   draft-logits cache keep rejection sampling exact; the token history is
-  kept on the GPU while it is on. Off by default.
+  kept on the GPU while it is on.
 - sconv metadata: padding rows start at num_actual_tokens, so the
   >256-token tile skip in _sconv_kernel keeps the cache taps of a tile
   that mixes real and padding rows (upstream bug).
@@ -61,43 +66,35 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../openai/chat_completion/serving.py         |   1 +
  .../serve/middleware/authenticate.py          |  34 ++-
  vllm/envs.py                                  |   6 +
- vllm/models/inkling/nvidia/ops/sconv.py       |   9 +-
- vllm/models/inkling2/nvidia/attention.py      |  43 +++-
- vllm/models/inkling2/nvidia/dspark.py         | 128 ++++++++++-
+ vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
+ vllm/models/inkling/nvidia/sconv_swa_attn.py  |  52 +++-
+ vllm/models/inkling2/nvidia/attention.py      |  43 ++-
+ vllm/models/inkling2/nvidia/dspark.py         | 128 ++++++++-
  vllm/models/inkling2/nvidia/loop.py           |  12 +
- vllm/models/inkling2/nvidia/model.py          |  86 ++++++-
- vllm/models/inkling2/nvidia/moe.py            | 111 ++++++++--
- vllm/models/inkling2/nvidia/ops/__init__.py   |  39 ++++
- vllm/models/inkling2/nvidia/ops/activation.py |   8 +-
- vllm/models/inkling2/nvidia/ops/attention.py  |  12 +-
- .../inkling2/nvidia/ops/attention_sm90.py     |  21 ++
- vllm/models/inkling2/nvidia/ops/attn_res.py   |   8 +-
- vllm/models/inkling2/nvidia/ops/bgemv.py      | 176 +++++++++++++++
- vllm/models/inkling2/nvidia/ops/conv_mix.py   |   4 +-
- vllm/models/inkling2/nvidia/ops/fp8_emu.py    |  76 +++++++
- vllm/models/inkling2/nvidia/ops/gemv.py       |   5 +-
- vllm/models/inkling2/nvidia/ops/linear.py     |  19 +-
- vllm/models/inkling2/nvidia/ops/linear_w4.py  | 209 ++++++++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 135 +++++++++++
- vllm/models/inkling2/nvidia/ops/lookup.py     | 192 ++++++++++++++++
- vllm/models/inkling2/nvidia/ops/moe.py        |  28 +--
- vllm/models/inkling2/nvidia/ops/moe_marlin.py | 209 ++++++++++++++++++
+ vllm/models/inkling2/nvidia/model.py          |  86 +++++-
+ vllm/models/inkling2/nvidia/moe.py            | 111 +++++++-
+ vllm/models/inkling2/nvidia/ops/__init__.py   |  18 ++
+ vllm/models/inkling2/nvidia/ops/attention.py  |   2 +-
+ .../inkling2/nvidia/ops/attention_sm90.py     |  21 +-
+ vllm/models/inkling2/nvidia/ops/bgemv.py      | 180 +++++++++++++
+ vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
+ vllm/models/inkling2/nvidia/ops/linear.py     |   2 +-
+ vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 +++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 139 ++++++++++
+ .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
+ vllm/models/inkling2/nvidia/ops/lookup.py     | 245 ++++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/moe_marlin.py | 210 +++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_sm120.py  |   6 +-
- vllm/models/inkling2/nvidia/ops/mxfp8.py      |   6 +-
- vllm/models/inkling2/nvidia/ops/nvfp4.py      |   6 +-
- vllm/models/inkling2/nvidia/ops/sconv.py      |  25 ++-
- vllm/models/inkling2/nvidia/sconv.py          |   6 +-
- vllm/models/inkling2/nvidia/vision.py         |   9 +-
- vllm/models/inkling2/processing.py            |  50 ++++-
- vllm/models/inkling2/quant_config.py          |  17 +-
+ vllm/models/inkling2/nvidia/ops/sconv.py      |   3 +-
+ vllm/models/inkling2/processing.py            |  50 +++-
+ vllm/models/inkling2/quant_config.py          |  14 +-
  vllm/models/inkling2/speculator.py            |  24 +-
- vllm/models/inkling2/speculator_config.py     |  11 +-
- vllm/v1/core/sched/scheduler.py               |  38 +++-
- vllm/v1/engine/core.py                        |  82 +++++++
- vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++++
- 39 files changed, 1865 insertions(+), 127 deletions(-)
+ vllm/models/inkling2/speculator_config.py     |  13 +-
+ vllm/v1/core/sched/scheduler.py               |  38 ++-
+ vllm/v1/engine/core.py                        |  82 ++++++
+ vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++++
+ 32 files changed, 1831 insertions(+), 85 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
- create mode 100644 vllm/models/inkling2/nvidia/ops/fp8_emu.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/lookup.py
@@ -105,7 +102,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 vllm/v1/spec_decode/dynamic/adaptive_k.py
 
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index 4ea6278f6..ffb634b5b 100644
+index 4ea6278f6c..ffb634b5b9 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -792,8 +792,12 @@ class VllmConfig:
@@ -122,7 +119,7 @@ index 4ea6278f6..ffb634b5b 100644
              speculative_config.num_speculative_tokens_per_batch_size,
              vllm_max_batch_size=max_num_seqs,
 diff --git a/vllm/entrypoints/common/cli_args.py b/vllm/entrypoints/common/cli_args.py
-index 2fc4a478b..ce1f78c08 100644
+index 2fc4a478bb..ce1f78c084 100644
 --- a/vllm/entrypoints/common/cli_args.py
 +++ b/vllm/entrypoints/common/cli_args.py
 @@ -345,11 +345,8 @@ class FrontendArgs(BaseFrontendArgs):
@@ -140,7 +137,7 @@ index 2fc4a478b..ce1f78c08 100644
      for what it does and does not protect."""
      ssl_keyfile: str | None = None
 diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
-index 175fba316..98127f9fb 100644
+index 175fba3169..98127f9fb2 100644
 --- a/vllm/entrypoints/openai/chat_completion/serving.py
 +++ b/vllm/entrypoints/openai/chat_completion/serving.py
 @@ -759,6 +759,7 @@ class OpenAIServingChat(GenerateBaseServing):
@@ -152,15 +149,10 @@ index 175fba316..98127f9fb 100644
                              continue
                          delta_message = DeltaMessage()
 diff --git a/vllm/entrypoints/serve/middleware/authenticate.py b/vllm/entrypoints/serve/middleware/authenticate.py
-index f757600f4..7021badc4 100644
+index e105a731f0..7021badc4b 100644
 --- a/vllm/entrypoints/serve/middleware/authenticate.py
 +++ b/vllm/entrypoints/serve/middleware/authenticate.py
-@@ -4,11 +4,25 @@ import hashlib
- import secrets
- from collections.abc import Awaitable
- 
-+from starlette._utils import get_route_path
- from starlette.datastructures import Headers
+@@ -9,7 +9,20 @@ from starlette.datastructures import Headers
  from starlette.responses import JSONResponse
  from starlette.types import ASGIApp, Receive, Scope, Send
  
@@ -182,7 +174,7 @@ index f757600f4..7021badc4 100644
  
  
  class AuthenticationMiddleware:
-@@ -18,8 +32,8 @@ class AuthenticationMiddleware:
+@@ -19,8 +32,8 @@ class AuthenticationMiddleware:
      Note:
          There are two cases in which authentication is skipped:
  
@@ -193,7 +185,7 @@ index f757600f4..7021badc4 100644
  
      """
  
-@@ -45,18 +59,16 @@ class AuthenticationMiddleware:
+@@ -46,19 +59,16 @@ class AuthenticationMiddleware:
          return token_match
  
      def __call__(self, scope: Scope, receive: Receive, send: Send) -> Awaitable[None]:
@@ -205,8 +197,9 @@ index f757600f4..7021badc4 100644
              # scope["type"] can be "lifespan" or "startup" for example,
              # in which case we don't need to do anything
              return self.app(scope, receive, send)
--        root_path = scope.get("root_path", "")
--        url_path = scope["path"].removeprefix(root_path)
+-        # Use Starlette's own segment-boundary-aware root_path stripping
+-        # so the auth guard agrees with the router on the effective path.
+-        url_path = get_route_path(scope)
 +        # The path the router matches; this runs before FastAPI's redirect_slashes.
 +        url_path = get_route_path(scope).rstrip("/") or "/"
          headers = Headers(scope=scope)
@@ -219,7 +212,7 @@ index f757600f4..7021badc4 100644
              return response(scope, receive, send)
          return self.app(scope, receive, send)
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 881478a1b..1f5907ddf 100644
+index 83f31dcf20..f70a8fbeb2 100644
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
 @@ -25,6 +25,7 @@ if TYPE_CHECKING:
@@ -230,7 +223,7 @@ index 881478a1b..1f5907ddf 100644
      VLLM_API_KEY: str | None = None
      VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
      S3_ACCESS_KEY_ID: str | None = None
-@@ -843,6 +844,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -844,6 +845,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
      # used to control the visible devices in the distributed setting
      "CUDA_VISIBLE_DEVICES": lambda: os.environ.get("CUDA_VISIBLE_DEVICES", None),
@@ -243,15 +236,16 @@ index 881478a1b..1f5907ddf 100644
      # during startup. Default is 600 seconds (10 minutes).
      "VLLM_ENGINE_READY_TIMEOUT_S": lambda: int(
 diff --git a/vllm/models/inkling/nvidia/ops/sconv.py b/vllm/models/inkling/nvidia/ops/sconv.py
-index 28101ec96..ab779d414 100644
+index 28101ec960..d8a27b5ce0 100644
 --- a/vllm/models/inkling/nvidia/ops/sconv.py
 +++ b/vllm/models/inkling/nvidia/ops/sconv.py
-@@ -245,9 +245,11 @@ def _seq_metadata_kernel(
+@@ -245,9 +245,12 @@ def _seq_metadata_kernel(
      padded = offs < num_padded_tokens
      query_start = tl.load(qsl_ptr + lo)
      tl.store(seq_idx_ptr + offs, tl.where(actual, lo, 0), mask=padded)
-+    # Padding rows (slot_mapping -1, all taps masked) start past every request, so starts
-+    # stay non-decreasing for the sconv tile skip (inkling2 ops/sconv.py SKIP_IDLE_CACHE).
++    # Padding rows (slot_mapping -1, all taps masked) start past every request, so
++    # starts stay non-decreasing for the sconv tile skip (inkling2 ops/sconv.py
++    # SKIP_IDLE_CACHE).
      tl.store(
          query_start_ptr + offs,
 -        tl.where(actual, query_start, 0),
@@ -259,7 +253,7 @@ index 28101ec96..ab779d414 100644
          mask=padded,
      )
  
-@@ -262,9 +264,8 @@ def sconv_seq_metadata(
+@@ -262,9 +265,8 @@ def sconv_seq_metadata(
  ) -> None:
      """Fill static per-token seq_idx / query_start buffers in one launch.
  
@@ -271,8 +265,83 @@ index 28101ec96..ab779d414 100644
      """
      if num_padded_tokens is None:
          num_padded_tokens = num_actual_tokens
+diff --git a/vllm/models/inkling/nvidia/sconv_swa_attn.py b/vllm/models/inkling/nvidia/sconv_swa_attn.py
+index 47285b1129..2b4ec92dad 100644
+--- a/vllm/models/inkling/nvidia/sconv_swa_attn.py
++++ b/vllm/models/inkling/nvidia/sconv_swa_attn.py
+@@ -32,8 +32,11 @@ from vllm.v1.attention.backend import (
+     AttentionMetadataBuilder,
+     CommonAttentionMetadata,
+ )
+-from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
++from vllm.v1.core.single_type_kv_cache_manager import (
++    DFlashSlidingWindowManager,
++    SlidingWindowManager,
++)
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup, KVCacheLayerConfig
+ 
+ from .ops.sconv import sconv_seq_metadata
+ 
+@@ -41,6 +44,42 @@ from .ops.sconv import sconv_seq_metadata
+ _K, _V, _ATTN, _MLP = 0, 1, 2, 3
+ 
+ 
++class SconvStateManager(DFlashSlidingWindowManager):
++    """Conv-state cache that backs only each step's tail.
++
++    The conv reads cached taps only for the first `W - 1` tokens of a step
++    (later taps come from the step's own inputs), so a step needs real blocks
++    just for its last tokens: the window, the drafts in flight that may be
++    rejected, and one hit alignment so that a prefix hit at the aligned
++    position below the step's end finds its window. The rest of a prefill
++    chunk is null. Hits use the plain sliding-window rule (`h` needs the
++    window before `h`): they land where a step ended.
++    """
++
++    @dataclass(frozen=True, slots=True)
++    class Params(DFlashSlidingWindowManager.Params):
++        hit_alignment_tokens: int = 0
++
++        @property
++        def tail_tokens(self) -> int:
++            return (
++                self.sliding_window
++                + self.num_speculative_tokens * self.max_in_flight_steps
++                + self.hit_alignment_tokens
++            )
++
++    find_longest_cache_hit = SlidingWindowManager.__dict__["find_longest_cache_hit"]
++    reachable_block_mask = SlidingWindowManager.__dict__["reachable_block_mask"]
++
++    def __init__(self, kv_cache_group: KVCacheGroup, **kwargs) -> None:
++        super().__init__(kv_cache_group, **kwargs)
++        params = self.manager_config.params
++        assert isinstance(params, SconvStateManager.Params)
++        assert self.cache_hit_alignment_tokens <= params.hit_alignment_tokens, (
++            "conv-state tails shorter than the prefix-hit alignment"
++        )
++
++
+ @dataclass
+ class InklingSconvMetadata(AttentionMetadata):
+     block_table: torch.Tensor  # [num_reqs, max_blocks] physical blocks per req
+@@ -203,6 +242,11 @@ class InklingConvState(nn.Module, AttentionLayerBase):
+             head_size_v=0,  # all 4 streams packed into head_size
+             dtype=self._dtype,
+         )
+-        return SlidingWindowManager.layer_config(
+-            spec, sliding_window=self.sliding_window
++        return SconvStateManager.layer_config(
++            spec,
++            sliding_window=self.sliding_window,
++            num_speculative_tokens=vllm_config.num_speculative_tokens,
++            max_in_flight_steps=vllm_config.max_concurrent_batches,
++            num_lookahead_tokens=vllm_config.num_lookahead_tokens,
++            hit_alignment_tokens=vllm_config.cache_config.block_size,
+         )
 diff --git a/vllm/models/inkling2/nvidia/attention.py b/vllm/models/inkling2/nvidia/attention.py
-index 7d4f950b2..d17ac196d 100644
+index d1fdc61364..3081660a9e 100644
 --- a/vllm/models/inkling2/nvidia/attention.py
 +++ b/vllm/models/inkling2/nvidia/attention.py
 @@ -3,6 +3,7 @@
@@ -305,10 +374,10 @@ index 7d4f950b2..d17ac196d 100644
  from .ops.attention_sm90 import MODE_OUT_LSE, rel_attention
  from .ops.linear import linear
 +from .ops.linear_w8 import W8Linear
+ from .ops.ll_gemm_sm120 import qkv_bmm, use_qkv_bmm
  from .ops.sconv import attention_prologue, shift_rel_proj
  from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
- 
-@@ -291,7 +292,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -292,7 +293,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
          self.max_decode_query_len = max_decode_query_len(vllm_config)
          cache_dtype = vllm_config.cache_config.cache_dtype
          supported: tuple[str, ...] = ("auto", "bfloat16")
@@ -317,7 +386,7 @@ index 7d4f950b2..d17ac196d 100644
              supported += ("float16", "fp8", "fp8_e4m3")
          if cache_dtype not in supported:
              raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
-@@ -299,6 +300,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -300,6 +301,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
          if cache_dtype == "float16" and vllm_config.speculative_config is not None:
              raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
          self.kv_cache = torch.tensor([])
@@ -325,7 +394,7 @@ index 7d4f950b2..d17ac196d 100644
          forward_context = vllm_config.compilation_config.static_forward_context
          if prefix in forward_context:
              raise ValueError(f"Duplicate layer name: {prefix}")
-@@ -308,6 +310,17 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -309,6 +311,17 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
  
      def process_weights_after_loading(self) -> None:
          self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
@@ -343,7 +412,7 @@ index 7d4f950b2..d17ac196d 100644
  
      def get_attn_backend(self) -> type[AttentionBackend]:
          return Inkling2AttentionBackend
-@@ -330,6 +343,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -331,6 +344,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
      def _project(
          self, x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor
      ) -> list[torch.Tensor]:
@@ -352,7 +421,7 @@ index 7d4f950b2..d17ac196d 100644
          # ``linear`` on the weight bypasses the layer (and a LoRA wrapper's
          # forward), so the LoRA deltas are added here (no-op without LoRA).
          weight = self.qkvr.weight
-@@ -347,12 +362,30 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -355,12 +370,30 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
          add_linear_lora(self.qkvr, v, x_v, [5])
          return [*projected.split(self.q_side_splits, dim=-1)[:4], k, v]
  
@@ -379,12 +448,12 @@ index 7d4f950b2..d17ac196d 100644
          if self.fp8_kv:
              # Every loop pass owns byte storage containing unit-scale E4M3 KV.
 -            kv_cache = kv_cache.view(torch.float8_e4m3fn)
-+            # SM8x has no FP8 type in Triton: raw bytes, `ops.fp8_emu`.
++            # SM8x has no FP8 type in Triton: raw bytes, `ops.e4m3`.
 +            kv_cache = kv_cache.view(torch.uint8 if is_sm8x() else torch.float8_e4m3fn)
          key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
          return (
              canonicalize_singleton_dim_strides(key_cache),
-@@ -395,6 +428,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
+@@ -403,6 +436,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
              output,
              pass_idx,
          )
@@ -394,7 +463,7 @@ index 7d4f950b2..d17ac196d 100644
          add_linear_lora(self.wo_ud, out, output)
          return out
 diff --git a/vllm/models/inkling2/nvidia/dspark.py b/vllm/models/inkling2/nvidia/dspark.py
-index 6e1755a18..3bdb2691c 100644
+index 6e1755a18b..3bdb2691c7 100644
 --- a/vllm/models/inkling2/nvidia/dspark.py
 +++ b/vllm/models/inkling2/nvidia/dspark.py
 @@ -5,6 +5,7 @@ through a small dense transformer over DFlare-mixed target-feature K/V, then a
@@ -632,25 +701,25 @@ index 6e1755a18..3bdb2691c 100644
 +            )
 +        torch.cuda.empty_cache()
 diff --git a/vllm/models/inkling2/nvidia/loop.py b/vllm/models/inkling2/nvidia/loop.py
-index 5bbb5cb67..9de75bb9a 100644
+index bee8058353..daca53110a 100644
 --- a/vllm/models/inkling2/nvidia/loop.py
 +++ b/vllm/models/inkling2/nvidia/loop.py
 @@ -26,7 +26,10 @@ from .model import (
      Inkling2ForConditionalGeneration,
      Inkling2Model,
  )
-+from .ops import use_sm12x_path
++from .ops import is_sm8x
  from .ops.attn_res import attn_res
 +from .ops.bgemv import MAX_M as BGEMV_MAX_M
 +from .ops.bgemv import controller_gemv
  from .ops.linear import linear_k_groups
+ from .ops.ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
  from .ops.loop import blend_rms_norm, pair_rms_norm
- from .sconv import conv_metadata
-@@ -121,6 +124,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
+@@ -122,6 +125,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
          broadcast over streams) and `message`, each output RMS-normalized
          with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
          pair = pair_rms_norm(dest, message)
-+        if pair.shape[1] <= BGEMV_MAX_M and use_sm12x_path():
++        if pair.shape[1] <= BGEMV_MAX_M and is_sm8x():
 +            # HyperInkling: decode-size controllers on a batched Triton GEMV
 +            # (cuBLAS picks latency-bound wmma kernels for these shapes).
 +            gain_forget = controller_gemv(
@@ -659,11 +728,11 @@ index 5bbb5cb67..9de75bb9a 100644
 +                self.controller_gain_forget[streams],
 +            )
 +            return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)
-         hidden = torch.bmm(pair, self.controller_down[streams].transpose(1, 2))
-         gain_forget = torch.bmm(
-             hidden,
+         down = self.controller_down[streams]
+         up = self.controller_gain_forget[streams]
+         if use_sm12x_bf16_ll_gemm(pair, down):
 diff --git a/vllm/models/inkling2/nvidia/model.py b/vllm/models/inkling2/nvidia/model.py
-index 4d3b63c4b..7d0db611f 100644
+index db9a9bc16b..58cd3b52ab 100644
 --- a/vllm/models/inkling2/nvidia/model.py
 +++ b/vllm/models/inkling2/nvidia/model.py
 @@ -82,6 +82,15 @@ class Inkling2LogitsProcessor(LogitsProcessor):
@@ -777,7 +846,7 @@ index 4d3b63c4b..7d0db611f 100644
  
  __all__ = ["Inkling2ForConditionalGeneration"]
 diff --git a/vllm/models/inkling2/nvidia/moe.py b/vllm/models/inkling2/nvidia/moe.py
-index 93fe44c4a..59b03f7bf 100644
+index 93fe44c4a3..793d88a436 100644
 --- a/vllm/models/inkling2/nvidia/moe.py
 +++ b/vllm/models/inkling2/nvidia/moe.py
 @@ -7,6 +7,7 @@ rank returns the full all-reduced bf16 output. Checkpoint names under
@@ -795,7 +864,7 @@ index 93fe44c4a..59b03f7bf 100644
 -from vllm.platforms import current_platform
  
 -from .ops import use_sm100_kernels
-+from .ops import is_sm8x, use_sm100_kernels, use_sm12x_path
++from .ops import is_sm8x, use_sm12x_path, use_sm100_kernels
  from .ops.activation import swiglu_quantize
  from .ops.block_scales import shuffle_rows, swizzle_block_scales
  from .ops.moe import NUM_COUNTERS, combine, combine_push, route
@@ -989,21 +1058,21 @@ index 93fe44c4a..59b03f7bf 100644
          plan = experts.plan(x.shape[0])
          routing, quantized = route(
 diff --git a/vllm/models/inkling2/nvidia/ops/__init__.py b/vllm/models/inkling2/nvidia/ops/__init__.py
-index cf240f8a3..035474abc 100644
+index bc0f45f003..f6381104e7 100644
 --- a/vllm/models/inkling2/nvidia/ops/__init__.py
 +++ b/vllm/models/inkling2/nvidia/ops/__init__.py
-@@ -11,3 +11,42 @@ def use_sm100_kernels() -> bool:
+@@ -39,3 +39,21 @@ def use_native_e4m3() -> bool:
      from vllm.platforms import current_platform
  
-     return current_platform.is_device_capability_family(100)
+     return current_platform.has_device_capability(89)
 +
 +
 +@functools.cache
 +def use_sm12x_path() -> bool:
 +    """Whether to take the SM12x code path: Triton experts, Triton relative
-+    attention, no TMA, no native conv/mix kernels. HyperInkling also routes
-+    Ampere (SM8x) here; what SM8x lacks beyond that (FP8/e2m1 hardware) is
-+    checked separately with `is_sm8x()`."""
++    attention, no native conv/mix kernels. HyperInkling also routes Ampere
++    (SM8x) here; what SM8x lacks beyond that (FP8/e2m1 hardware) is checked
++    separately with `is_sm8x()`."""
 +    from vllm.platforms import current_platform
 +
 +    return current_platform.is_device_capability_family(120) or is_sm8x()
@@ -1014,139 +1083,34 @@ index cf240f8a3..035474abc 100644
 +    from vllm.platforms import current_platform
 +
 +    return current_platform.is_device_capability_family(80)
-+
-+
-+# Programmatic dependent launch (griddepcontrol) is SM90+. `PDL` gates the
-+# launches, and the two helpers below compile the in-kernel waits away on SM8x.
-+PDL: bool = not is_sm8x()
-+
-+from vllm.triton_utils import tl, triton  # noqa: E402
-+
-+_PDL = tl.constexpr(PDL)
-+
-+
-+@triton.jit
-+def gdc_wait():
-+    if _PDL:
-+        tl.extra.cuda.gdc_wait()
-+
-+
-+@triton.jit
-+def gdc_launch_dependents():
-+    if _PDL:
-+        tl.extra.cuda.gdc_launch_dependents()
-diff --git a/vllm/models/inkling2/nvidia/ops/activation.py b/vllm/models/inkling2/nvidia/ops/activation.py
-index f32c13b9d..a6f520df9 100644
---- a/vllm/models/inkling2/nvidia/ops/activation.py
-+++ b/vllm/models/inkling2/nvidia/ops/activation.py
-@@ -7,6 +7,8 @@ import torch
- 
- from vllm.triton_utils import tl, tldevice, triton
- 
-+from . import PDL, gdc_launch_dependents, gdc_wait
-+
- from .mxfp8 import _mxfp8_block, _store_mxfp8_block
- from .nvfp4 import FP32_MAX, _quantize_block, _store_block
- 
-@@ -144,7 +146,7 @@ def _situ_quantize_kernel(
-     # scales are read before waiting for the gate/up GEMM, which launches this
-     # kernel only after its own wait for the routing kernel.
-     if LAUNCH_DEPENDENTS:
--        tl.extra.cuda.gdc_launch_dependents()
-+        gdc_launch_dependents()
-     num_rows = tl.load(NumRows)
-     r = tl.program_id(0)
-     row, gamma, w_amax = _row_inputs(
-@@ -153,7 +155,7 @@ def _situ_quantize_kernel(
-     denominator = 0.0
-     if NVFP4:
-         denominator = 1536.0 * tl.load(WDenominator)
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     start = tl.program_id(1) * (HEAD + TAIL)
-     while r < num_rows:
-         head = _situ(X, row, start, gamma, N, HEAD, GATE_CAP, UP_CAP)
-@@ -273,6 +275,6 @@ def swiglu_quantize(
-         num_warps=num_warps,
-         maxnreg=maxnreg,
-         enable_fp_fusion=False,
--        launch_pdl=True,
-+        launch_pdl=PDL,
-     )
-     return values, scales, row_scales
 diff --git a/vllm/models/inkling2/nvidia/ops/attention.py b/vllm/models/inkling2/nvidia/ops/attention.py
-index a9eb02374..f8508155f 100644
+index c8bc213285..03dd8881c9 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention.py
 +++ b/vllm/models/inkling2/nvidia/ops/attention.py
-@@ -20,7 +20,7 @@ from vllm.triton_utils import gl, gluon, tl, tldevice, triton
- from vllm.utils.platform_utils import num_compute_units
- from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
- 
--from . import use_sm100_kernels
-+from . import PDL, gdc_wait, use_sm100_kernels
- from .attention_sm90 import MODE_GATED, MODE_PARTIAL, rel_attention
- 
- # Full-layer FA4 split estimate, fitted on GB200 over uniform and mixed
-@@ -285,7 +285,7 @@ def _gate_sink_kernel(
-     D: tl.constexpr,
-     BLOCK: tl.constexpr,
- ):
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     row = tl.program_id(0).to(tl.int64)
-     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-     mask = col < H * D
-@@ -333,7 +333,7 @@ def gate_sink(
-         width // num_heads,
-         512,
-         enable_fp_fusion=False,
--        launch_pdl=True,
-+        launch_pdl=PDL,
-     )
- 
- 
-@@ -466,7 +466,7 @@ def _rel_decode_combine_kernel(
-         # gate and sink are ready.
-         gate = tl.load(Gate + row * stride_gate + head * D + offs_d).to(tl.float32)
-         sink = tl.load(Sink + row * stride_sink + head).to(tl.float32)
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     y_ptrs = Y + row * H * D + head * D + offs_d
-     if row >= num_actual_tokens:
-         tl.store(y_ptrs, tl.zeros([BLOCK_D], tl.float32))
-@@ -1295,7 +1295,7 @@ def _decode_attention(
-         BLOCK_D=block_d,
-         GATED=not draft,
-         num_warps=num_warps,
--        launch_pdl=True,
-+        launch_pdl=PDL,
-     )
- 
- 
-@@ -1377,5 +1377,5 @@ def _launch_rel_verify(
+@@ -1378,5 +1378,5 @@ def _launch_rel_verify(
          DRAFT=draft,
          WINDOW=window,
          num_warps=4,
 -        launch_pdl=True,
-+        launch_pdl=PDL,
++        launch_pdl=use_pdl(),
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/attention_sm90.py b/vllm/models/inkling2/nvidia/ops/attention_sm90.py
-index 8f53630cb..ed81f3d42 100644
+index 3cac9b9605..9ad1cfff0e 100644
 --- a/vllm/models/inkling2/nvidia/ops/attention_sm90.py
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm90.py
-@@ -18,6 +18,11 @@ import torch
+@@ -18,7 +18,10 @@ import torch
  
  from vllm.triton_utils import tl, triton
  
-+from .fp8_emu import e4m3_decode_fp16_scaled
+-from .e4m3 import _NATIVE_E4M3, _e4m3_f16, e4m3_arg
++from .e4m3 import _NATIVE_E4M3, _e4m3_f16, e4m3_arg, e4m3_f16_scaled
 +
-+# SM8x E4M3 KV loads come back scaled by 2^-8 (`e4m3_decode_fp16_scaled`).
++# SM8x E4M3 KV loads come back scaled by 2^-8 (`e4m3_f16_scaled`).
 +_U8_KV_SCALE = tl.constexpr(256.0)
-+
+ 
  # The query tile of tml_fa4 that shears the relative logits.
  _SHEAR_TILE = tl.constexpr(128)
- 
-@@ -36,6 +41,15 @@ def _sigmoid(x):
+@@ -38,6 +41,15 @@ def _sigmoid(x):
  
  @triton.jit
  def _load_fp8_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
@@ -1158,11 +1122,11 @@ index 8f53630cb..ed81f3d42 100644
 +            other=0,
 +        )
 +        # fp16 holding value * 2^-8 (see `_U8_KV_SCALE` in the kernel).
-+        return e4m3_decode_fp16_scaled(codes)
++        return e4m3_f16_scaled(codes)
      # Load each E4M3 pair once, retaining 16-bit packing for BF16 MMA order.
      half = tl.arange(0, D // 2)
      pair = tl.load(
-@@ -145,6 +159,11 @@ def _rel_attention_kernel(
+@@ -151,6 +163,11 @@ def _rel_attention_kernel(
          rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
  
      qk_scale = softmax_scale * LOG2E
@@ -1174,7 +1138,7 @@ index 8f53630cb..ed81f3d42 100644
      m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
      l_i = tl.zeros([BLOCK_M], tl.float32)
      acc = tl.zeros([BLOCK_M, D], tl.float32)
-@@ -193,6 +212,8 @@ def _rel_attention_kernel(
+@@ -199,6 +216,8 @@ def _rel_attention_kernel(
          m_i = m_new
  
      empty = l_i == 0.0
@@ -1183,62 +1147,22 @@ index 8f53630cb..ed81f3d42 100644
      o = acc / tl.where(empty, 1.0, l_i)[:, None]
      lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
      if MODE == 0:
-diff --git a/vllm/models/inkling2/nvidia/ops/attn_res.py b/vllm/models/inkling2/nvidia/ops/attn_res.py
-index 31590036a..bceb6b25e 100644
---- a/vllm/models/inkling2/nvidia/ops/attn_res.py
-+++ b/vllm/models/inkling2/nvidia/ops/attn_res.py
-@@ -15,6 +15,8 @@ import torch
- from vllm.models.inkling2.nvidia.ops.norm import rsqrt
- from vllm.triton_utils import tl, tldevice, triton
- 
-+from . import PDL, gdc_wait
-+
- 
- @triton.jit
- def _load_source(
-@@ -74,7 +76,7 @@ def _attn_res_kernel(
-     BLOCK_N: tl.constexpr,
-     BLOCK_D: tl.constexpr,
- ):
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     # One program per (token, query).
-     t = tl.program_id(1).to(tl.int64)
-     q_off = tl.program_id(0) * D
-@@ -188,7 +190,7 @@ def _attn_res_row_kernel(
-     BLOCK_A: tl.constexpr,
-     BLOCK_B: tl.constexpr,
- ):
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     # Small batches: one program per (token, query) holds the row in registers
-     # as a power-of-2 head [0, BLOCK_A) and a masked tail [BLOCK_A, D), so the
-     # sources are read twice instead of three times.
-@@ -291,7 +293,7 @@ def attn_res(
-         APPLY_NORM=apply_norm,
-         BLOCK_N=triton.next_power_of_2(num_stack + 1),
-         enable_fp_fusion=False,
--        launch_pdl=True,
-+        launch_pdl=PDL,
-     )
-     # The queries of a token run back to back and share its sources in L2.
-     grid = (num_q, num_tokens)
 diff --git a/vllm/models/inkling2/nvidia/ops/bgemv.py b/vllm/models/inkling2/nvidia/ops/bgemv.py
 new file mode 100644
-index 000000000..f18f0fc07
+index 0000000000..849d2e8263
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/bgemv.py
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,180 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling batched low-M GEMV: `out[s] = x[s] @ w[s].T` for a few
-+streams `s`, at most MAX_M rows each (decode and verify steps), with an fp32 or bf16
-+result.
++streams `s`, at most MAX_M rows each (decode and verify steps), with an fp32 or
++bf16 result, the stream as a second grid axis.
 +
-+`ops.gemv`'s kernel with the stream as a second grid axis. It replaces the
-+loop controllers' `torch.bmm`s (rank-64 down / up projections): at decode
-+and verify sizes cuBLAS runs them on its wmma kernels, latency-bound at 20-30 us for
-+well under a megabyte of weights. A tile holds all rows (16, 32 or 64).
++It replaces the loop controllers' `torch.bmm`s (rank-64 down / up projections):
++at decode and verify sizes cuBLAS runs them on its wmma kernels, latency-bound at
++20-30 us for well under a megabyte of weights. A tile holds all rows (16, 32 or
++64).
 +"""
 +
 +import torch
@@ -1332,7 +1256,9 @@ index 000000000..f18f0fc07
 +    hidden = tl.zeros((MP, BR), tl.float32)
 +    for split in range(SPLITS):
 +        base = (split * num_s + s).to(tl.int64) * MP * R
-+        hidden += tl.load(P + base + rows[:, None] * R + rs[None, :], rs[None, :] < R, other=0.0)
++        hidden += tl.load(
++            P + base + rows[:, None] * R + rs[None, :], rs[None, :] < R, other=0.0
++        )
 +    w = tl.load(
 +        W + s.to(tl.int64) * SWS + cols[None, :].to(tl.int64) * SWN + rs[:, None],
 +        (cols[None, :] < N) & (rs[:, None] < R),
@@ -1368,7 +1294,9 @@ index 000000000..f18f0fc07
 +    if m == 0:
 +        return out
 +    mp = _rows_tile(m)
-+    partials = torch.empty((DOWN_SPLITS, s, mp, r), dtype=torch.float32, device=x.device)
++    partials = torch.empty(
++        (DOWN_SPLITS, s, mp, r), dtype=torch.float32, device=x.device
++    )
 +    ks = triton.cdiv(triton.cdiv(k, DOWN_SPLITS), 64) * 64
 +    _down_split_kernel[(triton.cdiv(r, 16), s, DOWN_SPLITS)](
 +        x, down, partials, m, r, k, ks,
@@ -1405,222 +1333,43 @@ index 000000000..f18f0fc07
 +        BN=bn, BK=bk, MP=_rows_tile(m), num_warps=4,
 +    )  # fmt: skip
 +    return out
-diff --git a/vllm/models/inkling2/nvidia/ops/conv_mix.py b/vllm/models/inkling2/nvidia/ops/conv_mix.py
-index e4c1e0195..4f3042924 100644
---- a/vllm/models/inkling2/nvidia/ops/conv_mix.py
-+++ b/vllm/models/inkling2/nvidia/ops/conv_mix.py
-@@ -5,8 +5,8 @@ sublayer, for large batches of an already reduced input (CUDA)."""
- 
- import torch
- 
--from vllm.platforms import current_platform
- 
-+from . import use_sm12x_path
- from .attn_res import attn_res
- from .sconv import short_conv
- from .seq_parallel import SeqParallel
-@@ -89,7 +89,7 @@ def conv_mix(
-     )
-     if sp is None:
-         assert halo == 0 and positions.shape[0] == num_tokens and x.dim() == 2
--        if current_platform.is_device_capability_family(120):
-+        if use_sm12x_path():
-             # Native conv/mix kernels require Hopper or SM10x. Keep the
-             # loop executor's cache writes and residual rounding on SM12x.
-             short_conv(
-diff --git a/vllm/models/inkling2/nvidia/ops/fp8_emu.py b/vllm/models/inkling2/nvidia/ops/fp8_emu.py
-new file mode 100644
-index 000000000..d343dd6bb
---- /dev/null
-+++ b/vllm/models/inkling2/nvidia/ops/fp8_emu.py
-@@ -0,0 +1,76 @@
-+# SPDX-License-Identifier: Apache-2.0
-+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+"""Software E4M3 (FP8, OCP `float8_e4m3fn`) for SM8x, which has neither the
-+`cvt.*.e4m3` instructions nor Triton's fp8e4nv type.
-+
-+Inkling2's FP8 KV cache is unit-scale E4M3 (K is L2-clipped and V RMS-
-+normalized before the store, so no scales are kept). On SM8x the cache is a
-+uint8 view of the same bytes; these helpers encode on the store and decode on
-+the load, bit-exact with the hardware conversions (round to nearest even,
-+saturating at +-448, as `cvt.rn.satfinite`).
-+"""
-+
-+from vllm.triton_utils import tl, triton
-+
-+_E4M3_MAX = tl.constexpr(448.0)
-+_MIN_NORMAL = tl.constexpr(0.015625)  # 2^-6
+diff --git a/vllm/models/inkling2/nvidia/ops/e4m3.py b/vllm/models/inkling2/nvidia/ops/e4m3.py
+index 11465fa902..152349eeea 100644
+--- a/vllm/models/inkling2/nvidia/ops/e4m3.py
++++ b/vllm/models/inkling2/nvidia/ops/e4m3.py
+@@ -94,3 +94,13 @@ def cast_store(x, dtype: tl.constexpr):
+     """`x` cast to pointer element type `dtype`, where uint8 stands for e4m3
+     below SM89."""
+     return _e4m3_bits(x.to(tl.float32)) if dtype == tl.uint8 else x.to(dtype)
 +
 +
 +@triton.jit
-+def e4m3_decode(b):
-+    """uint8 E4M3 codes -> fp32 values."""
-+    x = b.to(tl.int32)
-+    sign = (x & 0x80) << 8
-+    # A normal E4M3 code shifted into FP16 position: exponent bias 7 -> 15.
-+    half_bits = (((x & 0x7F) << 7) + 0x2000) | sign
-+    normal = half_bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
-+    sub = (x & 7).to(tl.float32) * 0.001953125  # m * 2^-9
-+    sub = tl.where(sign != 0, -sub, sub)
-+    return tl.where((x & 0x78) == 0, sub, normal)
-+
-+
-+@triton.jit
-+def e4m3_decode_fp16_scaled(b):
-+    """uint8 E4M3 codes -> fp16 holding value * 2^-8, exactly, subnormals
-+    included: the code's (exponent, mantissa) bits moved into the FP16
-+    fields, as Marlin's FP8 dequant does. Callers fold the 2^8 back in."""
++def e4m3_f16_scaled(b):
++    """uint8 e4m3 codes -> fp16 holding value * 2**-8, exactly, subnormals
++    included: the code's exponent and mantissa bits moved into the fp16
++    fields. Callers fold the 2**8 back in (HyperInkling's SM8x KV decode)."""
 +    x = b.to(tl.int32)
 +    bits = ((x & 0x7F) << 7) | ((x & 0x80) << 8)
 +    return bits.to(tl.uint16).to(tl.float16, bitcast=True)
-+
-+
-+@triton.jit
-+def e4m3_decode_bf16(b):
-+    """uint8 E4M3 codes -> bf16, integer ops only (every E4M3 value is exact
-+    in bf16): the attention's inner-loop decode."""
-+    x = b.to(tl.int32)
-+    mag = x & 0x7F
-+    # Normal: exponent bias 7 -> 127 (+120 << 7), mantissa 3 -> 7 bits (<< 4).
-+    normal = (mag << 4) + 0x3C00
-+    # Subnormal m * 2^-9 (m = 1..7): normalize on the leading bit p.
-+    p = (mag >= 2).to(tl.int32) + (mag >= 4).to(tl.int32)
-+    sub = ((118 + p) << 7) | ((mag - (1 << p)) << (7 - p))
-+    sub = tl.where(mag == 0, 0, sub)
-+    bits = tl.where(mag < 8, sub, normal) | ((x & 0x80) << 8)
-+    return bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
-+
-+
-+@triton.jit
-+def e4m3_encode(y):
-+    """fp32 values -> uint8 E4M3 codes (RNE, saturating)."""
-+    sign = (y.to(tl.uint32, bitcast=True) >> 24) & 0x80
-+    a = tl.minimum(tl.abs(y), _E4M3_MAX)
-+    ab = a.to(tl.uint32, bitcast=True)
-+    # Normal range: round the (exponent | mantissa) field to 3 mantissa bits
-+    # (round half to even), then rebias the exponent 127 -> 7.
-+    r = (ab + 0x7FFFF + ((ab >> 20) & 1)) >> 20
-+    code_n = r.to(tl.int32) - (120 << 3)
-+    # Subnormal range: a multiple of 2^-9, rounded half to even.
-+    t = a * 512.0
-+    fl = tl.floor(t)
-+    frac = t - fl
-+    odd = (fl.to(tl.int32) & 1) == 1
-+    code_s = fl.to(tl.int32) + ((frac > 0.5) | ((frac == 0.5) & odd)).to(tl.int32)
-+    code = tl.where(a < _MIN_NORMAL, code_s, code_n)
-+    code = tl.minimum(code, 0x7E)
-+    return (code | sign.to(tl.int32)).to(tl.uint8)
-diff --git a/vllm/models/inkling2/nvidia/ops/gemv.py b/vllm/models/inkling2/nvidia/ops/gemv.py
-index 05156e99c..ead98a13a 100644
---- a/vllm/models/inkling2/nvidia/ops/gemv.py
-+++ b/vllm/models/inkling2/nvidia/ops/gemv.py
-@@ -4,9 +4,10 @@
- 
- import torch
- 
--from vllm.platforms import current_platform
- from vllm.triton_utils import tl, triton
- 
-+from . import use_sm12x_path
-+
- MAX_M = 16
- _BN, _BK = 32, 256
- 
-@@ -109,5 +110,5 @@ def use_sm12x_bf16_gemv(
-                 and bias.stride(0) == 1
-             )
-         )
--        and current_platform.is_device_capability_family(120)
-+        and use_sm12x_path()
-     )
 diff --git a/vllm/models/inkling2/nvidia/ops/linear.py b/vllm/models/inkling2/nvidia/ops/linear.py
-index f3da872c3..f1c231430 100644
+index 57aa7937d2..4dc63f30f7 100644
 --- a/vllm/models/inkling2/nvidia/ops/linear.py
 +++ b/vllm/models/inkling2/nvidia/ops/linear.py
-@@ -5,11 +5,10 @@ reference `linear` with fp32 accumulation in ordered 1024-wide K groups."""
- 
- import torch
- 
--from vllm.platforms import current_platform
- from vllm.triton_utils import tl, triton
- from vllm.utils.flashinfer import is_flashinfer_autotuning
- 
--from . import use_sm100_kernels
-+from . import PDL, gdc_launch_dependents, gdc_wait, use_sm100_kernels, use_sm12x_path
- from .gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
- 
- # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
-@@ -131,7 +130,7 @@ def _k_group_kernel(
- ):
-     if SPLIT and tl.program_id(1) == 0:
-         _prefetch_k_group_tile(W, N, K, BN, tl.program_id(0), tl.program_id(2))
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     _k_group_tile(
-         X,
-         W,
-@@ -150,7 +149,7 @@ def _k_group_kernel(
- 
- @triton.jit
- def _k_group_sum_kernel(Partials, Y, MN, GROUPS: tl.constexpr, BLOCK: tl.constexpr):
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-     mask = offs < MN
-     total = tl.load(Partials + offs, mask)
-@@ -178,9 +177,9 @@ def _k_group_tma_kernel(
-     GROUP_TILES: tl.constexpr = 1024 // BK
-     rows = tl.program_id(1) * BM
-     cols = tl.program_id(0) * BN
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     if LAUNCH_DEPENDENTS:
--        tl.extra.cuda.gdc_launch_dependents()
-+        gdc_launch_dependents()
-     total = tl.zeros((BM, BN), tl.float32)
-     partial = tl.zeros((BM, BN), tl.float32)
-     for tile in tl.range(TILES, warp_specialize=True):
-@@ -213,7 +212,7 @@ def k_group_partials(
-     assert x.is_contiguous() and weight.is_contiguous()
-     tokens, hidden = x.shape
-     n = weight.shape[0]
--    sm120 = current_platform.is_device_capability_family(120)
-+    sm120 = use_sm12x_path()
-     if tokens >= TMA_MIN_TOKENS and not sm120:
-         from triton.tools.tensor_descriptor import TensorDescriptor
- 
-@@ -233,7 +232,7 @@ def k_group_partials(
+@@ -237,7 +237,7 @@ def k_group_partials(
              num_warps=4 if block_n == 64 else 8,
-             num_stages=4 if block_n == 64 else 3,
+             num_stages=2 if sm120 else 4 if block_n == 64 else 3,
              enable_fp_fusion=False,
 -            launch_pdl=True,
-+            launch_pdl=PDL,
++            launch_pdl=use_pdl(),
          )
          return out
      block_m = 16 if tokens <= 128 else 64
-@@ -267,7 +266,7 @@ def k_group_partials(
-         num_warps=num_warps,
-         num_stages=num_stages,
-         enable_fp_fusion=False,
--        launch_pdl=True,
-+        launch_pdl=PDL,
-     )
-     return out
- 
-@@ -285,6 +284,6 @@ def linear_k_groups(
-         return partials[0]
-     out = torch.empty(partials.shape[1:], dtype=out_dtype, device=x.device)
-     _k_group_sum_kernel[(triton.cdiv(out.numel(), 1024),)](
--        partials, out, out.numel(), partials.shape[0], 1024, launch_pdl=True
-+        partials, out, out.numel(), partials.shape[0], 1024, launch_pdl=PDL
-     )
-     return out
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w4.py b/vllm/models/inkling2/nvidia/ops/linear_w4.py
 new file mode 100644
-index 000000000..5a2217db9
+index 0000000000..884f759994
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w4.py
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,210 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W4A16 linears: bf16 weights quantized at load time to int4
@@ -1787,8 +1536,9 @@ index 000000000..5a2217db9
 +        wide_k = k > 1024
 +        _w4_kernel[(triton.cdiv(n, bn), 1)](
 +            x, packed, scale, zero, out, m, n, k,
-+            x.stride(0), packed.stride(0), scale.stride(0), zero.stride(0), out.stride(0),
-+            BM=bm, BN=bn, G=GROUP, num_warps=8 if wide_k else 4, num_stages=3 if wide_k else 2,
++            x.stride(0), packed.stride(0), scale.stride(0), zero.stride(0),
++            out.stride(0), BM=bm, BN=bn, G=GROUP,
++            num_warps=8 if wide_k else 4, num_stages=3 if wide_k else 2,
 +        )  # fmt: skip
 +        return out
 +    if m <= 64:
@@ -1832,15 +1582,15 @@ index 000000000..5a2217db9
 +        return w4_matmul(x.contiguous(), self.packed, self.scale, self.zero, out)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear_w8.py b/vllm/models/inkling2/nvidia/ops/linear_w8.py
 new file mode 100644
-index 000000000..bd2816fb2
+index 0000000000..2da3cb057a
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/linear_w8.py
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,139 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling W8A16 linears: bf16 weights quantized at load time to int8
 +(symmetric, one bf16 scale per 128 inputs of each output channel), run by
-+a Triton kernel derived from `ops.gemv`'s.
++a Triton GEMV/GEMM kernel.
 +
 +The weight keeps the natural `[N, K]` layout, so slicing rows stays free
 +and full layers can project q, k and v (different inputs) in one launch:
@@ -1904,7 +1654,10 @@ index 000000000..bd2816fb2
 +
 +
 +def w8_matmul(
-+    x: torch.Tensor, q: torch.Tensor, scale: torch.Tensor, out: torch.Tensor | None = None
++    x: torch.Tensor,
++    q: torch.Tensor,
++    scale: torch.Tensor,
++    out: torch.Tensor | None = None,
 +) -> torch.Tensor:
 +    """`x [M, K] bf16 @ dequant(q, scale).T` -> `[M, N]` bf16."""
 +    m, k = x.shape
@@ -1914,11 +1667,12 @@ index 000000000..bd2816fb2
 +        out = torch.empty((m, n), dtype=x.dtype, device=x.device)
 +    if m == 0:
 +        return out
-+    # Tiles tuned on an RTX 3090 Ti (L2-cold weights, bench/w8_gemv.py; tests/test_linear_w8.py
-+    # covers every branch). Decode: one row tile, column tiles narrow enough to spread the
-+    # weight over every SM. Verify steps (requests x (1 + drafts): 3-128 rows) have their own
-+    # tiles; above 128 rows, the prefill tile.
-+    # Four widths: k/v (<= 1024), o (< 4096), qkvr and the query side (< 32768), the LM head.
++    # Tiles tuned on an RTX 3090 Ti (L2-cold weights, bench/w8_gemv.py;
++    # tests/test_linear_w8.py covers every branch). Decode: one row tile, column
++    # tiles narrow enough to spread the weight over every SM. Verify steps
++    # (requests x (1 + drafts): 3-128 rows) have their own tiles; above 128 rows,
++    # the prefill tile. Four widths: k/v (<= 1024), o (< 4096), qkvr and the
++    # query side (< 32768), the LM head.
 +    size = 0 if n <= 1024 else 1 if n < 4096 else 2 if n < 32768 else 3
 +    if m == 1:
 +        tiles = ((16, 16, 2, 4), (16, 16, 2, 4), (16, 32, 4, 3), (16, 128, 8, 5))
@@ -1971,25 +1725,126 @@ index 000000000..bd2816fb2
 +            w8_matmul(x.contiguous(), self.q[lo:hi], self.scale[lo:hi])
 +            for x, (lo, hi) in zip(inputs, col_ranges)
 +        ]
+diff --git a/vllm/models/inkling2/nvidia/ops/ll_gemm_sm120.py b/vllm/models/inkling2/nvidia/ops/ll_gemm_sm120.py
+index 9c5fe9ce3c..f6551a7e9e 100644
+--- a/vllm/models/inkling2/nvidia/ops/ll_gemm_sm120.py
++++ b/vllm/models/inkling2/nvidia/ops/ll_gemm_sm120.py
+@@ -1,18 +1,21 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Low-M BF16 tensor-core projections for SM120/SM121: batched `x @ w.T` with
+-deterministic split-K for narrow outputs, and a grouped q/k/v projection."""
++"""Low-M BF16 tensor-core projections for SM120/SM121 (HyperInkling: and SM8x):
++batched `x @ w.T` with deterministic split-K for narrow outputs, and a grouped
++q/k/v projection."""
+ 
+ import functools
+ from typing import NamedTuple
+ 
+ import torch
+ 
+-from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.platform_utils import num_compute_units
+ from vllm.utils.torch_utils import current_stream
+ 
++from . import use_pdl, use_sm12x_path
++from .pdl import gdc_launch_dependents, gdc_wait
++
+ MAX_M = 16
+ _MP = 16
+ _MAX_TILES = 4096
+@@ -45,7 +48,7 @@ def _ll_gemm_kernel(
+     `s`. With `SPLIT > 1` it writes fp32 partials to `P` `[SPLIT, B, MP, N]`;
+     the last of the tile's programs to finish (counted in `C`, reset to 0
+     after) sums them in split order, so results are deterministic."""
+-    tl.extra.cuda.gdc_wait()
++    gdc_wait()
+     pid_n = tl.program_id(0)
+     b = tl.program_id(1)
+     s = tl.program_id(2)
+@@ -90,7 +93,7 @@ def _ll_gemm_kernel(
+             acc.to(Y.dtype.element_ty),
+             (rows[:, None] < M) & (cols[None, :] < N),
+         )
+-    tl.extra.cuda.gdc_launch_dependents()
++    gdc_launch_dependents()
+ 
+ 
+ @triton.jit
+@@ -128,7 +131,7 @@ def _qkv_bmm_kernel(
+     """Columns `[0, S1)` of `Y` are `XQ @ W.T`, `[S1, S2)` `XK` and `[S2, N)`
+     `XV`. A tile spanning a boundary runs both inputs' dots and picks per
+     column (the second input's loads hit L2)."""
+-    tl.extra.cuda.gdc_wait()
++    gdc_wait()
+     n0 = tl.program_id(0) * BN
+     n1 = tl.minimum(n0 + BN, N) - 1
+     b_lo = (n0 >= S1).to(tl.int32) + (n0 >= S2).to(tl.int32)
+@@ -159,7 +162,7 @@ def _qkv_bmm_kernel(
+         acc.to(Y.dtype.element_ty),
+         (rows[:, None] < M) & (cols[None, :] < N),
+     )
+-    tl.extra.cuda.gdc_launch_dependents()
++    gdc_launch_dependents()
+ 
+ 
+ class _Config(NamedTuple):
+@@ -237,7 +240,7 @@ def _ll_gemm(
+         MP=_MP,
+         num_warps=cfg.num_warps,
+         num_stages=cfg.num_stages,
+-        launch_pdl=True,
++        launch_pdl=use_pdl(),
+     )
+ 
+ 
+@@ -252,7 +255,7 @@ def use_qkv_bmm(
+         and x_q.shape == x_k.shape == x_v.shape
+         and x_q.dtype == x_k.dtype == x_v.dtype == w.dtype == torch.bfloat16
+         and x_q.stride(1) == x_k.stride(1) == x_v.stride(1) == w.stride(1) == 1
+-        and current_platform.is_device_capability_family(120)
++        and use_sm12x_path()
+     )
+ 
+ 
+@@ -301,7 +304,7 @@ def qkv_bmm(
+         MP=_MP,
+         num_warps=4,
+         num_stages=4,
+-        launch_pdl=True,
++        launch_pdl=use_pdl(),
+     )
+     return out
+ 
+@@ -358,5 +361,5 @@ def use_sm12x_bf16_ll_gemm(
+                 and bias.stride(0) == 1
+             )
+         )
+-        and current_platform.is_device_capability_family(120)
++        and use_sm12x_path()
+     )
 diff --git a/vllm/models/inkling2/nvidia/ops/lookup.py b/vllm/models/inkling2/nvidia/ops/lookup.py
 new file mode 100644
-index 000000000..87a4cdea5
+index 0000000000..ed02984e29
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/lookup.py
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,245 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Drafting from the request's own context (HYPERINKLING_LOOKUP=1).
 +
-+The DSpark drafter sees a 1024-token window; a document the answer quotes can be far
-+beyond it. One Triton program per request finds the most recent occurrence of the longest
-+suffix (NMIN..NMAX tokens) of the token history and proposes the tokens that followed it.
-+The proposal is fused with the drafter's: a match of `nstrong` tokens or more replaces the
-+drafts on its own, a shorter one (down to `nmin`) only where the drafter independently
-+proposed the same first `agree_min` tokens.
++The DSpark drafter sees a 1024-token window; a document the answer quotes can be
++far beyond it. One Triton program per request finds the most recent occurrence of
++the longest suffix (NMIN..NMAX tokens) of the token history and proposes the
++tokens that followed it. The proposal is fused with the drafter's: a match of
++`nstrong` tokens or more replaces the drafts on its own, a shorter one (down to
++`nmin`) only where the drafter independently proposed the same first `agree_min`
++tokens.
 +
-+Lossless: every position taken from the lookup gets a point mass on the proposed token in
-+the draft-logits cache, a legal q for the rejection sampler (acceptance becomes p(x)).
++Lossless: every position taken from the lookup gets a point mass on the proposed
++token in the draft-logits cache, a legal q for the rejection sampler (acceptance
++becomes p(x)).
 +
 +After HyperQwen's dflash2-lookup-drafting (syv-ai/HyperQwen, Apache-2.0).
 +"""
@@ -2053,7 +1908,9 @@ index 000000000..87a4cdea5
 +                t_j = tl.load(base + e - j, mask=longer & ((e - j) >= 0), other=-1)
 +                longer = longer & (t_j == s_j)
 +                match = tl.where(longer, match + 1, match)
-+            score = tl.where(alive, match.to(tl.int64) * SCORE_STRIDE + e.to(tl.int64), -1)
++            score = tl.where(
++                alive, match.to(tl.int64) * SCORE_STRIDE + e.to(tl.int64), -1
++            )
 +            best = tl.maximum(best, tl.max(score, axis=0))
 +    if best < 0:
 +        return
@@ -2101,7 +1958,9 @@ index 000000000..87a4cdea5
 +    agree = tl.minimum(tl.min(tl.where(disagree, idx, K)), valid)
 +    take = (match_len >= nstrong) | ((match_len >= nmin) & (agree >= agree_min))
 +    if take & (valid > 0):
-+        tl.store(draft_ptr + req * draft_stride + idx, looked, mask=kmask & (idx < valid))
++        tl.store(
++            draft_ptr + req * draft_stride + idx, looked, mask=kmask & (idx < valid)
++        )
 +        tl.store(used_ptr + req, valid)
 +
 +
@@ -2118,15 +1977,17 @@ index 000000000..87a4cdea5
 +    vocab,
 +    BLOCK_V: tl.constexpr,
 +):
-+    """Grid (requests, K): the draft-logits row of each taken position becomes a point mass
-+    on the token now in `draft_tokens`."""
++    """Grid (requests, K): the draft-logits row of each taken position becomes a
++    point mass on the token now in `draft_tokens`."""
 +    req = tl.program_id(0)
 +    step = tl.program_id(1)
 +    req_state = tl.load(idx_mapping_ptr + req * idx_mapping_stride)
 +    if (req_state < 0) | (step >= tl.load(used_ptr + req)):
 +        return
 +    token = tl.load(draft_ptr + req * draft_stride + step)
-+    row = cache_ptr + req_state.to(tl.int64) * cache_stride_row + step * cache_stride_step
++    row = (
++        cache_ptr + req_state.to(tl.int64) * cache_stride_row + step * cache_stride_step
++    )
 +    for v0 in range(0, vocab, BLOCK_V):
 +        offs = v0 + tl.arange(0, BLOCK_V)
 +        tl.store(row + offs, float("-inf"), mask=offs < vocab)
@@ -2136,9 +1997,17 @@ index 000000000..87a4cdea5
 +class ContextLookup:
 +    """Persistent buffers for one speculator (CUDA-graph safe: no host reads)."""
 +
-+    def __init__(self, max_num_reqs: int, k: int, device: torch.device,
-+                 nmin: int = 6, nstrong: int = 8, agree_min: int = 2, nmax: int = 32,
-+                 search_max: int = 1 << 30):
++    def __init__(
++        self,
++        max_num_reqs: int,
++        k: int,
++        device: torch.device,
++        nmin: int = 6,
++        nstrong: int = 8,
++        agree_min: int = 2,
++        nmax: int = 32,
++        search_max: int = 1 << 30,
++    ):
 +        self.k, self.nmin, self.nstrong, self.agree_min = k, nmin, nstrong, agree_min
 +        self.nmax, self.search_max = nmax, search_max
 +        self.tokens = torch.zeros(max_num_reqs, k, dtype=torch.int32, device=device)
@@ -2147,143 +2016,71 @@ index 000000000..87a4cdea5
 +        # Per request: how many leading drafts came from the lookup this step.
 +        self.used = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
 +
-+    def apply(self, token_history: torch.Tensor, total_len: torch.Tensor,
-+              idx_mapping: torch.Tensor, idx_mapping_stride: int, num_reqs: int,
-+              draft_tokens: torch.Tensor, draft_logits: torch.Tensor | None) -> None:
++    def apply(
++        self,
++        token_history: torch.Tensor,
++        total_len: torch.Tensor,
++        idx_mapping: torch.Tensor,
++        idx_mapping_stride: int,
++        num_reqs: int,
++        draft_tokens: torch.Tensor,
++        draft_logits: torch.Tensor | None,
++    ) -> None:
 +        """`draft_tokens[:num_reqs]` <- the fused proposal; `draft_logits` (the
 +        [rows, K, vocab] cache indexed by request state) <- point masses where taken."""
 +        _suffix_lookup_kernel[(num_reqs,)](
-+            token_history, token_history.stride(0), total_len, idx_mapping,
-+            idx_mapping_stride, self.tokens, self.match_len, self.valid, self.search_max,
-+            K=self.k, NMAX=self.nmax, NMIN=min(self.nmin, 4), BLOCK=1024,
-+            BLOCK_K=triton.next_power_of_2(self.k), num_warps=4,
++            token_history,
++            token_history.stride(0),
++            total_len,
++            idx_mapping,
++            idx_mapping_stride,
++            self.tokens,
++            self.match_len,
++            self.valid,
++            self.search_max,
++            K=self.k,
++            NMAX=self.nmax,
++            NMIN=min(self.nmin, 4),
++            BLOCK=1024,
++            BLOCK_K=triton.next_power_of_2(self.k),
++            num_warps=4,
 +        )
 +        _fuse_kernel[(num_reqs,)](
-+            draft_tokens, draft_tokens.stride(0), self.tokens, self.match_len, self.valid,
-+            self.used, idx_mapping, idx_mapping_stride, self.nmin, self.nstrong,
-+            self.agree_min, K=self.k, BLOCK_K=triton.next_power_of_2(self.k), num_warps=1,
++            draft_tokens,
++            draft_tokens.stride(0),
++            self.tokens,
++            self.match_len,
++            self.valid,
++            self.used,
++            idx_mapping,
++            idx_mapping_stride,
++            self.nmin,
++            self.nstrong,
++            self.agree_min,
++            K=self.k,
++            BLOCK_K=triton.next_power_of_2(self.k),
++            num_warps=1,
 +        )
 +        if draft_logits is not None:
 +            _point_mass_kernel[(num_reqs, self.k)](
-+                draft_tokens, draft_tokens.stride(0), self.used, idx_mapping,
-+                idx_mapping_stride, draft_logits, draft_logits.stride(0),
-+                draft_logits.stride(1), draft_logits.shape[-1], BLOCK_V=4096, num_warps=4,
++                draft_tokens,
++                draft_tokens.stride(0),
++                self.used,
++                idx_mapping,
++                idx_mapping_stride,
++                draft_logits,
++                draft_logits.stride(0),
++                draft_logits.stride(1),
++                draft_logits.shape[-1],
++                BLOCK_V=4096,
++                num_warps=4,
 +            )
-diff --git a/vllm/models/inkling2/nvidia/ops/moe.py b/vllm/models/inkling2/nvidia/ops/moe.py
-index f4c0f540a..a0d6d48f5 100644
---- a/vllm/models/inkling2/nvidia/ops/moe.py
-+++ b/vllm/models/inkling2/nvidia/ops/moe.py
-@@ -9,6 +9,8 @@ import torch
- 
- from vllm.triton_utils import tl, tldevice, triton
- 
-+from . import PDL, gdc_launch_dependents, gdc_wait
-+
- from .block_scales import _scale_offsets
- from .linear import _k_group_tile, _prefetch_k_group_tile, k_group_partials
- from .mxfp8 import _mxfp8_block, _store_mxfp8_block
-@@ -623,7 +625,7 @@ def _fused_route_kernel(
-     bias = _load_bias(Bias, E, E_POW2)
-     lo = tl.load(ExpertBounds)
-     hi = tl.load(ExpertBounds + 1)
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     if pid < ROUTERS:
-         _k_group_tile(
-             X,
-@@ -747,8 +749,8 @@ def _route_tokens_kernel(
-     bias = _load_bias(Bias, E, E_POW2)
-     lo = tl.load(ExpertBounds)
-     hi = tl.load(ExpertBounds + 1)
--    tl.extra.cuda.gdc_wait()
--    tl.extra.cuda.gdc_launch_dependents()
-+    gdc_wait()
-+    gdc_launch_dependents()
-     token = tl.full((1,), tl.program_id(0), tl.int64)
-     padding = None
-     if Padding is not None:
-@@ -796,9 +798,9 @@ def _scatter_kernel(
-     token = tl.program_id(0).to(tl.int64)
-     # The tokens are complete before the routing kernel starts.
-     quantized = _quantize_x(X, token, H, NVFP4, HEAD, TAIL)
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     if LAUNCH_DEPENDENTS:
--        tl.extra.cuda.gdc_launch_dependents()
-+        gdc_launch_dependents()
-     dst, local = _place_rows(
-         Starts, Ids, Ranks, Weights, Src2Dst, Gammas, Rows, token, TOPK, LOCAL_POW2
-     )
-@@ -843,7 +845,7 @@ def _scatter_nvfp4_kernel(
-     x = X + token * H
-     # The tokens are complete before the routing kernel starts.
-     amax = _row_amax(x, H)
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     dst, local = _place_rows(
-         Starts, Ids, Ranks, Weights, Src2Dst, Gammas, Rows, token, TOPK, LOCAL_POW2
-     )
-@@ -971,7 +973,7 @@ def route(
-             num_stages=4,
-             enable_fp_fusion=False,
-             launch_cooperative_grid=True,
--            launch_pdl=True,
-+            launch_pdl=PDL,
-         )
-         return outputs, quantized
- 
-@@ -1002,7 +1004,7 @@ def route(
-         TILE=plan.tile,
-         MAX_CTAS=plan.max_ctas,
-         num_warps=4 if tokens <= 128 else 1,
--        launch_pdl=True,
-+        launch_pdl=PDL,
-     )
-     if nvfp4 and tokens >= NVFP4_SCATTER_MIN_TOKENS:
-         _scatter_nvfp4_kernel[(tokens,)](
-@@ -1023,7 +1025,7 @@ def route(
-             TILE=plan.tile,
-             num_warps=1,
-             enable_fp_fusion=False,
--            launch_pdl=True,
-+            launch_pdl=PDL,
-         )
-         return outputs, quantized
-     _scatter_kernel[(tokens,)](
-@@ -1049,7 +1051,7 @@ def route(
-         LAUNCH_DEPENDENTS=tokens <= LAUNCH_DEPENDENTS_MAX_TOKENS,
-         num_warps=2,
-         enable_fp_fusion=False,
--        launch_pdl=True,
-+        launch_pdl=PDL,
-     )
-     return outputs, quantized
- 
-@@ -1069,9 +1071,9 @@ def _combine_kernel(
-     PUSH: tl.constexpr,
-     HALO_ROWS: tl.constexpr,
- ):
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     if LAUNCH_DEPENDENTS:
--        tl.extra.cuda.gdc_launch_dependents()
-+        gdc_launch_dependents()
-     token = tl.program_id(0).to(tl.int64)
-     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-     acc = tl.zeros((BLOCK,), tl.float32)
-@@ -1142,5 +1144,5 @@ def _combine(
-         sp is not None,
-         HALO_ROWS,
-         num_warps=2,
--        launch_pdl=True,
-+        launch_pdl=PDL,
-     )
 diff --git a/vllm/models/inkling2/nvidia/ops/moe_marlin.py b/vllm/models/inkling2/nvidia/ops/moe_marlin.py
 new file mode 100644
-index 000000000..353112d18
+index 0000000000..efd319a912
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/moe_marlin.py
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,210 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 routed experts on Ampere (SM8x): Marlin MoE GEMMs (bf16
@@ -2361,6 +2158,7 @@ index 000000000..353112d18
 +        shapes: `(N, K)` of each projection; `w13`'s N interleaves the
 +            gate and up rows, which Marlin keeps in order.
 +        fmt: The experts' weight format.
++
 +    """
 +
 +    def __init__(
@@ -2494,17 +2292,18 @@ index 000000000..353112d18
 +            topk_weights, block_m, 1, rows, self.hidden_size, self.intermediate_size,
 +        )  # fmt: skip
 diff --git a/vllm/models/inkling2/nvidia/ops/moe_sm120.py b/vllm/models/inkling2/nvidia/ops/moe_sm120.py
-index 8a438dd37..3b9d8ad92 100644
+index 8a438dd37a..6b5c51a0f4 100644
 --- a/vllm/models/inkling2/nvidia/ops/moe_sm120.py
 +++ b/vllm/models/inkling2/nvidia/ops/moe_sm120.py
-@@ -10,6 +10,8 @@ import torch
+@@ -10,7 +10,9 @@ import torch
  
  from vllm.triton_utils import tl, triton
  
-+from . import PDL, gdc_wait
-+
++from . import use_pdl
  from .block_scales import _scale_offsets
++from .pdl import gdc_wait
  from .trtllm_bmm import ExpertPlan
+ 
  
 @@ -108,7 +110,7 @@ def _mxfp8_gemm(
      BK: tl.constexpr,
@@ -2520,228 +2319,26 @@ index 8a438dd37..3b9d8ad92 100644
              num_warps=num_warps,
              num_stages=3,
 -            launch_pdl=True,
-+            launch_pdl=PDL,
++            launch_pdl=use_pdl(),
          )
          return out
      assert weight.dtype == torch.uint8
-diff --git a/vllm/models/inkling2/nvidia/ops/mxfp8.py b/vllm/models/inkling2/nvidia/ops/mxfp8.py
-index 5d223bb41..569a13d35 100644
---- a/vllm/models/inkling2/nvidia/ops/mxfp8.py
-+++ b/vllm/models/inkling2/nvidia/ops/mxfp8.py
-@@ -8,6 +8,8 @@ import torch
- 
- from vllm.triton_utils import tl, tldevice, triton
- 
-+from . import PDL, gdc_wait
-+
- from .block_scales import _scale_offsets
- 
- 
-@@ -51,7 +53,7 @@ def _store_mxfp8_block(
- 
- @triton.jit
- def _mxfp8_quantize_kernel(X, Y, S, M, N: tl.constexpr, BLOCK: tl.constexpr):
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     for r in range(tl.program_id(0), M, tl.num_programs(0)):
-         row = tl.cast(r, tl.int64)
-         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-@@ -80,6 +82,6 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-         N=n,
-         BLOCK=block,
-         enable_fp_fusion=False,
--        launch_pdl=True,
-+        launch_pdl=PDL,
-     )
-     return values, scales
-diff --git a/vllm/models/inkling2/nvidia/ops/nvfp4.py b/vllm/models/inkling2/nvidia/ops/nvfp4.py
-index 57214d956..cf3f51727 100644
---- a/vllm/models/inkling2/nvidia/ops/nvfp4.py
-+++ b/vllm/models/inkling2/nvidia/ops/nvfp4.py
-@@ -14,7 +14,7 @@ import torch
- from vllm.platforms import current_platform
- from vllm.triton_utils import tl, triton
- 
--from . import use_sm100_kernels
-+from . import PDL, gdc_wait, use_sm100_kernels
- from .block_scales import _scale_offsets
- 
- FP32_MAX = tl.constexpr(3.4028234663852886e38)
-@@ -251,7 +251,7 @@ def _quantize_row(X, Values, Scales, Amax, row, K: tl.constexpr, BLOCK: tl.const
- def _nvfp4_quantize_kernel(
-     X, Values, Scales, Amax, M, K: tl.constexpr, BLOCK: tl.constexpr
- ):
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     for row in range(tl.program_id(0), M, tl.num_programs(0)):
-         _quantize_row(X, Values, Scales, Amax, row, K, BLOCK)
- 
-@@ -282,6 +282,6 @@ def nvfp4_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.T
-         BLOCK=block,
-         num_warps=num_warps,
-         enable_fp_fusion=False,
--        launch_pdl=True,
-+        launch_pdl=PDL,
-     )
-     return values, scales, amax
 diff --git a/vllm/models/inkling2/nvidia/ops/sconv.py b/vllm/models/inkling2/nvidia/ops/sconv.py
-index 2c2fcd954..4f9917904 100644
+index 67a3607a3e..d2df98d288 100644
 --- a/vllm/models/inkling2/nvidia/ops/sconv.py
 +++ b/vllm/models/inkling2/nvidia/ops/sconv.py
-@@ -27,6 +27,9 @@ import torch
- from vllm.models.inkling2.nvidia.ops.norm import qr_clip_rel_tokens, rsqrt
- from vllm.triton_utils import tl, triton
- 
-+from . import PDL, gdc_launch_dependents, gdc_wait
-+from .fp8_emu import e4m3_encode
-+
- 
- @triton.jit
- def _cached_taps(
-@@ -248,7 +251,7 @@ def _conv(
-         cached1 = _cached_tap(*taps, 2)
-         cached2 = _cached_tap(*taps, 1)
-         cached3 = _cached_tap(*taps, 0)
--        tl.extra.cuda.gdc_wait()
-+        gdc_wait()
- 
-     dtype = cache_ptr.dtype.element_ty
-     cur = tl.load(x_ptr + toff[:, None] * stride_x + coff[None, :], mask=tc_mask)
-@@ -335,7 +338,7 @@ def _sconv_kernel(
-     first = tl.program_id(0) * BT
-     tile_reads_cache = True
-     if SKIP_IDLE_CACHE:
--        tl.extra.cuda.gdc_wait()
-+        gdc_wait()
-         # Request starts are non-decreasing: no token of the tile is among the
-         # first W - 1 of its request unless the last token's request starts
-         # after first - (W - 1).
-@@ -458,7 +461,7 @@ def short_conv(
-         SKIP_IDLE_CACHE=prefill,
-         num_warps=4,
-         enable_fp_fusion=False,
--        launch_pdl=True,
-+        launch_pdl=PDL,
+@@ -264,7 +264,8 @@ def _conv(
+         + (safe_slot % N)[:, None] * stride_c_n
+         + cache_col[None, :]
      )
-     return out
+-    tl.store(dst, cur, mask=tc_mask & valid[:, None])
++    # Block 0 is the null block: tokens below the step's tail have no state.
++    tl.store(dst, cur, mask=tc_mask & (slot >= N)[:, None])
  
-@@ -554,9 +557,9 @@ def _attn_prologue_kernel(
-     QR_TOKENS: tl.constexpr,
-     FUSE_QR: tl.constexpr,
- ):
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
-     # The decode attention kernel prefetches cached keys meanwhile.
--    tl.extra.cuda.gdc_launch_dependents()
-+    gdc_launch_dependents()
-     # Programs (tile, head, 0 | 1) run the K | V conv of one KV head; programs
-     # (tile, head, 2) clip q of QR_TOKENS of the tile's tokens and programs
-     # (tile, head, 3 + c) their r and column block c of the relative logits.
-@@ -700,7 +703,7 @@ def _qr_rel_kernel(
-         BLOCK_HQ,
-         BLOCK_E,
-     )
--    tl.extra.cuda.gdc_wait()
-+    gdc_wait()
- 
- 
- @triton.jit
-@@ -810,7 +813,11 @@ def _kv_conv_tile(
-         + head * stride_kv_h
-         + d_idx[None, :]
-     )
--    tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
-+    if cache.dtype.element_ty == tl.uint8:
-+        # HyperInkling SM8x: unit-scale E4M3 encoded in software.
-+        tl.store(dst, e4m3_encode(y), mask=(kv_slot >= 0)[:, None])
-+    else:
-+        tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
- 
- 
- # From this many tokens, q/r run in their own launch (8 tokens per program)
-@@ -980,7 +987,7 @@ def attention_prologue(
-         FUSE_QR=not qr_tokens,
-         num_warps=4,
-         enable_fp_fusion=False,
--        launch_pdl=True,
-+        launch_pdl=PDL,
-     )
-     if qr_tokens:
-         _qr_rel_kernel[(triton.cdiv(num_tokens, qr_tokens), qr_blocks)](
-@@ -1012,5 +1019,5 @@ def attention_prologue(
-             QR_TOKENS=qr_tokens,
-             num_warps=4,
-             enable_fp_fusion=False,
--            launch_pdl=True,
-+            launch_pdl=PDL,
-         )
-diff --git a/vllm/models/inkling2/nvidia/sconv.py b/vllm/models/inkling2/nvidia/sconv.py
-index fa186cdaa..63544f90a 100644
---- a/vllm/models/inkling2/nvidia/sconv.py
-+++ b/vllm/models/inkling2/nvidia/sconv.py
-@@ -23,7 +23,7 @@ from vllm.models.inkling.nvidia.sconv_swa_attn import (
- 
- from .ops.allreduce import Inkling2AllReduceWorkspace, all_reduce_conv_mix
- from .ops.conv_mix import conv_mix as fused_conv_mix
--from .ops.linear import linear_k_groups
-+from .ops.linear import linear, linear_k_groups
- from .ops.sconv import short_conv
- from .ops.seq_parallel import SeqParallel
- 
-@@ -104,7 +104,9 @@ class Inkling2ShortConv(nn.Module):
-             4,
-         ):
-             return linear_k_groups(x.contiguous(), self.weight_proj, x.dtype)
--        return nn.functional.linear(x, self.weight_proj)
-+        # HyperInkling: `ops.linear.linear` (Triton GEMV for decode rows,
-+        # cuBLAS above), not cuBLAS's wmma kernels for every size.
-+        return linear(x, self.weight_proj)
- 
-     def forward(
-         self,
-diff --git a/vllm/models/inkling2/nvidia/vision.py b/vllm/models/inkling2/nvidia/vision.py
-index 5ac31a30a..e0c739486 100644
---- a/vllm/models/inkling2/nvidia/vision.py
-+++ b/vllm/models/inkling2/nvidia/vision.py
-@@ -17,7 +17,7 @@ import torch.nn.functional as F
- from torch import nn
- 
- from vllm.model_executor.model_loader.weight_utils import default_weight_loader
--from vllm.models.inkling2.nvidia.ops import use_sm100_kernels
-+from vllm.models.inkling2.nvidia.ops import use_sm100_kernels, use_sm12x_path
- from vllm.models.inkling2.nvidia.ops.linear import linear_k_groups
- from vllm.models.inkling2.nvidia.ops.vision import (
-     apply_rotary_qk_,
-@@ -25,7 +25,6 @@ from vllm.models.inkling2.nvidia.ops.vision import (
-     gather_patches,
-     scaled_residual_norm_,
- )
--from vllm.platforms import current_platform
- 
- _CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
- _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
-@@ -44,9 +43,7 @@ class _SM120Linear(nn.Linear):
- 
- 
- def _linear(in_features: int, out_features: int, bias: bool = True) -> nn.Linear:
--    cls = (
--        _SM120Linear if current_platform.is_device_capability_family(120) else nn.Linear
--    )
-+    cls = _SM120Linear if use_sm12x_path() else nn.Linear
-     return cls(in_features, out_features, bias=bias, dtype=torch.bfloat16)
- 
- 
-@@ -91,7 +88,7 @@ class Inkling2VisionAttention(nn.Module):
-         else:
-             from vllm.vllm_flash_attn import flash_attn_varlen_func
- 
--            version = 2 if current_platform.is_device_capability_family(120) else 3
-+            version = 2 if use_sm12x_path() else 3
-             out = flash_attn_varlen_func(q, k, v, fa_version=version, **kwargs)
-         return self.out_proj(out.view(hidden.shape))
- 
+     tap_args = (
+         x_ptr,
 diff --git a/vllm/models/inkling2/processing.py b/vllm/models/inkling2/processing.py
-index 1413a5a6d..d1383cf41 100644
+index 1413a5a6d1..d1383cf419 100644
 --- a/vllm/models/inkling2/processing.py
 +++ b/vllm/models/inkling2/processing.py
 @@ -11,6 +11,7 @@ from __future__ import annotations
@@ -2827,7 +2424,7 @@ index 1413a5a6d..d1383cf41 100644
          }
  
 diff --git a/vllm/models/inkling2/quant_config.py b/vllm/models/inkling2/quant_config.py
-index 5a861b564..c7d6eb1d8 100644
+index af504ebc6a..c1a70321e6 100644
 --- a/vllm/models/inkling2/quant_config.py
 +++ b/vllm/models/inkling2/quant_config.py
 @@ -2,7 +2,8 @@
@@ -2864,17 +2461,7 @@ index 5a861b564..c7d6eb1d8 100644
  
      @classmethod
      def get_name(cls) -> QuantizationMethods:
-@@ -43,7 +47,8 @@ class Inkling2QuantConfig(QuantizationConfig):
- 
-     @classmethod
-     def get_min_capability(cls) -> int:
--        return 90
-+        # HyperInkling: Ampere runs the SM12x Triton path.
-+        return 80
- 
-     @staticmethod
-     def get_config_filenames() -> list[str]:
-@@ -76,3 +81,9 @@ class Inkling2QuantConfig(QuantizationConfig):
+@@ -76,3 +80,9 @@ class Inkling2QuantConfig(QuantizationConfig):
      def is_mxfp8_layer(self, layer_id: int) -> bool:
          name = f"model.llm.layers.{layer_id}.mlp.experts.w13_weight"
          return name in self.mxfp8_weights
@@ -2885,7 +2472,7 @@ index 5a861b564..c7d6eb1d8 100644
 +            return "int4"
 +        return "mxfp8" if self.is_mxfp8_layer(layer_id) else "nvfp4"
 diff --git a/vllm/models/inkling2/speculator.py b/vllm/models/inkling2/speculator.py
-index 6beae2b0d..37bfafbbf 100644
+index 6beae2b0d5..37bfafbbf5 100644
 --- a/vllm/models/inkling2/speculator.py
 +++ b/vllm/models/inkling2/speculator.py
 @@ -3,6 +3,8 @@
@@ -2938,7 +2525,7 @@ index 6beae2b0d..37bfafbbf 100644
 +                None if self.draft_logits is None else self.draft_logits.values,
 +            )
 diff --git a/vllm/models/inkling2/speculator_config.py b/vllm/models/inkling2/speculator_config.py
-index 0d367f830..d6131fc86 100644
+index 0d367f8309..dcc7b20b89 100644
 --- a/vllm/models/inkling2/speculator_config.py
 +++ b/vllm/models/inkling2/speculator_config.py
 @@ -1,8 +1,8 @@
@@ -2952,13 +2539,15 @@ index 0d367f830..d6131fc86 100644
  from vllm.v1.worker.gpu.spec_decode.dspark.config import DSparkSpeculatorConfig
  
  if TYPE_CHECKING:
-@@ -11,11 +11,16 @@ if TYPE_CHECKING:
+@@ -11,11 +11,18 @@ if TYPE_CHECKING:
  
  class Inkling2DSparkSpeculatorConfig(DSparkSpeculatorConfig):
      speculator_class = "vllm.models.inkling2.speculator.Inkling2DSparkSpeculator"
 +    # HYPERINKLING_LOOKUP scans the token history every draft step: keep it on the GPU
 +    # (max_num_seqs x max_model_len int32, 6 MB at 6 x 262k).
-+    prefer_dense_token_history: ClassVar[bool] = os.environ.get("HYPERINKLING_LOOKUP") == "1"
++    prefer_dense_token_history: ClassVar[bool] = (
++        os.environ.get("HYPERINKLING_LOOKUP") == "1"
++    )
  
      @classmethod
      def adapt_draft_model_config(cls, spec: "SpeculativeConfig") -> None:
@@ -2971,7 +2560,7 @@ index 0d367f830..d6131fc86 100644
              # draft's unnormalized values. Keep the draft cache in BF16.
              if spec.kv_cache_dtype is None:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 0373c6477..34caff71d 100644
+index 0373c64773..34caff71d1 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -84,6 +84,10 @@ from vllm.v1.metrics.stats import (
@@ -3055,7 +2644,7 @@ index 0373c6477..34caff71d 100644
                  # scheduling, num_output_placeholders, which covers the spec
                  # tokens). A stale rejection count predates the preemption
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 6c83d46bb..e478d1f45 100644
+index 6c83d46bb1..e478d1f459 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -127,6 +127,68 @@ HANDSHAKE_TIMEOUT_MINS = 5
@@ -3163,7 +2752,7 @@ index 6c83d46bb..e478d1f45 100644
          # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
 diff --git a/vllm/v1/spec_decode/dynamic/adaptive_k.py b/vllm/v1/spec_decode/dynamic/adaptive_k.py
 new file mode 100644
-index 000000000..4cd88f259
+index 0000000000..4cd88f259e
 --- /dev/null
 +++ b/vllm/v1/spec_decode/dynamic/adaptive_k.py
 @@ -0,0 +1,130 @@

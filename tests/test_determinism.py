@@ -68,7 +68,7 @@ def test_short_conv_repeat(q):
     torch.manual_seed(0)
     reqs, blocks = 4, 32
     ctx = [10, 50, 90, 130]
-    cache = torch.randn(reqs * blocks, H, N, WS, device="cuda").to(torch.bfloat16)
+    cache = torch.randn(1 + reqs * blocks, H, N, WS, device="cuda").to(torch.bfloat16)
     weight = (torch.randn(H * WS, W, device="cuda") * 0.5).to(torch.bfloat16)
     x = torch.randn(reqs * q, H * WS, device="cuda").to(torch.bfloat16)
     meta = _batch([q] * reqs, ctx, 0, blocks)
