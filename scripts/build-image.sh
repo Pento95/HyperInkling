@@ -4,6 +4,8 @@
 #
 #   scripts/build-image.sh [tag]            # default tag hyperinkling:latest
 #
+# A tag already on its registry is refused (published images never move: bump the version).
+# The built image runs scripts/verify-image.py on the GPU (the compiled ops work on sm86).
 # Env: MAX_JOBS (compile jobs, default: nproc - 1), NVCC_THREADS (2), DOCKER (docker).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -13,10 +15,16 @@ JOBS=${MAX_JOBS:-$(( $(nproc) > 1 ? $(nproc) - 1 : 1 ))}
 [ -d vllm/.git ] || { echo "no ./vllm checkout: run scripts/setup-vllm.sh first" >&2; exit 1; }
 git -C vllm log -1 --format='%s' | grep -q '^\[hyperinkling\]' \
 	|| { echo "./vllm HEAD is not the HyperInkling commit" >&2; exit 1; }
+if [[ "$TAG" == */* ]] && "$DOCKER" manifest inspect "$TAG" > /dev/null 2>&1; then
+	echo "$TAG is already published: use a new version" >&2
+	exit 1
+fi
 
 "$DOCKER" build --network=host -f vllm/docker/Dockerfile --target vllm-openai \
 	--build-arg torch_cuda_arch_list='8.6' \
 	--build-arg max_jobs="$JOBS" --build-arg nvcc_threads="${NVCC_THREADS:-2}" \
 	-t hyperinkling-vllm:sm86 vllm
 "$DOCKER" build --network=host --build-arg VLLM_IMAGE=hyperinkling-vllm:sm86 -t "$TAG" .
-echo "built $TAG"
+"$DOCKER" run --rm --gpus all --entrypoint python3 "$TAG" scripts/verify-image.py \
+	|| { echo "$TAG: the compiled ops fail on this GPU" >&2; exit 1; }
+echo "built and verified $TAG"

@@ -4,19 +4,21 @@
 # table (scripts/wizard.py).
 #
 #   bench/memory_matrix.sh [out.tsv]        # ~2 min per combination, GPU must be free
-#   EXTRA_ENV="NBT=2048 IMAGE_MAX_W=1040 IMAGE_MAX_H=1560" bench/memory_matrix.sh x.tsv
+#   COMBOS="gpu:dspark:1:6:1024" bench/memory_matrix.sh x.tsv   # vision:spec:async:seqs:nbt
 #
-# Columns: vision spec async max_seqs  max_len_fits  pool_tokens  weights_gib
+# The defaults otherwise (ENV_FILE=: not the .env). Columns: vision spec async max_seqs nbt
+# max_len_fits pool_tokens weights_gib
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"
 OUT=${1:-.local/memory_matrix.tsv}; PORT=${PORT:-18030}
 mkdir -p .local/memmatrix
-COMBOS=${COMBOS:-"gpu:dspark:1:6 gpu:dspark:0:6 gpu:off:1:6 host:dspark:1:6 host:dspark:0:6 host:off:1:6 none:dspark:1:6 none:dspark:0:6 none:off:1:6 gpu:dspark:0:1 gpu:dspark:0:16 gpu:dspark:0:32 gpu:dspark:0:64 gpu:off:1:64"}
-[ -f "$OUT" ] || printf 'vision\tspec\tasync\tmax_seqs\tmax_len_fits\tpool_tokens\tweights_gib\n' > "$OUT"
+COMBOS=${COMBOS:-"gpu:dspark:1:6 gpu:dspark:0:6 gpu:off:1:6 gpu:off:0:6 host:dspark:1:6 host:off:1:6 none:dspark:1:6 none:off:1:6 gpu:dspark:1:1 gpu:dspark:1:16 gpu:dspark:1:32 gpu:dspark:1:64 gpu:off:1:64 gpu:dspark:1:6:1024 gpu:dspark:0:6:1024 gpu:off:1:6:1024"}
+[ -f "$OUT" ] || printf 'vision\tspec\tasync\tmax_seqs\tnbt\tmax_len_fits\tpool_tokens\tweights_gib\n' > "$OUT"
 for c in $COMBOS; do
-	IFS=: read -r vision spec async seqs <<< "$c"
-	log=.local/memmatrix/$vision-$spec-a$async-s$seqs.log
-	env_args=(PORT=$PORT KV_OFFLOAD_GB=0 WARMUP=0 SPEC=$spec ASYNC=$async MAX_SEQS=$seqs ${EXTRA_ENV:-})
+	IFS=: read -r vision spec async seqs nbt <<< "$c"
+	nbt=${nbt:-2048}
+	log=.local/memmatrix/$vision-$spec-a$async-s$seqs-n$nbt.log
+	env_args=(ENV_FILE= PORT=$PORT KV_OFFLOAD_GB=0 WARMUP=0 SPEC=$spec ASYNC=$async MAX_SEQS=$seqs NBT=$nbt)
 	case $vision in
 	host) env_args+=(HYPERINKLING_VISION_HOST=1) ;;
 	none) env_args+=(IMAGES=0) ;;
@@ -34,5 +36,5 @@ for c in $COMBOS; do
 	for p in $(pgrep -f '[v]llm serve'); do kill "$p"; done
 	for _ in $(seq 60); do pgrep -f '[v]llm serve' > /dev/null || break; sleep 2; done
 	wait $sp 2>/dev/null
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vision" "$spec" "$async" "$seqs" "${fits:-?}" "${pool:--}" "${weights:-?}" | tee -a "$OUT"
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vision" "$spec" "$async" "$seqs" "$nbt" "${fits:-?}" "${pool:--}" "${weights:-?}" | tee -a "$OUT"
 done

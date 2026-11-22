@@ -13,12 +13,14 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO"
 
 # The wizard's .env, for the variables not already set (the command line wins). UID/GID
-# are only for Docker's prepare service (UID is read-only in bash).
-if [ -f .env ]; then
+# are only for Docker's prepare service (UID is read-only in bash). ENV_FILE= skips it
+# (the benches measure the defaults).
+ENV_FILE=${ENV_FILE-.env}
+if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
 	while IFS='=' read -r key value; do
 		case "$key" in ''|'#'*|UID|GID) continue ;; esac
 		if [ -z "${!key+set}" ]; then export "$key=$value"; fi
-	done < .env
+	done < "$ENV_FILE"
 fi
 
 MODEL=${MODEL:-$REPO/models/Inkling-2-Mini-W4A16-g128-gptq}
@@ -69,11 +71,11 @@ KV_OFFLOAD_GB=${KV_OFFLOAD_GB:-auto}
 # over a minute, and clients with a read timeout would drop it. 0 disables.
 SSE_KEEPALIVE=${SSE_KEEPALIVE:-30}
 IMAGES=${IMAGES:-50}             # images per request
-# Largest image profiled: A4 at ~150 ppi (1,333 tokens). Larger images are scaled
-# down to this many 40 px cells (HYPERINKLING_IMAGE_MAX_CELLS) instead of hanging.
-# A4 at 300 ppi: IMAGE_MAX_W=2480 IMAGE_MAX_H=3508 ENCODER_CACHE=16384.
-IMAGE_MAX_W=${IMAGE_MAX_W:-1240}
-IMAGE_MAX_H=${IMAGE_MAX_H:-1760}
+# Largest image profiled: 1,014 tokens (40 px cells), an A4 page at ~128 ppi; NBT=2048
+# encodes two per step. Larger images are scaled down to it (HYPERINKLING_IMAGE_MAX_CELLS)
+# instead of hanging. A4 at 300 ppi: IMAGE_MAX_W=2480 IMAGE_MAX_H=3508 ENCODER_CACHE=16384.
+IMAGE_MAX_W=${IMAGE_MAX_W:-1040}
+IMAGE_MAX_H=${IMAGE_MAX_H:-1560}
 MM_CACHE_GB=${MM_CACHE_GB:-6}
 # Encoder output kept on the GPU, in tokens (~4.6 KB each): ~6 pages. It must hold
 # the largest image; vLLM's default (the prefill chunk) would reject a page.

@@ -8,8 +8,8 @@ fetched with `hf download --include` only when chosen.
 |---|---|---|
 | 2, the checkpoint (alternatives, after the post) | 8, 11, 12, 14, 33 | new files on HF |
 | 3, context (best effort) | 54 (with 53) | |
-| after the post | 38 | |
-| 4, speed and polish | 35, 13 (+37), 10, 34, 53, 51, 52, 50, in this order | Reddit post |
+| after the post | 10, 13, 38 | |
+| 4, release | 53, 50, then 51 if its image is public | Reddit post |
 
 Released: `ghcr.io/pento95/hyperinkling:0.1.1` (compose default), the HF checkpoint (its README
 is docs/MODEL_CARD.md: re-upload it when the card changes). A new image goes with a new tag
@@ -32,11 +32,6 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     GB/s on 201k x 2304, INT8 ~900).
 12. **Attention 4-bit** [NS] (GPTQ + int4 GEMV): halves the bytes, but the small attention
     matrices are latency-bound (35): measure the step, not GB/s.
-13. **A faster W4A16 GEMV** [NS, AX]: `ops/linear_w4.py` reaches 400-550 GB/s at decode
-    (outputs of 16k columns or more take the single-launch kernel, the rest split-K;
-    `bench/w4_gemv.py`). The cost is the nibble unpack: try the bit-shift pair unpack of
-    `csrc/nvfp4_moe_sm86.cu` [AX] (two weights to bf16x2 in three integer ops, `lop3`).
-    Unblocks 11, 12 and the drafter (1.1-1.8 ms per step, 37).
 14. **Run-to-run nondeterminism** [NS]: the same request scored twice differs from position 1
     (~0.003 in logprob); an expert flip carries it down the sequence (KL mean floor 0.060,
     median 0.0003). Bitwise repeatable (`tests/test_determinism.py`): Marlin MoE, the W8
@@ -65,6 +60,12 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     asks for an optional cap instead of computing `MAX_LEN`, and shows the expected context
     from the new table (with 53, on the matrix of 50). Its `NBT` question still has the old
     logic (2048 forced async off at -68k): `NBT=2048` is now the default.
+13. **Drafter W4 at 6-16 requests** [NS, after the post]: past ~21 rows the W4 kernels
+    are tensor-core bound (int4 halves the bytes per MAC, so the bound comes at half the
+    rows of INT8): 1.3 ms per step at 6 requests. fp16 accumulation doubles the MMA rate on
+    GeForce; for the drafter it moves only acceptance (est. +2-3% at 6-16 requests).
+    Building bf16 from bits (`code | 0x4300` = 128 + code, the zero point corrected per
+    group from the row sums) gave +15-20% at 1-7 rows on split-K, worth ~0.03 ms a step.
 38. **Drafter SWA layers padded into the global groups' size** [NS]: the KV manager groups 9
     layers per block; the drafter's 2 SWA layers pad to 9 (the "350% padding" warning).
     Small real waste per block; merging that bucket with another frees it.
@@ -94,22 +95,10 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 32. **BASE to vLLM main when #69165 merges** [AR]: `patches/BASE` is its head today
     (`scripts/setup-vllm.sh` stops if a force-push removed it). #69165 hit a sampler-warmup
     OOM at `max_num_seqs` 256: keep the wizard's cap.
-34. **SiTU fused into the experts' w13 epilogue** [AX `labs/lab3b`]: today Marlin writes
-    gate_up, a separate kernel applies the softcapped SiTU, w2 reads it back: one launch and
-    a round trip per visit, 48 per token. AX fuses it in registers (and the top-8 w2
-    reduction). Needs a Marlin epilogue change, bitwise against the unfused output.
-35. **W8 small matrices are latency-bound** [NS nsys]: `_w8_kernel` takes 2.8/3.6/5.5 ms per
-    step at 1/6/16 requests; qkvr (8600 x 2304) and o (2304 x 3072) stay at 300-500 GB/s
-    whatever the tile. Fewer launches, not fewer bytes: o fused with the next qkvr input
-    path, or a persistent kernel over a layer's projections. A single-launch kernel over a
-    global layer's three q/k/v inputs helps only the 8 global visits (not worth it alone).
-37. **Drafter W4 time** [NS nsys]: 1.1-1.8 ms per step; follows 13.
-51. **Against club-3090's image** [C3]: once its single-GPU profile ships, run the same
-    benches on both for the post (it serves the release checkpoint, bf16 KV).
-52. **Release guards** [C3 `build.sh`]: `scripts/build-image.sh` refuses to retag a published
-    tag and the push pushes the image it built and checked; a `--verify` that the compiled
-    libraries carry sm86 code (stock libraries without it leave `moe_align_block_size`'s
-    buffers unwritten, silently).
+51. **Against club-3090's image** [C3]: PR noonghunna/club-3090#2135 (open) adds one-card
+    slugs on `ghcr.io/noonghunna/vllm-inkling-club3090` (private so far): `single-max` 180k
+    without drafter, `single-fast` 100k with DSpark, both NBT 512, 2 requests, release
+    checkpoint. Once it pulls: `bench/context_bench.py` against both on this GPU, for the post.
 53. **Image budget in the wizard** [NS]: ask the largest image as tokens per image (default
     1024, shown also as megapixels: 1024 tokens = 1024 cells of 40 x 40 px = 1.64 MP, an A4
     page at ~128 ppi), and set `IMAGE_MAX_W`/`_H` from it. With `NBT=2048` a step then
@@ -124,10 +113,21 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     `bench/extract_bench.py`, `bench/memory_matrix.sh`, `bench/kl_eval.py`,
     `bench/quality_battery.py` against the original. The post credits HyperQwen, basalt, AR,
     AX, C3 and invites field reports (`.github/ISSUE_TEMPLATE/field-report.yml`).
+    Measured at 6 requests: the controller chain (`pair_rms`, `down_split`,
+    `up_from_partials`, `blend_rms_norm`) is 18 us per visit, but `blend`'s RMSNorm sums the
+    whole row in one `tl.sum` and `up` must stay a `tl.dot`, so they cannot merge bitwise;
+    `pair_rms` into `down_split` saves ~0.1 ms, `attn_res_row` (0.53 ms) is the other
+    candidate: ~1-2% in all.
 
 ## Tried and dropped
 
 - Verify-side MoE kernel work [NS]: Marlin already reads ~900 GB/s; a second verified token
+- W8 attention/head kernels [NS, item 35]: up to 32 rows they read 75-90% of bandwidth
+  (qkvr 765-800 GB/s, the head 870-930); past 32 rows they are bound by the dequant and
+  MMAs (qkvr at 96 rows ~62 TFLOPS). Ordering the grid so row tiles of a column run
+  together (weights from L2) changed nothing. Left: o (few column tiles), <1% of a step.
+- SiTU fused into the experts' w13 epilogue [AX, item 34]: `_swiglu_kernel` is 0.12 ms of a
+  22 ms step at 6 requests (0.5%), and each try rebuilds Marlin's C++.
   costs less than double because tokens share experts. A warp-GEMV MoE for 1-4 tokens [AX]
   reaches ~390 GB/s per expert: below Marlin here.
 - Screening the Markov head on the base logits' top-k [BS]: acceptance collapsed (counting
