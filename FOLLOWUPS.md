@@ -18,9 +18,9 @@ with `hf download --include` only when chosen.
 
 ## Release (in progress)
 
-2. **Published 0.1.0** (GitHub release, `ghcr.io/pento95/hyperinkling:0.1.0`, the HF checkpoint;
-   re-upload the HF README from docs/MODEL_CARD.md when the card changes). Not yet run: a
-   fresh machine's compose `prepare` download from HF.
+2. **Published 0.1.1** (GitHub release, `ghcr.io/pento95/hyperinkling:0.1.1`, the HF checkpoint;
+   re-upload the HF README from docs/MODEL_CARD.md when the card changes; a new image goes
+   with a new tag and the compose default).
 
 ## Still to try
 
