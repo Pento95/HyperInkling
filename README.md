@@ -60,10 +60,22 @@ should work where CUDA 13 and a gcc it accepts are installed; that is best effor
 ## Speed (RTX 3090 Ti, 2026-11-22)
 
 Measured on an RTX 3090 Ti undervolted to 350 W, with
-[gpu-unlock](https://github.com/zagitta/gpu-unlock) active; KV cache FP8 E4M3.
+[gpu-unlock](https://github.com/zagitta/gpu-unlock) active; KV cache FP8 E4M3; DSpark on
+(the default). "Aggregate" is the sum over all requests running at once.
 
-Decode speed of one request, by kind of text (`bench/spec_bench.py`, temperature 0.2 for
-structured output and 0.5 for the rest, reasoning on):
+Decode with short prompts (~30 tokens in, 512 out, greedy; `bench/profile_spec.sh`):
+
+| requests at once | 1 | 6 | 16 |
+|---|---|---|---|
+| decode, per request | 124 tok/s | 72 tok/s | 49 tok/s |
+| decode, aggregate | 124 tok/s | **434 tok/s** | **785 tok/s** |
+| time per step | 12.6 ms | 24.0 ms | 33.8 ms |
+
+Each step reads the experts the batch routes to: ~17 of 128 per layer visit for one request,
+~60 for 6, ~90 for 16 (measured on real routing), so more requests cost little more per step.
+
+Decode of one request, by kind of text (`bench/spec_bench.py`, temperature 0.2 for structured
+output and 0.5 for the rest, reasoning on):
 
 | | without DSpark | with DSpark (default) |
 |---|---|---|
@@ -74,16 +86,22 @@ structured output and 0.5 for the rest, reasoning on):
 | questions over a document, quoting it | 133 | ~275 |
 | copying a 120-line table from a 50k-token document (greedy) | not measured | **~490** |
 
-Long prompts (AA-LCR documents, 256 to 64k tokens, mean 12k; 512 tokens out;
-`bench/evalscope_perf.sh`, 10 minutes each). Mostly prefill: with 6 at once, each request's
-decode steps share the GPU with the others' prefill chunks, so per-request decode drops and
-the output rate counts the prefill time too.
+Prefill: ~5,500 tok/s for one 14.5k-token prompt and ~5,600 tok/s **aggregate** with 6 at once
+(with or without DSpark; context limit 262k): one prompt already fills the GPU. With
+`NBT=2048`: 6,050 tok/s both (at a 65k limit: 2048 does not fit 262k). gpu-unlock raises the
+bf16 tensor-core rate (102 TFLOPS on a cuBLAS GEMM instead of ~40): that changes prefill, not
+decode, which is bandwidth-bound. A stock card prefills slower; decode is the same.
+
+Long prompts are bound by that prefill (AA-LCR documents, 256 to 64k tokens, mean 12k; 512
+tokens out, so 24 prompt tokens per generated one; `bench/evalscope_perf.sh`, 10 minutes each).
+With 6 at once the GPU prefills 6 x 12k tokens per round: the output cannot exceed
+~5,600 / 24 = ~230 tok/s aggregate however fast the decode, and each request's decode steps
+share the GPU with the others' prefill chunks.
 
 | | 1 request, no DSpark | 1 request, DSpark | 6 requests, no DSpark | 6 requests, DSpark |
 |---|---|---|---|---|
-| prompt processing, per request | 4,510 tok/s | 4,570 tok/s | 4,320 tok/s | 4,200 tok/s |
 | decode, per request | 128 tok/s | **217 tok/s** | 26 tok/s | 31 tok/s |
-| output, aggregate (prefill time included) | 77 tok/s | 102 tok/s | 125 tok/s | 141 tok/s |
+| output, aggregate, prefill time included | 77 tok/s | 102 tok/s | 125 tok/s | 141 tok/s |
 | time to first token (6: queueing included) | 2.66 s | 2.64 s | 4.64 s | 5.29 s |
 
 Document extraction, 6 requests at once (`bench/extract_bench.py`, 10 minutes: a shared ~3.5k
@@ -94,12 +112,6 @@ time to first token 0.84 s median and 1.45 s p90, 2.4 tokens per verify step.
 DSpark is lossless: the target verifies every draft. It helps most where the text is
 predictable (structured output, code, quoting) and least on free prose, because a verify step
 on a mixture-of-experts model reads many more experts than a plain step (NOTES.md).
-
-Prefill: ~5,500 tok/s for one 14.5k-token prompt, ~5,600 tok/s aggregate with 6 at once
-(with or without DSpark; context limit 262k). With `NBT=2048`: 6,050 tok/s both (measured at a
-65k limit: 2048 does not fit 262k). gpu-unlock raises the bf16 tensor-core rate (102 TFLOPS on a cuBLAS
-GEMM instead of ~40): that changes prefill, not decode, which is bandwidth-bound. A stock card
-prefills slower; decode is the same.
 
 ## Context and the knobs that trade it
 

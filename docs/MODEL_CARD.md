@@ -78,21 +78,22 @@ Server context limit 262,144 tokens (the default); the NBT 2048 figures at 65,53
 | | prompt | without DSpark | with DSpark (default) |
 |---|---|---|---|
 | prefill, one prompt | 14.5k | 5,550 tok/s | 5,470 tok/s (NBT 2048: 6,050) |
-| prefill, 6 prompts at once, aggregate | 6 x 14.5k | 5,600 tok/s | 5,570 tok/s (NBT 2048: 6,050) |
+| prefill, 6 prompts at once, **aggregate** | 6 x 14.5k | 5,600 tok/s | 5,570 tok/s (NBT 2048: 6,050) |
 | decode, one request, prose | ~30, 512 out | 134 tok/s | ~160 tok/s |
 | decode, one request, long documents | 13k mean, 512 out | 128 tok/s | 217 tok/s |
 | decode, one request, structured output | ~100 | 135 tok/s | ~295 tok/s |
 | decode, one request, copying a table | 50k | not measured | ~490 tok/s |
-| decode, 6 requests, prose, aggregate | ~30 each, 512 out | 428 tok/s | ~435 tok/s |
+| decode, 6 requests, prose, **aggregate** | ~30 each, 512 out | 428 tok/s | ~435 tok/s |
+| decode, 16 requests, prose, **aggregate** | ~30 each, 512 out | not measured | ~785 tok/s |
 
-Long prompts (AA-LCR documents, mean 12k tokens, 512 out). Mostly prefill: with 6 at once,
-decode steps share the GPU with the others' prefill chunks.
+Long prompts are bound by the prefill (AA-LCR documents, mean 12k tokens, 512 out: 24 prompt
+tokens per generated one). With 6 at once the output cannot exceed ~5,600 / 24 = ~230 tok/s
+aggregate, and decode steps share the GPU with the others' prefill chunks.
 
 | | 1 request, no DSpark | 1 request, DSpark | 6 requests, no DSpark | 6 requests, DSpark |
 |---|---|---|---|---|
-| prompt processing, per request | 4,510 tok/s | 4,570 tok/s | 4,320 tok/s | 4,200 tok/s |
 | decode, per request | 128 tok/s | 217 tok/s | 26 tok/s | 31 tok/s |
-| output, aggregate (prefill time included) | 77 tok/s | 102 tok/s | 125 tok/s | 141 tok/s |
+| output, **aggregate**, prefill time included | 77 tok/s | 102 tok/s | 125 tok/s | 141 tok/s |
 | time to first token (6: queueing included) | 2.66 s | 2.64 s | 4.64 s | 5.29 s |
 
 `NBT=2048` (a wizard option) costs ~68k tokens of context: 200k instead of 268k with DSpark,
