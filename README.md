@@ -33,7 +33,7 @@ The wizard's answers are in `.env`, which compose reads at every start: next tim
 To build the image yourself instead (~1 hour, compiles vLLM for sm86):
 `scripts/setup-vllm.sh && scripts/build-image.sh`, then `IMAGE=hyperinkling:latest` in `.env`.
 
-The OpenAI-compatible API is at `http://127.0.0.1:8080/v1`, model `inkling-2-mini`
+The OpenAI-compatible API is at `http://127.0.0.1:8080/v1`, model `inkling-2-mini` (alias `local`, see `SERVED_ALIASES`)
 (`GET /health` when it is up; `GET /` is a 404 by design). The port is published on
 127.0.0.1 only: to serve other machines set `BIND=0.0.0.0` and a `VLLM_API_KEY` in `.env`
 (the wizard does both). With a key, every path except `/health`, `/ping`, `/load` and
@@ -50,8 +50,8 @@ works; 64 GB lets the prefix-cache CPU tier hold long shared prompts.
 scripts/setup-vllm.sh            # vllm/ = PR #69028 at patches/BASE + our patch
 scripts/build-vllm.sh            # venv/, sm86 only (~30-60 min)
 hf download Pentium95/Inkling-2-Mini-W4A16-g128-gptq --local-dir models/Inkling-2-Mini-W4A16-g128-gptq
-python3 scripts/wizard.py --print   # the same questions, prints the env line
-./start.sh                       # every knob is an env var; run it in tmux
+python3 scripts/wizard.py         # the same questions, writes .env
+./start.sh                       # foreground; reads .env, every knob is also an env var
 ```
 
 Tested on Fedora 44 (gcc 15 next to the default gcc 16, CUDA 13.3). Other distributions

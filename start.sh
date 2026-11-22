@@ -1,18 +1,30 @@
 #!/bin/bash
 # HyperInkling: Inkling 2 Mini on one RTX 3090 / 3090 Ti (sm86), single entry point.
 #
-#   ./start.sh                      # foreground; run it inside tmux
+#   ./start.sh                      # runs in the foreground
 #   PORT=18020 KV_OFFLOAD_GB=0 ./start.sh
 #
-# Every knob below is an env var with the measured default. The weights are
+# Every knob below is an env var with the measured default; ./.env (scripts/wizard.py)
+# sets the ones the command line does not. The weights are
 # models/Inkling-2-Mini-W4A16-g128-gptq (experts INT4 g128 GPTQ, see prepare/);
 # attention, LM head and token embeddings become INT8 at load time.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO"
 
+# The wizard's .env, for the variables not already set (the command line wins). UID/GID
+# are only for Docker's prepare service (UID is read-only in bash).
+if [ -f .env ]; then
+	while IFS='=' read -r key value; do
+		case "$key" in ''|'#'*|UID|GID) continue ;; esac
+		if [ -z "${!key+set}" ]; then export "$key=$value"; fi
+	done < .env
+fi
+
 MODEL=${MODEL:-$REPO/models/Inkling-2-Mini-W4A16-g128-gptq}
 SERVED_NAME=${SERVED_NAME:-inkling-2-mini}
+# Extra names the same model answers to: "local" is the backend-neutral id Hermes uses.
+SERVED_ALIASES=${SERVED_ALIASES:-local}
 # Local only by default. HOST=0.0.0.0 serves the network: set VLLM_API_KEY too, or put
 # the server behind something that authenticates (a VPN, a reverse proxy).
 HOST=${HOST:-127.0.0.1}
@@ -179,7 +191,7 @@ echo "=================================================="
 # The native install's venv; the container has vllm on PATH.
 [ -f "$REPO/venv/bin/activate" ] && source "$REPO/venv/bin/activate"
 exec taskset -c "$CPUS" "${wrap[@]}" vllm serve "$MODEL" \
-	--served-model-name "$SERVED_NAME" --host "$HOST" --port "$PORT" \
+	--served-model-name "$SERVED_NAME" $SERVED_ALIASES --host "$HOST" --port "$PORT" \
 	--max-model-len "$MAX_LEN" --max-num-seqs "$MAX_SEQS" \
 	--max-num-batched-tokens "$NBT" --gpu-memory-utilization "$GPU_UTIL" \
 	--kv-cache-dtype "$KV_DTYPE" --enable-prefix-caching \
