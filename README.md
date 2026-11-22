@@ -74,15 +74,17 @@ structured output and 0.5 for the rest, reasoning on):
 | questions over a document, quoting it | 133 | ~275 |
 | copying a 120-line table from a 50k-token document (greedy) | not measured | **~490** |
 
-Long prompts of varied length (AA-LCR documents, 256 to 64k tokens, mean 13k; 512 tokens out;
-`bench/evalscope_perf.sh`, 10 minutes each):
+Long prompts (AA-LCR documents, 256 to 64k tokens, mean 12k; 512 tokens out;
+`bench/evalscope_perf.sh`, 10 minutes each). Mostly prefill: with 6 at once, each request's
+decode steps share the GPU with the others' prefill chunks, so per-request decode drops and
+the output rate counts the prefill time too.
 
-| | without DSpark | with DSpark |
-|---|---|---|
-| 1 request: decode | 128 tok/s | **217 tok/s** (1.70x) |
-| 1 request: time to first token | 2.66 s | 2.64 s |
-| 6 requests: time per output token | 38.9 ms | 32.1 ms |
-| 6 requests: output throughput, aggregate | 125 tok/s | 141 tok/s |
+| | 1 request, no DSpark | 1 request, DSpark | 6 requests, no DSpark | 6 requests, DSpark |
+|---|---|---|---|---|
+| prompt processing, per request | 4,510 tok/s | 4,570 tok/s | 4,320 tok/s | 4,200 tok/s |
+| decode, per request | 128 tok/s | **217 tok/s** | 26 tok/s | 31 tok/s |
+| output, aggregate (prefill time included) | 77 tok/s | 102 tok/s | 125 tok/s | 141 tok/s |
+| time to first token (6: queueing included) | 2.66 s | 2.64 s | 4.64 s | 5.29 s |
 
 Document extraction, 6 requests at once (`bench/extract_bench.py`, 10 minutes: a shared ~3.5k
 token Italian system prompt, 1-3 DocVQA pages, half strict JSON at temperature 0.2, half

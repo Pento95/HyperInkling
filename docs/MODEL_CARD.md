@@ -82,6 +82,16 @@ KV cache FP8 E4M3.
 | decode, one request, copying a table from a 50k-token document | not measured | ~490 tok/s |
 | decode, 6 requests, prose, aggregate | 428 tok/s | ~435 tok/s |
 
+Long prompts (AA-LCR documents, mean 12k tokens, 512 out). Mostly prefill: with 6 at once,
+decode steps share the GPU with the others' prefill chunks.
+
+| | 1 request, no DSpark | 1 request, DSpark | 6 requests, no DSpark | 6 requests, DSpark |
+|---|---|---|---|---|
+| prompt processing, per request | 4,510 tok/s | 4,570 tok/s | 4,320 tok/s | 4,200 tok/s |
+| decode, per request | 128 tok/s | 217 tok/s | 26 tok/s | 31 tok/s |
+| output, aggregate (prefill time included) | 77 tok/s | 102 tok/s | 125 tok/s | 141 tok/s |
+| time to first token (6: queueing included) | 2.66 s | 2.64 s | 4.64 s | 5.29 s |
+
 Prefill chunk (`NBT`, a wizard option): 2048 instead of the default 1024 gives 6,050 instead of
 5,610 tok/s prefill (one prompt and 6 at once, aggregate), the same decode, and ~68k tokens
 less context (200k instead of 268k with DSpark).
