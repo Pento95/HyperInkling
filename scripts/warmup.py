@@ -1,6 +1,6 @@
 """Warm-up requests at the shapes vLLM's boot warmup leaves out, so their Triton kernels
 compile (or load from the JIT cache) before the first real request: prefills of 65-256
-tokens and over 256 not a multiple of 16, a full prefill chunk, decode batches of 2-6
+tokens and over 256 not a multiple of 16, a full prefill chunk, decode batches of 2-8
 requests (the LM head runs outside the CUDA graphs at every verify row count), and a
 prefill next to running decodes. start.sh runs it in the background once /health answers
 (WARMUP=1).
@@ -70,8 +70,8 @@ def main():
     # not a multiple of 16, one full 2048-token chunk and its remainder.
     for words in (60, 115, 170, 530, 1150, 2300):
         _chat(words, 2)
-    # Decode batches of 2..6 requests (verify lengths vary with the adaptive k).
-    for n in range(2, 7):
+    # Decode batches of 2..8 requests (verify lengths vary with the adaptive k).
+    for n in range(2, 9):
         _at_once(*[(20, 48)] * n)
     # A prefill while three requests decode (a mixed step).
     threads = [threading.Thread(target=_chat, args=(20, 160)) for _ in range(3)]

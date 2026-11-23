@@ -125,3 +125,62 @@ def test_cublas_linear_repeat(tokens):
     w = (torch.randn(8608, HIDDEN, device="cuda") * 0.02).to(torch.bfloat16)
     x = torch.randn(tokens, HIDDEN, device="cuda").to(torch.bfloat16)
     _repeat(lambda: torch.nn.functional.linear(x, w))
+
+
+@pytest.mark.parametrize("q_lens,past", [([1, 1, 1], 500), ([7, 5, 3], 500), ([512], 0), ([300], 700)])
+@pytest.mark.parametrize("window", [0, 256])
+def test_rel_attention_repeat(q_lens, past, window):
+    """The prefill attention with FP8 keys and values; positions past each request's end
+    and the rel-logits outside the extent hold garbage."""
+    from vllm.models.inkling2.nvidia.ops.attention_sm90 import MODE_OUT_LSE, rel_attention
+
+    torch.manual_seed(0)
+    heads, kv_heads, dim, page, extent = 16, 8, 64, 64, 128
+    reqs, tokens, ctx = len(q_lens), sum(q_lens), past + max(q_lens)
+    blocks = -(-ctx // page)
+    # Codes without NaN (0x7f, 0xff); `_poison` covers the memory around them.
+    cache = torch.randint(0, 0x60, (2, 1 + reqs * blocks, page, kv_heads, dim),
+                          dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    q = torch.randn(tokens, heads, dim, device="cuda").to(torch.bfloat16)
+    rel = torch.randn(tokens + 128, heads, extent + 256, device="cuda").to(torch.bfloat16)
+    table = 1 + torch.arange(reqs * blocks, dtype=torch.int32, device="cuda").view(reqs, blocks)
+    lens = torch.tensor([past + n for n in q_lens], dtype=torch.int32, device="cuda")
+    cu = torch.tensor([0, *q_lens], device="cuda").cumsum(0).to(torch.int32)
+
+    def run(want):
+        out = torch.empty(tokens, heads, dim, device="cuda")
+        lse = torch.empty(heads, tokens, device="cuda")
+        rel_attention(q, cache[0], cache[1], out, lse, rel, block_table=table,
+                      cache_seqlens=lens, cu_seqlens_q=cu, max_query_len=max(q_lens),
+                      softmax_scale=dim**-0.5, window=window, num_splits=1, mode=MODE_OUT_LSE)
+        return out if want == "out" else lse
+
+    for want in ("out", "lse"):
+        assert torch.isfinite(run(want)).all()
+        _repeat(lambda want=want: run(want))
+
+
+@pytest.mark.parametrize("tokens,block_m", [(48, 8), (375, 32), (2048, 64)])
+def test_moe_rows_ordered(tokens, block_m):
+    """`order_rows` on a skewed routing (some experts take many blocks, some none): the same
+    table every time, each expert's rows ascending, every row once, invalid rows skipped."""
+    from vllm.models.inkling2.nvidia.ops.moe_marlin import moe_align_block_size, order_rows
+
+    torch.manual_seed(0)
+    weights = 1 / torch.arange(1, EXPERTS + 1, device="cuda") ** 1.5
+    ids = torch.stack([torch.multinomial(weights, TOPK) for _ in range(tokens)]).to(torch.int32)
+    ids[-1] = -1  # a padding token
+    rows = tokens * TOPK
+    tables = []
+    for _ in range(REPEAT):
+        table = moe_align_block_size(ids, block_m, EXPERTS, ignore_invalid_experts=True)[:3]
+        order_rows(ids, *table, block_m, EXPERTS)
+        padded = int(table[2][0])
+        tables.append(table[0][:padded].clone())
+        assert torch.equal(tables[-1], tables[0])
+    blocks = tables[0].view(-1, block_m)
+    experts = table[1][: blocks.shape[0]]
+    for e in range(EXPERTS):
+        mine = blocks[experts == e].flatten()
+        mine = mine[mine < rows]
+        assert torch.equal(mine.long(), (ids.flatten() == e).nonzero().flatten())

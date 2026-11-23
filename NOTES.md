@@ -115,8 +115,8 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   FlashAttention impl that only writes KV (FlashAttention refuses fp8 on SM8x; the draft
   attention runs in `block_decode_attention`, which reads the emulated E4M3 cache). Its
   pages then pack with the target's instead of being padded to them.
-- **Longest request** (DSpark, vision tower on the GPU, 6 requests, FP8 KV): 274k,
-  291k with async off (`docs/memory_matrix.tsv`). The global layers hold almost all of it; async scheduling costs
+- **Longest request** (DSpark, vision tower on the GPU, 8 requests, FP8 KV): 268k,
+  285k with async off (`docs/memory_matrix.tsv`). The global layers hold almost all of it; async scheduling costs
   ~17k tokens (two in-flight tails) for +3-4% decode.
 - **Measure the context limit with `MAX_LEN=auto`.** vLLM checks a fixed limit before the
   warmup (without the transient activations and CUDA graphs, ~1.5 GiB here, so its estimate
@@ -157,12 +157,15 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
 - **Greedy output depends on the verify length.** Each `SPEC_K` runs different kernel
   shapes, so near-ties resolve differently: compare a speculative change against `SPEC=off`
   (or the same `SPEC_K`), never across k. Within one configuration it is repeatable.
-- **KL: compare medians.** One request at a time the same transcript scored twice on one
-  server still differs from the first positions (~0.003 in logprob; Marlin MoE is bitwise
-  repeatable, `tests/test_determinism.py`); where that flips an expert the difference
-  carries down the sequence. The original against itself: median 0.0003, mean 0.060 (0.069
-  6-way batched). Image-pad positions must be excluded (token id 200054; prompt_logprobs
-  are keyed by token id).
+- **Run-to-run repeatability**: `moe_align_block_size` puts an expert's rows in atomic order;
+  past `block_m` rows a row lands in another Marlin block and its result moves by 1 bf16 ulp,
+  which flips experts down the sequence. `order_rows` (`ops/moe_marlin.py`,
+  `HYPERINKLING_MOE_ORDER`, 0.44% of a step at 6 requests, nothing at 1) sorts them: the
+  original against itself is KL 0 at every position, one request at a time. Batch composition
+  is not covered. `bench/diverge.py` finds the first differing layer visit.
+- **KL: compare medians.** A small numeric difference flips an expert and the rest of the
+  sequence follows, so a few positions dominate the mean. Image-pad positions must be excluded
+  (token id 200054; prompt_logprobs are keyed by token id).
 - **Doubling calibration (332k tokens) changed nothing** measurable vs 166k.
 - **`--uvicorn-log-level warning` hides "Application startup complete"**: wait on
   `GET /health` instead. Every wait gets a deadline.

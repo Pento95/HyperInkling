@@ -149,7 +149,7 @@ def main():
     print("      the attention output projections edited), quantized the same way")
     checkpoint = "uncensored" if ask("   choice", "ab", "a") == "b" else "original"
 
-    seqs = ask("\n1) How many requests should run at the same time? (1-64)", default=6,
+    seqs = ask("\n1) How many requests should run at the same time? (1-64)", default=8,
                cast=int, check=lambda v: 1 <= v <= 64 or print("  1 to 64"))
 
     print("\n2) Where should the vision tower (images) run?")

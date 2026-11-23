@@ -46,16 +46,14 @@ second round of 166k tokens changed nothing measurable. The pipeline is in Hyper
 
 Teacher-forced KL against the original checkpoint on 22 held-out transcripts (images, tool
 calls, code, Italian, chat), one request at a time. Compare medians: a few positions where
-run-to-run noise flips an expert dominate the mean.
+a small difference flips an expert dominate the mean.
 
 | | KL median | KL mean | top-1 agreement |
 |---|---|---|---|
-| the original against itself (run-to-run noise) | 0.0003 | 0.060 | 95.8% |
-| INT4 round-to-nearest experts | 0.0039 | 0.133 | 91.2% |
-| **INT4 GPTQ experts (this checkpoint)** | **0.0028** | **0.112** | **92.7%** |
-| + INT8 attention, head, embeddings, FP8 KV (HyperInkling's defaults) | 0.0032 | 0.123 | 92.0% |
-
-Document pages are close to the noise floor (mean 0.009).
+| the original against itself | 0 | 0 | 100% |
+| INT4 round-to-nearest experts (older build) | 0.0039 | 0.133 | 91.2% |
+| **INT4 GPTQ experts (this checkpoint)** | **0.0030** | **0.117** | **92.5%** |
+| + INT8 attention, head, embeddings, FP8 KV (HyperInkling's defaults) | 0.0031 | 0.123 | 92.1% |
 
 Task accuracy, the same server settings for both (`bench/quality_battery.py`, greedy, 200
 items each; about +-1 to +-3 points of noise):
@@ -87,16 +85,16 @@ it. "Aggregate" is the sum over the requests running at once.
 
 ## Maximum context with HyperInkling (RTX 3090 Ti)
 
-Longest single request, 6 requests served at once, KV cache FP8 E4M3 (8 bits), fitted by the
+Longest single request, 8 requests served at once, KV cache FP8 E4M3 (8 bits), fitted by the
 server at boot.
 
 | vision tower | DSpark (default) | no DSpark |
 |---|---|---|
-| on the GPU (default) | **274k** | 357k |
-| in host RAM | 310k | 397k |
-| none (text only) | 311k | 390k |
+| on the GPU (default) | **268k** | 345k |
+| in host RAM | 303k | 385k |
+| none (text only) | 305k | 394k |
 
-Async scheduling off gives ~17k more, a 1024-token prefill chunk ~25k more. Without DSpark and
+Async scheduling off gives ~17k more, a 1024-token prefill chunk ~24k more. Without DSpark and
 the vision tower, async off, chunk 1024: 432k.
 
 ## Use

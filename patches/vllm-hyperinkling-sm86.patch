@@ -1,4 +1,4 @@
-From 4ce0b51e881760d16af903c4b74619ab96c420d7 Mon Sep 17 00:00:00 2001
+From 7640aa31e7156d9fdfe3f6fd5cc508a08c0be409 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -21,6 +21,9 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   one hit alignment; the rest of a prefill chunk is null and the conv skips
   stores into the null block; the window below the request's
   shared-prefix junction is backed too (note_shared_prefix).
+- Marlin MoE rows in ascending order per expert (order_rows,
+  HYPERINKLING_MOE_ORDER, default on): moe_align_block_size leaves them in
+  atomic order, and a row's result depends on its Marlin block.
 - Decode attention of the full layers: at least two CTAs per SM (21 splits
   at one request instead of 10), +3% decode at 32k, +10% at 128k.
 - Loop controllers and sconv dynamic taps on Triton GEMVs (ops/bgemv.py,
@@ -72,24 +75,24 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../serve/middleware/authenticate.py          |  34 ++-
  vllm/envs.py                                  |   6 +
  vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
- vllm/models/inkling/nvidia/sconv_swa_attn.py  | 141 +++++++++-
+ vllm/models/inkling/nvidia/sconv_swa_attn.py  | 141 ++++++++-
  vllm/models/inkling2/nvidia/attention.py      |  43 ++-
- vllm/models/inkling2/nvidia/dspark.py         | 164 +++++++++---
+ vllm/models/inkling2/nvidia/dspark.py         | 164 ++++++++---
  vllm/models/inkling2/nvidia/loop.py           |  12 +
  vllm/models/inkling2/nvidia/model.py          |  86 +++++-
- vllm/models/inkling2/nvidia/moe.py            | 107 +++++++-
+ vllm/models/inkling2/nvidia/moe.py            | 107 ++++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  18 ++
  vllm/models/inkling2/nvidia/ops/attention.py  |   8 +-
  .../inkling2/nvidia/ops/attention_sm90.py     |  21 +-
- vllm/models/inkling2/nvidia/ops/bgemv.py      | 180 +++++++++++++
+ vllm/models/inkling2/nvidia/ops/bgemv.py      | 180 ++++++++++++
  vllm/models/inkling2/nvidia/ops/dspark.py     |  22 +-
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |   2 +-
- vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 +++++++++++++++
- vllm/models/inkling2/nvidia/ops/linear_w8.py  | 139 ++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 ++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w8.py  | 139 +++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
- vllm/models/inkling2/nvidia/ops/lookup.py     | 245 ++++++++++++++++++
- vllm/models/inkling2/nvidia/ops/moe_marlin.py | 210 +++++++++++++++
+ vllm/models/inkling2/nvidia/ops/lookup.py     | 245 ++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/moe_marlin.py | 272 ++++++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_sm120.py  |   6 +-
  vllm/models/inkling2/nvidia/ops/sconv.py      |   3 +-
  vllm/models/inkling2/processing.py            |  50 +++-
@@ -100,8 +103,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/core/sched/scheduler.py               |  38 ++-
  vllm/v1/core/single_type_kv_cache_manager.py  |   4 +
  vllm/v1/engine/core.py                        |  84 ++++++
- vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++++
- 35 files changed, 1956 insertions(+), 118 deletions(-)
+ vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
+ 35 files changed, 2018 insertions(+), 118 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -2380,10 +2383,10 @@ index 0000000000..ed02984e29
 +            )
 diff --git a/vllm/models/inkling2/nvidia/ops/moe_marlin.py b/vllm/models/inkling2/nvidia/ops/moe_marlin.py
 new file mode 100644
-index 0000000000..efd319a912
+index 0000000000..216edd678b
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/moe_marlin.py
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,272 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 routed experts on Ampere (SM8x): Marlin MoE GEMMs (bf16
@@ -2401,6 +2404,7 @@ index 0000000000..efd319a912
 +"""
 +
 +import math
++import os
 +from types import SimpleNamespace
 +from typing import Literal
 +
@@ -2423,11 +2427,69 @@ index 0000000000..efd319a912
 +    prepare_mxfp8_moe_layer_for_marlin,
 +)
 +from vllm.scalar_type import scalar_types
++from vllm.triton_utils import tl, triton
 +
 +from .moe_sm90 import swiglu
 +
 +ExpertFormat = Literal["nvfp4", "mxfp8", "int4"]
 +INT4_GROUP = 128
++# `moe_align_block_size` places an expert's rows in atomic order, different at every call.
++# A row's result depends on its Marlin block, so the rows are put in ascending order.
++_MOE_ORDER = os.environ.get("HYPERINKLING_MOE_ORDER", "1") == "1"
++
++
++@triton.jit
++def _order_rows_kernel(
++    Ids,
++    SortedIds,
++    ExpertIds,
++    NumPadded,
++    n,
++    block_m,
++    max_blocks,
++    BLOCK: tl.constexpr,
++):
++    """One program per expert: its rows of `SortedIds`, rewritten in ascending order
++    (their places are known from the expert's first block)."""
++    expert = tl.program_id(0)
++    num_blocks = tl.load(NumPadded) // block_m
++    none = 0x7FFFFFFF
++    first = none
++    for b0 in range(0, max_blocks, BLOCK):
++        b = b0 + tl.arange(0, BLOCK)
++        e = tl.load(ExpertIds + b, b < num_blocks, other=-1)
++        first = tl.minimum(first, tl.min(tl.where(e == expert, b, none)))
++    if first == none:
++        return
++    place = first * block_m
++    for i0 in range(0, n, BLOCK):
++        i = i0 + tl.arange(0, BLOCK)
++        mine = (tl.load(Ids + i, i < n, other=-1) == expert).to(tl.int32)
++        rank = tl.cumsum(mine, 0) - 1
++        tl.store(SortedIds + place + rank, i, mine != 0)
++        place += tl.sum(mine)
++
++
++def order_rows(
++    ids: torch.Tensor,
++    sorted_ids: torch.Tensor,
++    expert_ids: torch.Tensor,
++    num_tokens_padded: torch.Tensor,
++    block_m: int,
++    num_experts: int,
++) -> None:
++    """Rewrite `moe_align_block_size`'s `sorted_ids` with each expert's rows ascending."""
++    _order_rows_kernel[(num_experts,)](
++        ids,
++        sorted_ids,
++        expert_ids,
++        num_tokens_padded,
++        ids.numel(),
++        block_m,
++        expert_ids.numel(),
++        BLOCK=256,
++        num_warps=4,
++    )
 +
 +
 +def _repack_int4(
@@ -2577,6 +2639,9 @@ index 0000000000..efd319a912
 +        alignment = moe_align_block_size(
 +            ids, block_m, self.num_experts, ignore_invalid_experts=True
 +        )[:3]
++        # An expert gets at most one row per token: below a block nothing can move.
++        if _MOE_ORDER and tokens > block_m:
++            order_rows(ids.contiguous(), *alignment, block_m, self.num_experts)
 +        # The routing weights are applied by `swiglu`, not by the GEMMs.
 +        topk_weights = weights.view(tokens, topk)
 +        n13 = 2 * self.intermediate_size

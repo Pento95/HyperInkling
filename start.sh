@@ -31,14 +31,14 @@ SERVED_ALIASES=${SERVED_ALIASES:-local}
 # the server behind something that authenticates (a VPN, a reverse proxy).
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8080}
-MAX_SEQS=${MAX_SEQS:-6}
+MAX_SEQS=${MAX_SEQS:-8}
 # Speculative decoding with the bundled DSpark drafter (on unless SPEC=off). The
 # block drafter always drafts 7 tokens; SPEC_K says how many of them the target
 # verifies, by batch size: [first, last, k] ranges. k=4 for
-# 1-2 requests, k=3 for 3-6 (bench/dspark_k_sweep.sh; a verify step touches ~6x the
+# 1-2 requests, k=3 from 3 (bench/dspark_k_sweep.sh; a verify step touches ~6x the
 # experts of a plain step, so long windows only pay on predictable text).
 SPEC=${SPEC:-dspark}
-SPEC_K=${SPEC_K:-[[1,2,4],[3,6,3]]}
+SPEC_K=${SPEC_K:-[[1,2,4],[3,8,3]]}
 # Drafts sampled from the draft distribution (as the reference) rather than
 # greedy: at temperature 0.2-0.5 +15-20% on structured output.
 SPEC_DRAFT=${SPEC_DRAFT:-probabilistic}

@@ -48,12 +48,11 @@ inputs and routing captured from it, then GPTQ per expert (HyperInkling's `prepa
 ## Quality
 
 Teacher-forced KL against the source on 22 held-out transcripts (images, tool calls, code,
-Italian, chat), one request at a time. Compare medians: a few positions where run-to-run noise
-flips an expert dominate the mean.
+Italian, chat), one request at a time. Compare medians: a few positions where a small difference
+flips an expert dominate the mean. Measured before the server was repeatable (0.0003 / 0.060 of noise).
 
 | | KL median | KL mean | top-1 agreement |
 |---|---|---|---|
-| run-to-run noise (the original against itself) | 0.0003 | 0.060 | 95.8% |
 | **INT4 GPTQ experts (this checkpoint)** | **0.0025** | **0.111** | **92.8%** |
 | + INT8 attention, head, embeddings, FP8 KV (HyperInkling's defaults) | 0.0027 | 0.115 | 92.6% |
 
@@ -63,7 +62,7 @@ One calibration round (166k tokens) gave 0.0026: doubling it changed nothing mea
 
 The same as the original checkpoint served by HyperInkling (same architecture, sizes and
 kernels): see [its card](https://huggingface.co/Pentium95/Inkling-2-Mini-W4A16-g128-gptq) and
-HyperInkling's README. ~274k tokens of context with DSpark, 6 requests and the vision tower on
+HyperInkling's README. ~268k tokens of context with DSpark, 8 requests and the vision tower on
 the GPU.
 
 ## Use

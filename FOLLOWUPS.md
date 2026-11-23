@@ -6,7 +6,7 @@ fetched with `hf download --include` only when chosen.
 
 | phase | items |
 |---|---|
-| 2, the checkpoint (new files on HF) | 14 first, then 8, 11, 12, 33 |
+| 2, the checkpoint (new files on HF) | 56, 8, 11, 12, 33 |
 | 3, context (best effort) | 18, 19, 13, 38, 39, 55 |
 | 4, speed and upstream | 10, 7, 21, 22, 32, 51 |
 
@@ -32,11 +32,16 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     GB/s on 201k x 2304, INT8 ~900).
 12. **Attention 4-bit** [NS] (GPTQ + int4 GEMV): halves the bytes, but the small attention
     matrices are latency-bound (35): measure the step, not GB/s.
-14. **Run-to-run nondeterminism** [NS]: the same request scored twice differs from position 1
-    (~0.003 in logprob); an expert flip carries it down the sequence (KL mean floor 0.060,
-    median 0.0003). Bitwise repeatable (`tests/test_determinism.py`): Marlin MoE, the W8
-    linear, `bgemv`, `short_conv`. Not yet tested: `_rel_attention_kernel` (prefill),
-    the router (`_k_group_kernel`, `select_experts`), `attn_res`, cuBLAS.
+    Also only layers 0-5 and 18-23, the loop core staying INT8 (56): half the bytes saved but
+    12 of the 48 visits. Keep it if the KL median does not get worse and the context or the step
+    gains. Does not apply to 11: the head runs once per token.
+56. **Loop-core attention in bf16** ([hxyulin](https://huggingface.co/hxyulin/Inkling-2-Mini-Outer-Attention-FP8),
+    an FP8 recipe for the Ingine engine on a 5090, which keeps layers 6-17 in bf16): their
+    weights run three times per token, so an INT8 error may repeat at each pass. Let
+    `HYPERINKLING_ATTN_W8` take a layer list; compare KL median, step time and context with
+    all-INT8 (est. ~300 MiB, ~17k tokens, and slower steps). The expected KL gain is
+    small (all load-time conversions together: 0.0028 -> 0.0032). A wizard knob only if the KL
+    improves.
 33. **llm-compressor / compressed-tensors** [LC, AR #69141]: llm-compressor calibrates GPTQ,
     AWQ and SmoothQuant schemes on the HF model and writes compressed-tensors checkpoints;
     #69141 runs such experts (W4A16, W4A8, W8A8, FP8) on Humming. Three uses here:

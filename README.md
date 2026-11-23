@@ -2,7 +2,7 @@
 
 **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Thinking Machines
 Lab, Apache-2.0) on one RTX 3090 / 3090 Ti, with vLLM.** Text and images (document pages),
-tool calls, strict JSON output, ~274k tokens of context per request, several requests at
+tool calls, strict JSON output, ~268k tokens of context per request, several requests at
 once, and the model's own DSpark drafter for speculative decoding.
 
 Upstream vLLM runs Inkling 2 Mini on Hopper and Blackwell. This repository is the port to
@@ -96,36 +96,37 @@ output and answers that quote the prompt, least on free prose like these summari
 
 ## Context and the knobs that trade it
 
-Longest single request, 6 requests at once, KV at 8 bits, the defaults otherwise
+Longest single request, 8 requests at once, KV at 8 bits, the defaults otherwise
 (`docs/memory_matrix.tsv`, `bench/memory_matrix.sh`). The server fits it at boot
 (`MAX_LEN=auto`); the wizard shows it for every choice.
 
 | vision tower | DSpark (default) | no DSpark |
 |---|---|---|
-| on the GPU (default) | **274k** | 357k |
-| in host RAM | 310k | 397k |
-| none (text only) | 311k | 390k |
+| on the GPU (default) | **268k** | 345k |
+| in host RAM | 303k | 385k |
+| none (text only) | 305k | 394k |
 
-With DSpark and the vision tower on the GPU: 289k at 1 request, 256k at 16, 235k at 32,
-197k at 64. Async scheduling off gives ~17k more; a prefill chunk of 1024 ~25k more. Without
+With DSpark and the vision tower on the GPU: 289k at 1 request, 274k at 6, 256k at 16, 235k at 32,
+197k at 64. Async scheduling off gives ~17k more; a prefill chunk of 1024 ~24k more. Without
 DSpark, without the vision tower, with async scheduling off and a 1024 prefill chunk: **432k**
 at 1 request (427k at 6), as far as the 24 GiB allow, not to the model's 1M.
 
 | knob | default | what it does | context / VRAM | speed |
 |---|---|---|---|---|
-| `SPEC` | `dspark` | speculative decoding with the bundled drafter | ~83k tokens less (274k vs 357k) | 1.5-2x decode at one request, 1.7-1.8x aggregate at 6 |
+| `SPEC` | `dspark` | speculative decoding with the bundled drafter | ~78k tokens less (268k vs 345k) | 1.5-2x decode at one request, 1.7-1.8x aggregate at 6 |
 | `MAX_LEN` | `auto` | longest request: `auto` is what the KV cache holds after warmup; a number caps it (and the boot fails if it does not fit) | none | none |
 | `ASYNC` | 1 | async scheduling (two steps in flight) | off: ~17k tokens more | off: -3 to -4% decode |
-| `NBT` | 2048 | prefill chunk (and image encodings per step) | 1024: ~25k tokens more | 1024: -8% prefill, same decode |
+| `NBT` | 2048 | prefill chunk (and image encodings per step) | 1024: ~24k tokens more | 1024: -8% prefill, same decode |
 | `IMAGES` | 50 | images per request; 0 = no vision tower | 0: ~37k tokens more | no images |
 | `HYPERINKLING_VISION_HOST` | 0 | vision tower weights in host RAM, copied to the GPU layer by layer per image | 1: ~36k tokens more | +27 ms per A4 page |
 | `IMAGE_MAX_W` / `_H` | 1040 x 1560 | largest image: 1,014 tokens, an A4 page at ~126 ppi (two per 2048 chunk); larger ones are scaled down to it | A4 at 300 ppi (2480 x 3508, with `ENCODER_CACHE=16384`): ~5.5x the tokens per page | 300 ppi: ~5.5x the prefill per page |
-| `MAX_SEQS` | 6 | requests at once | 289k at 1, 274k at 6, 256k at 16, 197k at 64 | more aggregate decode |
+| `MAX_SEQS` | 8 | requests at once | 289k at 1, 274k at 6, 268k at 8, 256k at 16, 197k at 64 | more aggregate decode |
 | `KV_OFFLOAD_GB` | `auto` (60% of RAM - 8 GiB, at most 36) | prefix-cache tier in host RAM (`/dev/shm`) | host RAM only | evicted prefixes come back in 0.1 s instead of seconds |
 | `HYPERINKLING_SPEC_ADAPTIVE` | `2,4,7` | verify length chosen per step from these; empty = the fixed `SPEC_K` schedule | ~5k tokens | with the lookup: +41-43% copying, +20% at 6 requests |
 | `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context, fused with DSpark's (lossless) | 6 MB | +7-13% while copying |
 | `SPEC_K` | `[[1,2,4],[3,6,3]]` | drafts verified per step, by batch size, when the adaptive length is off | none | |
 | `SPEC_DRAFT` | `probabilistic` | drafts sampled from the draft distribution | none | +15-20% on structured output at temperature > 0 |
+| `HYPERINKLING_MOE_ORDER` | 1 | each expert's rows in a fixed order: the same request alone gives the same output bit for bit | none | 0: +0.4% decode at 6 requests |
 | `WARMUP` | 1 | requests at the shapes vLLM's warmup leaves out, right after `/health` | none | no compile stalls on the first requests (4 s at boot, 14 s after an update) |
 | `HOST` / `VLLM_API_KEY` | 127.0.0.1 / none | who can connect | none | none |
 
@@ -150,18 +151,19 @@ NOTES.md has the reasons, the measurements and the gotchas; FOLLOWUPS.md what co
 ## Quality
 
 Teacher-forced KL against the original NVFP4/MXFP8 checkpoint on 22 held-out transcripts
-(images, tool calls, code, Italian, chat; `bench/kl_eval.py`, one request at a time). The
-median is the number to compare: a few positions where the run-to-run noise flips an expert
-dominate the mean.
+(images, tool calls, code, Italian, chat; `bench/kl_eval.py`, one request at a time). One
+request at a time the server is repeatable bit for bit (`HYPERINKLING_MOE_ORDER`); the mean
+stays dominated by the few positions where a small difference flips an expert, so compare
+medians.
 
 | | KL median | KL mean | top-1 agreement |
 |---|---|---|---|
-| the original against itself (noise) | 0.0003 | 0.060 | 95.8% |
-| experts INT4, round to nearest | 0.0039 | 0.133 | 91.2% |
-| experts INT4 GPTQ | 0.0028 | 0.112 | 92.7% |
-| **as served**: + INT8 attention, head, embeddings, FP8 KV | **0.0032** | 0.123 | 92.0% |
+| the original against itself | 0 | 0 | 100% |
+| experts INT4, round to nearest (older build) | 0.0039 | 0.133 | 91.2% |
+| experts INT4 GPTQ | 0.0030 | 0.117 | 92.5% |
+| **as served**: + INT8 attention, head, embeddings, FP8 KV | **0.0031** | 0.123 | 92.1% |
 
-Document pages are close to the noise floor (mean 0.009). Speculative decoding does not
+Speculative decoding does not
 change the output distribution.
 
 Task accuracy, the same server settings for both (`bench/quality_battery.py`, greedy, 200
@@ -219,7 +221,7 @@ $V bench/kl_eval.py compare bench/kl/mine/ref.json bench/kl/mine/int4.json data/
 ```
 
 Serve the result with `MODEL=$OUT ./start.sh`. For reference, the published checkpoint scores
-a KL median of 0.0028 against the release (0.0003 is the run-to-run noise; round to nearest,
+a KL median of 0.0030 against the release (round to nearest,
 `prepare/quantize_experts.py`, 0.0039). `prepare/calib_round.sh` runs steps 1-4 for a further
 round with a new seed; a second round of 166k tokens changed nothing measurable here.
 
