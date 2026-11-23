@@ -158,13 +158,15 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   hybrid groups.
 - **Greedy output depends on the verify length.** Each `SPEC_K` runs different kernel
   shapes, so near-ties resolve differently: compare a speculative change against `SPEC=off`
-  (or the same `SPEC_K`), never across k. Within one configuration it is repeatable.
+  (or the same `SPEC_K`), never across k.
 - **Run-to-run repeatability**: `moe_align_block_size` puts an expert's rows in atomic order;
   past `block_m` rows a row lands in another Marlin block and its result moves by 1 bf16 ulp,
   which flips experts down the sequence. `order_rows` (`ops/moe_marlin.py`,
   `HYPERINKLING_MOE_ORDER`, 0.44% of a step at 6 requests, nothing at 1) sorts them: the
-  original against itself is KL 0 at every position, one request at a time. Batch composition
-  is not covered. `bench/diverge.py` finds the first differing layer visit.
+  original against itself is KL 0 at every position (prefill, one request at a time, no
+  speculation, no prefix cache). Generation with the served defaults is not repeatable, even
+  one request at a time (8 greedy prompts twice: 2 with the same tokens): the adaptive verify
+  length follows wall time and the drafts are sampled, so kernel shapes change. Not isolated. `bench/diverge.py` finds the first differing layer visit.
 - **KL: compare medians.** A small numeric difference flips an expert and the rest of the
   sequence follows, so a few positions dominate the mean. Image-pad positions must be excluded
   (token id 200054; prompt_logprobs are keyed by token id).

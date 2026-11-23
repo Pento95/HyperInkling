@@ -13,7 +13,7 @@ KL over the reference's top-k only: the mass outside it is lumped into one
 bucket on both sides, so the number is a slight underestimate of the full KL.
 
 One request at a time (KL_JOBS=1, with a MAX_SEQS=1 server as bench/kl_sweep.sh boots it).
-The server is then repeatable bit for bit (HYPERINKLING_MOE_ORDER). Decide on the median: a
+Scoring then repeats bit for bit (HYPERINKLING_MOE_ORDER). Decide on the median: a
 small difference flips an expert and carries down the sequence, so a few positions dominate
 the mean.
 """

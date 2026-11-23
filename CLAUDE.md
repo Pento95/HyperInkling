@@ -45,7 +45,7 @@ Key mechanisms of the port (spread across several files):
   `inkling/nvidia/sconv_swa_attn.py`); the conv skips stores into the null block.
 - Loop controllers and sconv taps on Triton batched GEMVs (`ops/bgemv.py`).
 - Marlin rows in a fixed order per expert (`order_rows`, `HYPERINKLING_MOE_ORDER`): the same
-  request alone gives the same output bit for bit.
+  prefill alone gives the same numbers bit for bit (generation with DSpark does not repeat).
 - `HYPERINKLING_CAPTURE_DIR` enables the MoE input/routing capture hook used by GPTQ.
 - DSpark speculative decoding (on by default, `SPEC`): the block drafter always drafts 7;
   `SPEC_K` sets how many the target verifies per batch size (vLLM dynamic speculative

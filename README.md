@@ -139,7 +139,7 @@ at 1 request (427k at 6), as far as the 24 GiB allow, not to the model's 1M.
 | `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context, fused with DSpark's (lossless) | 6 MB | +7-13% while copying |
 | `SPEC_K` | `[[1,2,4],[3,6,3]]` | drafts verified per step, by batch size, when the adaptive length is off | none | |
 | `SPEC_DRAFT` | `probabilistic` | drafts sampled from the draft distribution | none | +15-20% on structured output at temperature > 0 |
-| `HYPERINKLING_MOE_ORDER` | 1 | each expert's rows in a fixed order: the same request alone gives the same output bit for bit | none | 0: +0.4% decode at 6 requests |
+| `HYPERINKLING_MOE_ORDER` | 1 | each expert's rows in a fixed order: the same prefill gives the same numbers bit for bit (generation with DSpark still varies between runs) | none | 0: +0.4% decode at 6 requests |
 | `WARMUP` | 1 | requests at the shapes vLLM's warmup leaves out, right after `/health` | none | no compile stalls on the first requests (4 s at boot, 14 s after an update) |
 | `HOST` / `VLLM_API_KEY` | 127.0.0.1 / none | who can connect | none | none |
 
@@ -165,7 +165,8 @@ NOTES.md has the reasons, the measurements and the gotchas; FOLLOWUPS.md what co
 
 Teacher-forced KL against the original NVFP4/MXFP8 checkpoint on 22 held-out transcripts
 (images, tool calls, code, Italian, chat; `bench/kl_eval.py`, one request at a time). One
-request at a time the server is repeatable bit for bit (`HYPERINKLING_MOE_ORDER`); the mean
+request at a time, without speculation, scoring a prompt repeats bit for bit
+(`HYPERINKLING_MOE_ORDER`); the mean
 stays dominated by the few positions where a small difference flips an expert, so compare
 medians.
 
