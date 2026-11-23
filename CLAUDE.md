@@ -103,6 +103,7 @@ Benchmarks and quality (all need a running server):
 - `bench/extract_bench.py`: document extraction on public data (shared Italian system
   prompt, 1-3 DocVQA pages, JSON or summary), closed loop with `metrics_window.py` alongside.
 - `bench/greedy_ref.py save|compare`, `bench/copy_test.py`: output and acceptance checks.
+- `bench/diverge.py`: first layer visit where two runs of a request differ (capture hook).
 - `bench/w4_gemv.py`, `bench/w8_gemv.py`: W4/W8 GEMV tiles against a grid search (no server).
 - `bench/long_decode.py`, `bench/offload_test.py`, `bench/moe_kernels.py`.
 

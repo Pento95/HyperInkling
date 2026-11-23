@@ -2,17 +2,21 @@
 
 The server runs with HYPERINKLING_CAPTURE_DIR set and in eager mode; this
 script creates `<dir>/ACTIVE`, sends every transcript of the corpus with the
-final assistant turn teacher-forced (max_tokens 1), and removes ACTIVE.
+final assistant turn teacher-forced (max_tokens 1), removes ACTIVE and sends one more
+request, which makes the server write its last buffers; then it checks the token count.
 
     venv/bin/python prepare/replay_capture.py data/calib/calib.jsonl data/capture
 """
 
+import glob
 import json
 import os
 import sys
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+
+import torch
 
 URL = "http://127.0.0.1:18030/v1/chat/completions"
 
@@ -46,6 +50,11 @@ def main(corpus, capture_dir):
             tokens = list(ex.map(send, recs))
     finally:
         os.remove(flag)
+    send({"source": "flush", "messages": [{"role": "user", "content": "ok"}]})
+    captured = sum(torch.load(f, mmap=True)["x"].shape[0]
+                   for f in glob.glob(os.path.join(capture_dir, "visit00_pass0_*.pt")))
+    if captured != sum(tokens):
+        sys.exit(f"{captured} tokens captured, {sum(tokens)} replayed")
     if not all(tokens):
         sys.exit(f"{tokens.count(0)} of {len(recs)} transcripts were not captured")
     print(f"{len(recs)} transcripts, {sum(tokens)} prompt tokens replayed")

@@ -1,4 +1,4 @@
-From ab6bbdaf56d9a3488c8397766286e928a9c7b1be Mon Sep 17 00:00:00 2001
+From 4ec55746685edd52c8031986b74ddae2a4eaf52e Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -76,7 +76,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/dspark.py         | 164 +++++++++---
  vllm/models/inkling2/nvidia/loop.py           |  12 +
  vllm/models/inkling2/nvidia/model.py          |  86 +++++-
- vllm/models/inkling2/nvidia/moe.py            | 111 +++++++-
+ vllm/models/inkling2/nvidia/moe.py            | 107 +++++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  18 ++
  vllm/models/inkling2/nvidia/ops/attention.py  |   8 +-
  .../inkling2/nvidia/ops/attention_sm90.py     |  21 +-
@@ -98,7 +98,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/core/sched/scheduler.py               |  38 ++-
  vllm/v1/engine/core.py                        |  84 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++++
- 33 files changed, 1864 insertions(+), 118 deletions(-)
+ 33 files changed, 1860 insertions(+), 118 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -950,7 +950,7 @@ index db9a9bc16b..58cd3b52ab 100644
  
  __all__ = ["Inkling2ForConditionalGeneration"]
 diff --git a/vllm/models/inkling2/nvidia/moe.py b/vllm/models/inkling2/nvidia/moe.py
-index 93fe44c4a3..793d88a436 100644
+index 93fe44c4a3..e96974721c 100644
 --- a/vllm/models/inkling2/nvidia/moe.py
 +++ b/vllm/models/inkling2/nvidia/moe.py
 @@ -7,6 +7,7 @@ rank returns the full all-reduced bf16 output. Checkpoint names under
@@ -961,7 +961,7 @@ index 93fe44c4a3..793d88a436 100644
  from collections.abc import Callable, Sequence
  from typing import Literal, Protocol
  
-@@ -23,19 +24,73 @@ from vllm.distributed import (
+@@ -23,19 +24,69 @@ from vllm.distributed import (
  from vllm.forward_context import get_forward_context, is_forward_context_available
  from vllm.model_executor.model_loader.weight_utils import default_weight_loader
  from vllm.model_executor.utils import set_weight_attrs
@@ -994,8 +994,10 @@ index 93fe44c4a3..793d88a436 100644
 +
 +def _capture(key: str, pass_idx: int, x: torch.Tensor, selected) -> None:
 +    # Only while `<dir>/ACTIVE` exists: the startup profile and warm-up runs
-+    # (random inputs) stay out of the calibration data.
++    # (random inputs) stay out of the calibration data. The first call after it is
++    # removed writes what is buffered.
 +    if not os.path.exists(os.path.join(_CAPTURE_DIR, "ACTIVE")):
++        capture_flush_all()
 +        return
 +    ids, weights, _ = selected
 +    keep = ids[:, 0] >= 0  # padding tokens have no local slots
@@ -1026,19 +1028,13 @@ index 93fe44c4a3..793d88a436 100644
 +
 +
 +def capture_flush_all() -> None:
-+    """Writes every partial capture buffer (call before shutting down)."""
++    """Writes every partial capture buffer."""
 +    for name in list(_capture_buffers):
 +        _capture_flush(name)
-+
-+
-+if _CAPTURE_DIR:
-+    import atexit
-+
-+    atexit.register(capture_flush_all)
  
  
  class ExpertsLoRA(Protocol):
-@@ -102,7 +157,9 @@ class Inkling2Experts(nn.Module):
+@@ -102,7 +153,9 @@ class Inkling2Experts(nn.Module):
          self.topk = config.num_experts_per_tok
          self.gate_cap = config.mlp_gate_softcap
          self.up_cap = config.mlp_up_softcap
@@ -1048,7 +1044,7 @@ index 93fe44c4a3..793d88a436 100644
          hidden, inter = config.hidden_size, config.intermediate_size
          self.hidden_size, self.intermediate_size = hidden, inter
  
-@@ -111,6 +168,13 @@ class Inkling2Experts(nn.Module):
+@@ -111,6 +164,13 @@ class Inkling2Experts(nn.Module):
          scale_dtype = torch.float8_e4m3fn if self.nvfp4 else torch.uint8
          self.shapes = ((2 * inter, hidden), (hidden, inter))
          for name, (n, k) in zip(("w13", "w2"), self.shapes):
@@ -1062,7 +1058,7 @@ index 93fe44c4a3..793d88a436 100644
              # Rows are shuffled and block scales swizzled (``block_scales``).
              self._register(
                  f"{name}_weight",
-@@ -148,15 +212,21 @@ class Inkling2Experts(nn.Module):
+@@ -148,15 +208,21 @@ class Inkling2Experts(nn.Module):
          )
          # Humming weights are repacked after loading.
          self.sm100 = use_sm100_kernels()
@@ -1086,7 +1082,7 @@ index 93fe44c4a3..793d88a436 100644
          if self.sm100:
              load_kernels(
                  (self.w13_weight, self.w2_weight),
-@@ -202,9 +272,19 @@ class Inkling2Experts(nn.Module):
+@@ -202,9 +268,19 @@ class Inkling2Experts(nn.Module):
          param.data.copy_(loaded)
  
      def process_weights_after_loading(self) -> None:
@@ -1107,7 +1103,7 @@ index 93fe44c4a3..793d88a436 100644
          for name in ("w13", "w2"):
              amax, denominator = self.scales(name)
              global_scale = None
-@@ -217,11 +297,12 @@ class Inkling2Experts(nn.Module):
+@@ -217,11 +293,12 @@ class Inkling2Experts(nn.Module):
                  getattr(self, f"{name}_weight_scale").data,
                  global_scale,
              )
@@ -1125,7 +1121,7 @@ index 93fe44c4a3..793d88a436 100644
          # The Humming copies replace the checkpoint layout.
          for name in ("w13", "w2"):
              for suffix in ("weight", "weight_scale"):
-@@ -274,7 +355,7 @@ class Inkling2Experts(nn.Module):
+@@ -274,7 +351,7 @@ class Inkling2Experts(nn.Module):
          Without `reduce`, returns the local expert rows and `src2dst` for
          the consumer to combine and reduce, or pushes their combine to the
          token shard owners."""
@@ -1134,7 +1130,7 @@ index 93fe44c4a3..793d88a436 100644
              src2dst, gammas, rows, tiles = routing
              gate_up = self._gemm(quantized, "w13", tiles, plan, 0)
              m = plan.max_ctas
-@@ -341,6 +422,8 @@ class Inkling2MoE(nn.Module):
+@@ -341,6 +418,8 @@ class Inkling2MoE(nn.Module):
              torch.tensor([0, config.n_routed_experts], dtype=torch.int32),
              persistent=False,
          )
@@ -1143,7 +1139,7 @@ index 93fe44c4a3..793d88a436 100644
  
      def routed_expert_ids(self, x: torch.Tensor) -> torch.Tensor:
          """Each token's top-k expert ids `[T, topk]` over all experts: the
-@@ -382,7 +465,7 @@ class Inkling2MoE(nn.Module):
+@@ -382,7 +461,7 @@ class Inkling2MoE(nn.Module):
          is_padding = None
          if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
              is_padding = get_forward_context().is_padding
@@ -1152,7 +1148,7 @@ index 93fe44c4a3..793d88a436 100644
              selected = select_experts(
                  x,
                  gate.weight,
-@@ -392,6 +475,8 @@ class Inkling2MoE(nn.Module):
+@@ -392,6 +471,8 @@ class Inkling2MoE(nn.Module):
                  experts.expert_bounds,
                  is_padding,
              )
