@@ -65,7 +65,9 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
 - **The sconv conv-state cache holds only each step's tail** (`SconvStateManager`): the
   conv reads cached taps only for a step's first 3 tokens, so a step needs real blocks for
   the window, the drafts in flight and one prefix-hit alignment (64 tokens), not for its
-  whole prefill chunk. Prefix hits land where a step ended (a prompt's end, chunk ends).
+  whole prefill chunk. Plus the window below the shared-prefix junction vLLM detects (where
+  requests with the same system prompt diverge): without it they would hit only when a step
+  happens to end there (`bench/prefix_hit.py`).
 - **Embeddings via UVA** (HyperQwen's `qwen3_5-embed-uva` mechanism): only the looked-up
   rows cross PCIe; frees ~23k tokens of KV.
 

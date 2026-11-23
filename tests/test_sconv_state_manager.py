@@ -11,8 +11,14 @@ from vllm.models.inkling.nvidia.sconv_swa_attn import SconvStateManager
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+from vllm.v1.core.single_type_kv_cache_manager import (
+    DFlashSlidingWindowManager,
+    FullAttentionManager,
+    SlidingWindowManager,
+)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheGroup
 from vllm.v1.request import Request
 
 BLOCK, WINDOW, DRAFTS, ALIGN, CHUNK = 8, 4, 7, 64, 1024
@@ -114,3 +120,51 @@ def test_prefix_hit_at_the_aligned_position_below_the_prompt_end(prompt_len):
         alignment_tokens=ALIGN,
     )
     assert hit == prompt_len // ALIGN * ALIGN
+
+
+@pytest.mark.parametrize("chunk", [1024, 2000, 2048])
+@pytest.mark.parametrize("shared,total", [(1000, 6052), (2344, 3076), (3000, 6052), (4090, 6052)])
+def test_shared_prefix_hit_away_from_a_step_end(shared, total, chunk):
+    """Requests sharing only their first tokens (a system prompt, then different pages)
+    resume at the junction from the third on, with every KV group of the served model
+    (full, window 1024, conv state, DSpark drafter)."""
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(BLOCK, sha256)
+
+    def spec(block):
+        return AttentionSpec(block_size=block, num_kv_heads=1, head_size=1, dtype=torch.float32)
+
+    layers = [
+        FullAttentionManager.layer_config(spec(ALIGN)),
+        SlidingWindowManager.layer_config(spec(ALIGN), sliding_window=1024),
+        _layer(2),
+        DFlashSlidingWindowManager.layer_config(
+            spec(ALIGN), sliding_window=1024, num_speculative_tokens=DRAFTS,
+            max_in_flight_steps=2, num_lookahead_tokens=DRAFTS),
+    ]
+    groups = [KVCacheGroup({f"l{i}": c.spec}, c.manager_config, c.spec.block_size, False)
+              for i, c in enumerate(layers)]
+    manager = KVCacheManager(
+        KVCacheConfig(num_blocks=20000, kv_cache_tensors=[], kv_cache_groups=groups,
+                      prefix_cache_retention_interval=0, hash_block_size=BLOCK),
+        max_model_len=100000, scheduler_block_size=ALIGN, hash_block_size=BLOCK,
+        enable_caching=True, max_in_flight_tokens=2 * chunk,
+    )
+    free = manager.block_pool.get_num_free_blocks()
+    hits = []
+    for k in range(4):
+        ids = [*range(shared), *range(10**6 * (k + 1), 10**6 * (k + 1) + total - shared)]
+        request = Request(request_id=str(k), prompt_token_ids=ids, pooling_params=None,
+                          sampling_params=SamplingParams(max_tokens=1), block_hasher=hasher)
+        blocks, hit, request.shared_prefix_boundary = manager.get_computed_blocks(request)
+        hits.append(hit)
+        pos, first = hit, {"num_new_computed_tokens": hit, "new_computed_blocks": blocks}
+        while pos < total:
+            step = min(chunk, total - pos)
+            assert manager.allocate_slots(
+                request, step, num_lookahead_tokens=DRAFTS, **first) is not None
+            first, pos = {}, pos + step
+            request.num_computed_tokens = pos
+        manager.free(request)
+        assert manager.block_pool.get_num_free_blocks() == free  # nothing leaks
+    assert hits[2:] == [shared // ALIGN * ALIGN] * 2
