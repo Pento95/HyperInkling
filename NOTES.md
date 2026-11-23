@@ -113,10 +113,9 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   FlashAttention impl that only writes KV (FlashAttention refuses fp8 on SM8x; the draft
   attention runs in `block_decode_attention`, which reads the emulated E4M3 cache). Its
   pages then pack with the target's instead of being padded to them.
-- **Longest request** (DSpark, vision tower on the GPU, 6 requests, FP8 KV): 303k with
-  async off, 291k with async on; with `NBT=2048` and 1024-token images 283k / 267k
-  The global layers hold almost all of it; async scheduling
-  now costs ~12k tokens (two in-flight tails) for +3-4% decode.
+- **Longest request** (DSpark, vision tower on the GPU, 6 requests, FP8 KV): 274k,
+  291k with async off (`docs/memory_matrix.tsv`). The global layers hold almost all of it; async scheduling costs
+  ~17k tokens (two in-flight tails) for +3-4% decode.
 - **Measure the context limit with `MAX_LEN=auto`.** vLLM checks a fixed limit before the
   warmup (without the transient activations and CUDA graphs, ~1.5 GiB here, so its estimate
   is optimistic) and again after it; `--max-model-len -1` fits the limit after warmup in one
@@ -150,8 +149,7 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   profiled 2048 px squares (2704 tokens) and `--limit-mm-per-prompt` width/height can
   only shrink that, so an A4 page at 300 ppi (5488 tokens) passed validation and then
   waited with no error. Fixed in `processing.py` (the override can grow the profiled
-  page up to 4096 px); `start.sh` profiles 2480x3508 and sets
-  `--encoder-cache-size 16384`.
+  page up to 4096 px); `start.sh` sets `IMAGE_MAX_W`/`_H` and `--encoder-cache-size`.
 - **The KV CPU tier needs prefix caching on**; it worked first time with Inkling's
   hybrid groups.
 - **Greedy output depends on the verify length.** Each `SPEC_K` runs different kernel

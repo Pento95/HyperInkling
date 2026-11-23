@@ -258,6 +258,8 @@ def main():
     if spec == "dspark" and adaptive == "n":
         env["HYPERINKLING_SPEC_ADAPTIVE"] = ""
         env["HYPERINKLING_LOOKUP"] = 0
+    if tier != "auto" and tier > 36:  # compose's /dev/shm default is 48
+        env["SHM_GB"] = tier + 12
     if hasattr(os, "getuid"):  # compose's prepare writes ./models as this user
         env["UID"], env["GID"] = os.getuid(), os.getgid()
     if expose == "y":
@@ -282,7 +284,8 @@ def main():
     print("\nStart it:  docker compose up -d     (logs: docker compose logs -f; the first start"
           " downloads the checkpoint)")
     print(f"Native:    hf download {repo} --local-dir models/{local}   (once)")
-    exports = " ".join(f"{k}={v}" for k, v in env.items())
+    exports = " ".join(f"{k}={v}" for k, v in env.items()
+                       if k not in ("UID", "GID", "SHM_GB", "BIND", "HF_REPO", "CHECKPOINT"))
     print(f"Native:    {exports} ./start.sh")
 
 

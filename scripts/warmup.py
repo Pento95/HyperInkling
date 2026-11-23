@@ -5,7 +5,7 @@ requests (the LM head runs outside the CUDA graphs at every verify row count), a
 prefill next to running decodes. start.sh runs it in the background once /health answers
 (WARMUP=1).
 
-    python3 scripts/warmup.py [port]          # VLLM_API_KEY from the environment
+    python3 scripts/warmup.py [port] [model] [host]   # VLLM_API_KEY from the environment
 """
 
 import json
@@ -16,7 +16,12 @@ import time
 import urllib.request
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "8080"
-URL = f"http://127.0.0.1:{PORT}"
+MODEL = sys.argv[2] if len(sys.argv) > 2 else "inkling-2-mini"
+HOST = sys.argv[3] if len(sys.argv) > 3 else "127.0.0.1"
+if HOST in ("0.0.0.0", "::", ""):  # listening everywhere
+    HOST = "127.0.0.1"
+URL = f"http://[{HOST}]:{PORT}" if ":" in HOST else f"http://{HOST}:{PORT}"
+failures = []
 HEADERS = {"Content-Type": "application/json"}
 if os.environ.get("VLLM_API_KEY"):
     HEADERS["Authorization"] = f"Bearer {os.environ['VLLM_API_KEY']}"
@@ -26,7 +31,8 @@ WORDS = ("the model reads every page of the report and writes a careful summary 
 
 def _wait_health(deadline_s=1800):
     end = time.time() + deadline_s
-    while time.time() < end:
+    server = os.getppid()  # start.sh becomes the server
+    while time.time() < end and os.getppid() == server:
         try:
             urllib.request.urlopen(f"{URL}/health", timeout=2)
             return True
@@ -37,13 +43,14 @@ def _wait_health(deadline_s=1800):
 
 def _chat(words, max_tokens):
     text = " ".join(WORDS[i % len(WORDS)] for i in range(words))
-    body = {"model": "inkling-2-mini", "temperature": 0.5, "max_tokens": max_tokens,
+    body = {"model": MODEL, "temperature": 0.5, "max_tokens": max_tokens,
             "min_tokens": max_tokens, "messages": [{"role": "user", "content": text}]}
     req = urllib.request.Request(f"{URL}/v1/chat/completions", json.dumps(body).encode(),
                                  HEADERS)
     try:
         urllib.request.urlopen(req, timeout=600).read()
     except OSError as e:
+        failures.append(e)
         print(f"warm-up request failed: {e}", file=sys.stderr)
 
 
@@ -74,6 +81,8 @@ def main():
     _chat(530, 2)
     for t in threads:
         t.join()
+    if failures:
+        sys.exit(f"warm-up: {len(failures)} requests failed")
     print(f"warm-up done in {time.time() - t0:.1f} s", flush=True)
 
 

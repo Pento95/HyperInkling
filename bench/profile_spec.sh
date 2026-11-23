@@ -10,12 +10,12 @@
 # (draft + verify) is one step.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source scripts/server-lib.sh
 name=$1; conc=$2; tokens=$3; extra=${4:-}
 PORT=${PORT:-18030}; log=.local/prof-$name.log
 mkdir -p .local/prof
-PROFILE=$name PORT=$PORT KV_OFFLOAD_GB=0 WARMUP=0 ENV_FILE= MAX_LEN=${MAX_LEN:-131072} EXTRA_ARGS="$extra" ./start.sh > "$log" 2>&1 &
-for _ in $(seq 150); do curl -sf --max-time 2 "localhost:$PORT/health" > /dev/null && break; sleep 3; done
-curl -sf --max-time 2 "localhost:$PORT/health" > /dev/null || { echo "server failed: $log"; exit 1; }
+start_server "$PORT" "$log" PROFILE=$name PORT=$PORT KV_OFFLOAD_GB=0 WARMUP=0 ENV_FILE= MAX_LEN=${MAX_LEN:-131072} EXTRA_ARGS="$extra" ./start.sh
+wait_health "$PORT" || { echo "server failed: $log"; exit 1; }
 steps() { curl -s "localhost:$PORT/metrics" | awk 'index($0,"vllm:iteration_tokens_total_count{")==1 {s+=$NF} END {print s+0}'; }
 # Warm-up at the measured shapes: new kernel variants compile on first use.
 for _ in 1 2; do venv/bin/python scripts/quick_bench.py "$conc" "$tokens" "$PORT" > /dev/null; done
@@ -24,8 +24,7 @@ s0=$(steps); t0=$(date +%s.%N)
 venv/bin/python scripts/quick_bench.py "$conc" "$tokens" "$PORT" | grep conc
 s1=$(steps); t1=$(date +%s.%N)
 curl -s -X POST --max-time 600 "localhost:$PORT/stop_profile"
-for p in $(pgrep -f '[v]env/bin/vllm serve'); do kill "$p"; done
-while pgrep -f '[v]env/bin/vllm serve' > /dev/null; do sleep 1; done
+stop_server
 nsys stats -q --report cuda_gpu_kern_sum --format csv ".local/prof/$name.nsys-rep" 2> /dev/null | python3 -c "
 import csv, sys
 rows = list(csv.DictReader(sys.stdin)); steps = max($s1 - $s0, 1)

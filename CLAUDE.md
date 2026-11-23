@@ -104,7 +104,7 @@ Benchmarks and quality (all need a running server):
   prompt, 1-3 DocVQA pages, JSON or summary), closed loop with `metrics_window.py` alongside.
 - `bench/greedy_ref.py save|compare`, `bench/copy_test.py`: output and acceptance checks.
 - `bench/w4_gemv.py`, `bench/w8_gemv.py`: W4/W8 GEMV tiles against a grid search (no server).
-- `bench/long_decode.py`, `bench/offload_test.py`, `bench/moe_kernels.py`, `bench/profile_decode.sh`.
+- `bench/long_decode.py`, `bench/offload_test.py`, `bench/moe_kernels.py`.
 
 Model preparation (`prepare/`): `build_calib.py` → `replay_capture.py` → `gptq_experts.py`
 (see README "Model preparation"); `quantize_experts.py` is the round-to-nearest baseline,
@@ -119,6 +119,8 @@ CLAUDE.local.md, not in git.
 - `start.sh` refuses to start if the port is taken. Two engines cannot share the 24 GiB.
 - `--uvicorn-log-level warning` hides "Application startup complete": wait on
   `GET /health` with a deadline. `GET /` is 404 by design.
+- Scripts that boot a server use `scripts/server-lib.sh`: it refuses a busy GPU or port and
+  stops only its own server.
 - Never `pkill -f '<pattern>'` (it matches and kills the calling shell); use
   `pgrep -f '[v]env/bin/vllm serve'`.
 - After killing a server (especially under nsys), check `nvidia-smi --query-compute-apps`

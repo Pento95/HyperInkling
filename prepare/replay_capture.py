@@ -46,6 +46,8 @@ def main(corpus, capture_dir):
             tokens = list(ex.map(send, recs))
     finally:
         os.remove(flag)
+    if not all(tokens):
+        sys.exit(f"{tokens.count(0)} of {len(recs)} transcripts were not captured")
     print(f"{len(recs)} transcripts, {sum(tokens)} prompt tokens replayed")
 
 

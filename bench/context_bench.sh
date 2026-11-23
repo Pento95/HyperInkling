@@ -5,21 +5,16 @@
 #   bench/context_bench.sh <name>        # labels <name>-off, <name>-dspark; GPU must be free
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source scripts/server-lib.sh
 name=$1; PORT=${PORT:-18030}
 for spec in off dspark; do
 	log=.local/context-bench-$name-$spec.log
-	SPEC=$spec PORT=$PORT KV_OFFLOAD_GB=0 WARMUP=0 ENV_FILE= ./start.sh > "$log" 2>&1 &
-	for _ in $(seq 200); do
-		curl -sf --max-time 2 "localhost:$PORT/health" > /dev/null && break
-		sleep 3
-	done
-	if curl -sf --max-time 2 "localhost:$PORT/health" > /dev/null; then
+	start_server "$PORT" "$log" SPEC=$spec PORT=$PORT KV_OFFLOAD_GB=0 WARMUP=0 ENV_FILE= ./start.sh
+	if wait_health "$PORT"; then
 		venv/bin/python bench/context_bench.py run "$name-$spec" --port "$PORT"
 	else
 		echo "server failed: $log"
 	fi
-	for p in $(pgrep -f '[v]env/bin/vllm serve'); do kill "$p"; done
-	while pgrep -f '[v]env/bin/vllm serve' > /dev/null; do sleep 1; done
-	wait
+	stop_server
 done
 venv/bin/python bench/context_bench.py table "$name-off" "$name-dspark"

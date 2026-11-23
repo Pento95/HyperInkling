@@ -8,28 +8,22 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 corpus=$1; out=$2; shift 2
 mkdir -p "$out"
+source scripts/server-lib.sh
+failed=0
 for spec in "$@"; do
 	name=${spec%%=*}; model=${spec#*=}
-	log=".local/sweep-$name.log"
-	rm -f "$log"  # a previous run's ready line must not count
-	MODEL=$model MM_LIMIT='{"image":1}' MAX_LEN=16384 EAGER= MAX_SEQS=1 TRY_TIMEOUT=3600 \
+	start_server 18030 ".local/sweep-$name.out" MODEL="$model" MM_LIMIT='{"image":1}' MAX_LEN=16384 \
+		EAGER= MAX_SEQS=1 TRY_TIMEOUT=3600 \
 		scripts/serve-try.sh "sweep-$name" --max-num-batched-tokens 512 \
 		--reasoning-parser inkling --enable-auto-tool-choice --tool-call-parser inkling \
 		--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1]}' \
-		${SERVE_ARGS:-} \
-		> /dev/null 2>&1 &
-	for _ in $(seq 600); do  # 20 min
-		grep -q -E 'Application startup complete|Traceback' "$log" 2>/dev/null && break
-		sleep 2
-	done
-	if ! grep -q 'Application startup complete' "$log"; then
-		echo "$name: server failed, see $log"
-		for p in $(pgrep -f '[v]env/bin/vllm serve'); do kill "$p"; done
-		wait
-		continue
+		${SERVE_ARGS:-}
+	if wait_health 18030; then
+		venv/bin/python bench/kl_eval.py score "$corpus" "$out/$name.json" || failed=1
+	else
+		echo "$name: server failed, see .local/sweep-$name.log"
+		failed=1
 	fi
-	venv/bin/python bench/kl_eval.py score "$corpus" "$out/$name.json"
-	for p in $(pgrep -f '[v]env/bin/vllm serve'); do kill "$p"; done
-	while pgrep -f '[v]env/bin/vllm serve' > /dev/null; do sleep 1; done
-	wait
+	stop_server
 done
+exit $failed

@@ -34,18 +34,18 @@ PORT=${PORT:-8080}
 MAX_SEQS=${MAX_SEQS:-6}
 # Speculative decoding with the bundled DSpark drafter (on unless SPEC=off). The
 # block drafter always drafts 7 tokens; SPEC_K says how many of them the target
-# verifies, by batch size: [first, last, k] ranges. Measured 2026-11-21: k=4 for
-# 1-2 requests, k=3 for 3-6 (bench/spec_bench.py; a verify step touches ~6x the
+# verifies, by batch size: [first, last, k] ranges. k=4 for
+# 1-2 requests, k=3 for 3-6 (bench/dspark_k_sweep.sh; a verify step touches ~6x the
 # experts of a plain step, so long windows only pay on predictable text).
 SPEC=${SPEC:-dspark}
 SPEC_K=${SPEC_K:-[[1,2,4],[3,6,3]]}
 # Drafts sampled from the draft distribution (as the reference) rather than
-# greedy: at temperature 0.2-0.5 struct went 264 -> 314 tok/s, 6-way 444 -> 465.
+# greedy: at temperature 0.2-0.5 +15-20% on structured output.
 SPEC_DRAFT=${SPEC_DRAFT:-probabilistic}
 # The verify length chosen online per step (adaptive_k.py) from these candidates;
 # empty = the fixed SPEC_K schedule. Each candidate costs the context of one CUDA graph
 # per batch size: 2,4,7 ~5k tokens (still 262k with 6 requests and vision on the GPU),
-# 1,2,3,4,5,7 ~14k. With the lookup, against SPEC_K (2026-11-22): +41-43% copying,
+# 1,2,3,4,5,7 ~14k. With the lookup, against SPEC_K: +41-43% copying,
 # +20% at 6 requests, +4-6% chat and prose, the rest within noise.
 export HYPERINKLING_SPEC_ADAPTIVE=${HYPERINKLING_SPEC_ADAPTIVE-2,4,7}
 # Drafts from the request's own context fused with DSpark's (ops/lookup.py): +7-13% on
@@ -191,7 +191,7 @@ echo "=================================================="
 # compile (first boot after an update) or load from the JIT cache before real traffic.
 WARMUP=${WARMUP:-1}
 if [ "$WARMUP" = 1 ] && [ -z "${PROFILE:-}" ]; then
-	python3 "$REPO/scripts/warmup.py" "$PORT" &
+	python3 "$REPO/scripts/warmup.py" "$PORT" "$SERVED_NAME" "$HOST" &
 fi
 exec taskset -c "$CPUS" "${wrap[@]}" vllm serve "$MODEL" \
 	--served-model-name "$SERVED_NAME" $SERVED_ALIASES --host "$HOST" --port "$PORT" \

@@ -3,9 +3,10 @@
 # the captures and the result is scored on the eval set against the source.
 # Usage: prepare/calib_round.sh <seed> <tag>   e.g. 20261122 r2
 # Env: SRC (source checkpoint, default models/Inkling-2-Mini), CAPTURES (comma-separated
-# capture dirs for GPTQ, default every data/capture*), OUT (the INT4 checkpoint), KL_DIR
+# capture dirs for GPTQ, all of the same SRC; default this round's only), OUT (the INT4
+# checkpoint), KL_DIR
 # (scores; the source is scored there as ref.json first if missing).
-set -uo pipefail
+set -euo pipefail
 cd "$(dirname "$0")/.."
 seed=$1; tag=$2
 corpus=data/calib/calib-$tag.jsonl
@@ -15,36 +16,28 @@ out=${OUT:-models/Inkling-2-Mini-W4A16-g128-gptq-$tag}
 common=(--max-num-batched-tokens 512 --reasoning-parser inkling
 	--enable-auto-tool-choice --tool-call-parser inkling)
 
-stop_server() {
-	for p in $(pgrep -f '[v]env/bin/vllm serve'); do kill "$p"; done
-	while pgrep -f '[v]env/bin/vllm serve' > /dev/null; do sleep 1; done
-}
-start_server() {  # <log name> [env...] -- [args...]
-	local log=".local/$1.log"; shift
-	rm -f "$log"
-	env "$@" > /dev/null 2>&1 &
-	until grep -q -E 'Application startup complete|Traceback' "$log" 2>/dev/null; do sleep 2; done
-	! grep -q Traceback "$log"
+source scripts/server-lib.sh
+serve() {  # <log name> [VAR=value...] scripts/serve-try.sh [args...]
+	local name=$1; shift
+	start_server 18030 ".local/$name.out" MODEL="$src" MM_LIMIT='{"image":1}' MAX_LEN=16384 TRY_TIMEOUT=7200 "$@"
+	wait_health 18030 || { echo "server failed, see .local/$name.log" >&2; exit 1; }
 }
 
 echo "== generate $corpus"
-start_server "$tag-gen" MODEL="$src" MM_LIMIT='{"image":1}' MAX_LEN=16384 EAGER= MAX_SEQS=6 TRY_TIMEOUT=7200 \
-	scripts/serve-try.sh "$tag-gen" "${common[@]}" \
-	--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,3,4,5,6]}' \
-	|| { echo "gen server failed"; exit 1; }
+serve "$tag-gen" EAGER= MAX_SEQS=6 scripts/serve-try.sh "$tag-gen" "${common[@]}" \
+	--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,3,4,5,6]}'
 HYPERINKLING_CALIB_SEED=$seed venv/bin/python prepare/build_calib.py "$corpus" data/calib/eval.jsonl
 stop_server
 
 echo "== capture $capture"
 rm -rf "$capture"; mkdir -p "$capture"
-start_server "$tag-capture" MODEL="$src" HYPERINKLING_CAPTURE_DIR="$PWD/$capture" MM_LIMIT='{"image":1}' \
-	MAX_LEN=16384 MAX_SEQS=2 TRY_TIMEOUT=7200 scripts/serve-try.sh "$tag-capture" "${common[@]}" \
-	|| { echo "capture server failed"; exit 1; }
+serve "$tag-capture" HYPERINKLING_CAPTURE_DIR="$PWD/$capture" MAX_SEQS=2 \
+	scripts/serve-try.sh "$tag-capture" "${common[@]}"
 venv/bin/python prepare/replay_capture.py "$corpus" "$capture"
 stop_server
 
 echo "== gptq $out"
-dirs=${CAPTURES:-$(ls -d data/capture data/capture-* | paste -sd,)}
+dirs=${CAPTURES:-$capture}
 rm -rf "$out"
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True taskset -c 0-30 \
 	venv/bin/python prepare/gptq_experts.py "$src" "$dirs" "$out" \

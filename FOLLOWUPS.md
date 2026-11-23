@@ -4,12 +4,11 @@ What comes next, by phase. Any item that trades something for something else shi
 wizard option, not a default. Alternative tensors go in the same HF repo as separate files,
 fetched with `hf download --include` only when chosen.
 
-| phase | items | then |
-|---|---|---|
-| 2, the checkpoint (alternatives, after the post) | 8, 11, 12, 14, 33 | new files on HF |
-| 3, context (best effort) | 54 (with 53) | |
-| after the post | 55, 10, 13, 38 | |
-| 4, release | 53, 50, then 51 if its image is public | Reddit post |
+| phase | items |
+|---|---|
+| 2, the checkpoint (new files on HF) | 14 first, then 8, 11, 12, 33 |
+| 3, context (best effort) | 18, 19, 13, 38, 39, 55 |
+| 4, speed and upstream | 10, 7, 21, 22, 32, 51 |
 
 Released: `ghcr.io/pento95/hyperinkling:0.1.2` (compose default) and two HF checkpoints, the
 original (README = docs/MODEL_CARD.md) and the uncensored one (README =
@@ -55,13 +54,7 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     needs a 4-bit column.
 19. **Least-routed experts in host RAM when the context needs room** [BS]: the way toward
     1M without DSpark and without the vision tower on the GPU.
-54. **`MAX_LEN=auto` in the wizard**: `start.sh` defaults to it (vLLM fits the longest
-    request after warmup; the drafter computes its RoPE angles, so nothing grows with the
-    limit) and `ASYNC` to 1; `bench/memory_matrix.sh` boots once per row. Left: the wizard
-    asks for an optional cap instead of computing `MAX_LEN`, and shows the expected context
-    from the new table (with 53, on the matrix of 50). Its `NBT` question still has the old
-    logic (2048 forced async off at -68k): `NBT=2048` is now the default.
-13. **Drafter W4 at 6-16 requests** [NS, after the post]: past ~21 rows the W4 kernels
+13. **Drafter W4 at 6-16 requests** [NS]: past ~21 rows the W4 kernels
     are tensor-core bound (int4 halves the bytes per MAC, so the bound comes at half the
     rows of INT8): 1.3 ms per step at 6 requests. fp16 accumulation doubles the MMA rate on
     GeForce; for the drafter it moves only acceptance (est. +2-3% at 6-16 requests).
@@ -92,6 +85,11 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     numerics (fixed summation orders, no FMA contraction, exact `tanh`: AX measured
     `tanh.approx` flipping 0.23% of bf16 outputs) must hold: check bitwise against the
     unfused path.
+    Measured at 6 requests: the controller chain (`pair_rms`, `down_split`,
+    `up_from_partials`, `blend_rms_norm`) is 18 us per visit, but `blend`'s RMSNorm sums the
+    whole row in one `tl.sum` and `up` must stay a `tl.dot`, so they cannot merge bitwise;
+    `pair_rms` into `down_split` saves ~0.1 ms, `attn_res_row` (0.53 ms) is the other
+    candidate: ~1-2% in all.
 21. **Rust frontend** for the native build: vendored OpenSSL needs Perl `FindBin` (the
     container builds it).
 22. **Upstream PRs**: the processing.py dummy-size fix and the oversized-image downscale are
@@ -102,38 +100,19 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 51. **Against club-3090's image** [C3]: PR noonghunna/club-3090#2135 (open) adds one-card
     slugs on `ghcr.io/noonghunna/vllm-inkling-club3090` (private so far): `single-max` 180k
     without drafter, `single-fast` 100k with DSpark, both NBT 512, 2 requests, release
-    checkpoint. Once it pulls: `bench/context_bench.py` against both on this GPU, for the post.
-53. **Image budget in the wizard** [NS]: ask the largest image as tokens per image (default
-    1024, shown also as megapixels: 1024 tokens = 1024 cells of 40 x 40 px = 1.64 MP, an A4
-    page at ~128 ppi), and set `IMAGE_MAX_W`/`_H` from it. With `NBT=2048` a step then
-    encodes two such pages (the encoder budget is the prefill chunk). Measure the context
-    and prefill of `NBT=2048` with 1024-token images after 17, in the memory matrix, and
-    move the owner's profile to it (a little under 262k is acceptable).
-50. **Final measurements** (once, after phases 3-4, before the Reddit post), for README and
-    the model card, with the defaults (`NBT=2048`): the speed table is one table from
-    `bench/context_bench.sh` (8k and 32k context; prefill per request and aggregate, decode
-    per request and aggregate without prefill; 1 and 6 requests, with and without DSpark);
-    plus `bench/spec_bench.py 8080 512 user`, `bench/copy_test.py` at 50k,
-    `bench/extract_bench.py`, `bench/memory_matrix.sh`, `bench/kl_eval.py`,
-    `bench/quality_battery.py` against the original. The post credits HyperQwen, basalt, AR,
-    AX, C3 and invites field reports (`.github/ISSUE_TEMPLATE/field-report.yml`).
-    Measured at 6 requests: the controller chain (`pair_rms`, `down_split`,
-    `up_from_partials`, `blend_rms_norm`) is 18 us per visit, but `blend`'s RMSNorm sums the
-    whole row in one `tl.sum` and `up` must stay a `tl.dot`, so they cannot merge bitwise;
-    `pair_rms` into `down_split` saves ~0.1 ms, `attn_res_row` (0.53 ms) is the other
-    candidate: ~1-2% in all.
+    checkpoint. Once it pulls: `bench/context_bench.py` against both on this GPU.
 
 ## Tried and dropped
 
 - Verify-side MoE kernel work [NS]: Marlin already reads ~900 GB/s; a second verified token
+  costs less than double because tokens share experts. A warp-GEMV MoE for 1-4 tokens [AX]
+  reaches ~390 GB/s per expert: below Marlin here.
 - W8 attention/head kernels [NS, item 35]: up to 32 rows they read 75-90% of bandwidth
   (qkvr 765-800 GB/s, the head 870-930); past 32 rows they are bound by the dequant and
   MMAs (qkvr at 96 rows ~62 TFLOPS). Ordering the grid so row tiles of a column run
   together (weights from L2) changed nothing. Left: o (few column tiles), <1% of a step.
 - SiTU fused into the experts' w13 epilogue [AX, item 34]: `_swiglu_kernel` is 0.12 ms of a
   22 ms step at 6 requests (0.5%), and each try rebuilds Marlin's C++.
-  costs less than double because tokens share experts. A warp-GEMV MoE for 1-4 tokens [AX]
-  reaches ~390 GB/s per expert: below Marlin here.
 - Screening the Markov head on the base logits' top-k [BS]: acceptance collapsed (counting
   6.6 -> 2.9 tokens/step); the right token comes from the Markov bias.
 - A drafter-only INT4 copy of the LM head [HQ / BS 2-bit screen]: -1.5% step time for 0.23
@@ -142,7 +121,7 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
   (7 is the way).
 - HyperQwen's `kv-cache-seat-budget` (its `KVCacheGroup` API differs here),
   `terminal-request-progress` (does not apply), `tokenize-v1-route` (not needed).
-- The release's MXFP8 experts on layers 20-23 [BS] (`prepare/mix_experts.py`): KL median
+- The release's MXFP8 experts on layers 20-23 [BS]: KL median
   0.0027 vs 0.0030 (noise floor 0.0003), top-1 92.5% vs 92.35%, for +1.94 GiB (~110k tokens
   of context); layer 23 alone changes nothing.
 - A draft vocabulary subset [HQ `qwen3_5-mtp-draft-vocab`]: base logits and Markov fold on

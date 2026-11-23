@@ -12,6 +12,7 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$REPO"
 OUT=${1:-.local/memory_matrix.tsv}; PORT=${PORT:-18030}
 mkdir -p .local/memmatrix
+source scripts/server-lib.sh
 COMBOS=${COMBOS:-"gpu:dspark:1:6 gpu:dspark:0:6 gpu:off:1:6 gpu:off:0:6 host:dspark:1:6 host:off:1:6 none:dspark:1:6 none:off:1:6 gpu:dspark:1:1 gpu:dspark:1:16 gpu:dspark:1:32 gpu:dspark:1:64 gpu:off:1:64 gpu:dspark:1:6:1024 gpu:dspark:0:6:1024 gpu:off:1:6:1024"}
 [ -f "$OUT" ] || printf 'vision\tspec\tasync\tmax_seqs\tnbt\tmax_len_fits\tpool_tokens\tweights_gib\n' > "$OUT"
 for c in $COMBOS; do
@@ -23,18 +24,15 @@ for c in $COMBOS; do
 	host) env_args+=(HYPERINKLING_VISION_HOST=1) ;;
 	none) env_args+=(IMAGES=0) ;;
 	esac
-	env "${env_args[@]}" MAX_LEN=auto ./start.sh > "$log" 2>&1 &
-	sp=$!
+	start_server "$PORT" "$log" "${env_args[@]}" MAX_LEN=auto ./start.sh
 	for _ in $(seq 200); do
 		grep -qE 'GPU KV cache size|Engine core initialization failed' "$log" && break
-		kill -0 $sp 2>/dev/null || break
+		server_alive || break
 		sleep 3
 	done
 	fits=$(grep -oE 'reduced max_model_len from [0-9]+ to [0-9]+' "$log" | tail -1 | grep -oE '[0-9]+$')
 	pool=$(grep -m1 -oE 'GPU KV cache size: [0-9,]+' "$log" | grep -oE '[0-9,]+$' | tr -d ,)
 	weights=$(grep -m1 -oE 'Model loading took [0-9.]+ GiB' "$log" | grep -oE '[0-9.]+')
-	for p in $(pgrep -f '[v]llm serve'); do kill "$p"; done
-	for _ in $(seq 60); do pgrep -f '[v]llm serve' > /dev/null || break; sleep 2; done
-	wait $sp 2>/dev/null
+	stop_server
 	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$vision" "$spec" "$async" "$seqs" "$nbt" "${fits:-?}" "${pool:--}" "${weights:-?}" | tee -a "$OUT"
 done

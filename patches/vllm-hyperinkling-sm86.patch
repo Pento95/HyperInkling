@@ -1,4 +1,4 @@
-From 4d1d6c15b3c26d3d53ddbfc37a954972b87ee75d Mon Sep 17 00:00:00 2001
+From ab6bbdaf56d9a3488c8397766286e928a9c7b1be Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -96,9 +96,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/speculator.py            |  24 +-
  vllm/models/inkling2/speculator_config.py     |  13 +-
  vllm/v1/core/sched/scheduler.py               |  38 ++-
- vllm/v1/engine/core.py                        |  82 ++++++
+ vllm/v1/engine/core.py                        |  84 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 ++++++++++
- 33 files changed, 1862 insertions(+), 118 deletions(-)
+ 33 files changed, 1864 insertions(+), 118 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -2845,10 +2845,10 @@ index 0373c64773..34caff71d1 100644
                  # scheduling, num_output_placeholders, which covers the spec
                  # tokens). A stale rejection count predates the preemption
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 6c83d46bb1..e478d1f459 100644
+index 6c83d46bb1..099aa36f27 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
-@@ -127,6 +127,68 @@ HANDSHAKE_TIMEOUT_MINS = 5
+@@ -127,6 +127,70 @@ HANDSHAKE_TIMEOUT_MINS = 5
  _R = TypeVar("_R")  # Return type for collective_rpc
  
  
@@ -2861,8 +2861,9 @@ index 6c83d46bb1..e478d1f459 100644
 +    stepping with a stale snapshot (e.g. a request parked
 +    WAITING_FOR_REMOTE_KVS while the loop falls through to the input queue)
 +    is still reported against its current state. `_last_done` is a plain
-+    float written only by the main loop; a lock here could participate in
-+    exactly the cross-thread stall this class exists to report. The thread is
++    float; a lock here could participate in
++    exactly the cross-thread stall this class exists to report. While nothing is
++    live the thread refreshes the clock, so idle time is not a stall. It is
 +    a daemon; it dies with the EngineCore process.
 +    """
 +
@@ -2893,14 +2894,15 @@ index 6c83d46bb1..e478d1f459 100644
 +
 +    def _run(self) -> None:
 +        while not self._stop.wait(self._check_interval_s):
-+            gap = time.monotonic() - self._last_done
-+            if gap < self._threshold_s or self._stall_logged:
-+                continue
 +            try:
 +                running, waiting = self._get_counts()
 +            except Exception:  # noqa: BLE001 - never kill the sentinel
 +                continue
-+            if (running + waiting) > 0:
++            if running + waiting == 0:
++                self._last_done = time.monotonic()
++                continue
++            gap = time.monotonic() - self._last_done
++            if gap >= self._threshold_s and not self._stall_logged:
 +                self._stall_logged = True
 +                logger.warning(
 +                    "EngineCore stall: no completed step for %.0f s "
@@ -2917,7 +2919,7 @@ index 6c83d46bb1..e478d1f459 100644
  class EngineCore:
      """Inner loop of vLLM's Engine."""
  
-@@ -1417,6 +1479,24 @@ class EngineCoreProc(EngineCore):
+@@ -1417,6 +1481,24 @@ class EngineCoreProc(EngineCore):
                  internal_dp_balancing,
              )
  
@@ -2942,7 +2944,7 @@ index 6c83d46bb1..e478d1f459 100644
              # Initialize fault tolerance settings.
              self.enable_fault_tolerance = (
                  vllm_config.parallel_config.enable_fault_tolerance
-@@ -1890,6 +1970,8 @@ class EngineCoreProc(EngineCore):
+@@ -1890,6 +1972,8 @@ class EngineCoreProc(EngineCore):
              self.output_queue.put_nowait(output)
          # Post-step hook.
          self.post_step(model_executed)
