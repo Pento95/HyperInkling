@@ -6,7 +6,7 @@ fetched with `hf download --include` only when chosen.
 
 | phase | items |
 |---|---|
-| 2, the checkpoint (new files on HF) | 56, 8, 11, 12, 33 |
+| 2, the checkpoint (new files on HF) | 8, 11, 12, 33 |
 | 3, context (best effort) | 18, 19, 13, 38, 39, 55 |
 | 4, speed and upstream | 10, 7, 21, 22, 32, 51 |
 
@@ -32,16 +32,9 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     GB/s on 201k x 2304, INT8 ~900).
 12. **Attention 4-bit** [NS] (GPTQ + int4 GEMV): halves the bytes, but the small attention
     matrices are latency-bound (35): measure the step, not GB/s.
-    Also only layers 0-5 and 18-23, the loop core staying INT8 (56): half the bytes saved but
+    Also only layers 0-5 and 18-23, the loop core staying INT8: half the bytes saved but
     12 of the 48 visits. Keep it if the KL median does not get worse and the context or the step
     gains. Does not apply to 11: the head runs once per token.
-56. **Loop-core attention in bf16** ([hxyulin](https://huggingface.co/hxyulin/Inkling-2-Mini-Outer-Attention-FP8),
-    an FP8 recipe for the Ingine engine on a 5090, which keeps layers 6-17 in bf16): their
-    weights run three times per token, so an INT8 error may repeat at each pass. Let
-    `HYPERINKLING_ATTN_W8` take a layer list; compare KL median, step time and context with
-    all-INT8 (est. ~300 MiB, ~17k tokens, and slower steps). The expected KL gain is
-    small (all load-time conversions together: 0.0028 -> 0.0032). A wizard knob only if the KL
-    improves.
 33. **llm-compressor / compressed-tensors** [LC, AR #69141]: llm-compressor calibrates GPTQ,
     AWQ and SmoothQuant schemes on the HF model and writes compressed-tensors checkpoints;
     #69141 runs such experts (W4A16, W4A8, W8A8, FP8) on Humming. Three uses here:
@@ -109,6 +102,9 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 
 ## Tried and dropped
 
+- Loop-core attention (layers 6-17) in bf16, as [hxyulin's recipe](https://huggingface.co/hxyulin/Inkling-2-Mini-Outer-Attention-FP8)
+  does: all load-time conversions and the FP8 KV together cost 0.0001 of KL median (0.0030 ->
+  0.0031), for ~17k tokens of context.
 - Verify-side MoE kernel work [NS]: Marlin already reads ~900 GB/s; a second verified token
   costs less than double because tokens share experts. A warp-GEMV MoE for 1-4 tokens [AX]
   reaches ~390 GB/s per expert: below Marlin here.
