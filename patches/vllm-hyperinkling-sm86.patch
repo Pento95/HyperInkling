@@ -1,4 +1,4 @@
-From 7640aa31e7156d9fdfe3f6fd5cc508a08c0be409 Mon Sep 17 00:00:00 2001
+From 1fb00c5caea31509a4d9f57d239f0c4410b4213d Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -62,6 +62,8 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
 - sconv metadata: padding rows start at num_actual_tokens, so the
   >256-token tile skip in _sconv_kernel keeps the cache taps of a tile
   that mixes real and padding rows (upstream bug).
+- disable_any_whitespace also reaches structural tags, which is how Inkling's
+  parser asks for JSON (the server-wide part of vllm#68990).
 - Serving, after HyperQwen: --api-key guards every path but /health,
   /ping, /load, /version (auth-deny-default); stall sentinel
   (VLLM_ENGINE_STALL_SENTINEL_S, engine-stall-sentinel); continuous usage
@@ -104,7 +106,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/core/single_type_kv_cache_manager.py  |   4 +
  vllm/v1/engine/core.py                        |  84 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
- 35 files changed, 2018 insertions(+), 118 deletions(-)
+ vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
+ 36 files changed, 2058 insertions(+), 119 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -3285,6 +3288,62 @@ index 0000000000..4cd88f259e
 +            self.cost[key] = (ms, 1)
 +        else:
 +            self.cost[key] = (old[0] + _COST_EMA * (ms - old[0]), old[1] + 1)
+diff --git a/vllm/v1/structured_output/backend_xgrammar.py b/vllm/v1/structured_output/backend_xgrammar.py
+index d5c2ec4ecc..9d2620836e 100644
+--- a/vllm/v1/structured_output/backend_xgrammar.py
++++ b/vllm/v1/structured_output/backend_xgrammar.py
+@@ -161,7 +161,13 @@ class XgrammarBackend(StructuredOutputBackend):
+             )
+         elif request_type == StructuredOutputOptions.STRUCTURAL_TAG:
+             s_tag = json.loads(grammar_spec)
+-            if "structures" in s_tag:
++            if self.disable_any_whitespace and "structures" not in s_tag:
++                # Structural tags have no any_whitespace or separators option: the
++                # JSON nodes are rewritten to match the JSON paths (vllm#68990).
++                ctx = self.full_vocab_compiler.compile_structural_tag(
++                    _without_json_whitespace(xgr.StructuralTag.model_validate(s_tag))
++                )
++            elif "structures" in s_tag:
+                 # Falling back to deprecated method of compiling structural tag
+                 tags = [
+                     xgr.StructuralTagItem(
+@@ -570,3 +576,36 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
+         "XGrammar structured outputs backend "
+         "does not support this structured outputs specification"
+     )
++
++
++def _without_json_whitespace(tag: "xgr.StructuralTag") -> "xgr.StructuralTag":
++    """Forbid whitespace in the JSON values of a structural tag: each JSON-style node
++    becomes the grammar the JSON paths compile. Whitespace inside string values is
++    unchanged; other styles (XML tool calls) are left alone. From vllm#68990 (only the
++    server-wide flag; nodes with `excludes` keep their schema, a grammar cannot)."""
++    # Imported here, as xgrammar is loaded lazily.
++    from pydantic import BaseModel
++    from xgrammar.structural_tag import GrammarFormat, JSONSchemaFormat
++
++    def convert(node: Any) -> Any:
++        if (
++            isinstance(node, JSONSchemaFormat)
++            and node.style == "json"
++            and not node.excludes
++        ):
++            grammar = xgr.Grammar.from_json_schema(
++                json.dumps(node.json_schema),
++                any_whitespace=False,
++                separators=(",", ":"),
++                any_order=node.any_order,
++            )
++            return GrammarFormat(grammar=str(grammar))
++        if isinstance(node, BaseModel):
++            for name in type(node).model_fields:
++                setattr(node, name, convert(getattr(node, name)))
++        elif isinstance(node, list):
++            return [convert(item) for item in node]
++        return node
++
++    tag.format = convert(tag.format)
++    return tag
 -- 
 2.56.1
 

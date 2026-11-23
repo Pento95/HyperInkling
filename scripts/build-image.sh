@@ -6,7 +6,8 @@
 #
 # A tag already on its registry is refused (published images never move: bump the version).
 # The built image runs scripts/verify-image.py on the GPU (the compiled ops work on sm86).
-# Env: MAX_JOBS (compile jobs, default: nproc - 1), NVCC_THREADS (2), DOCKER (docker).
+# Env: MAX_JOBS (compile jobs, default: nproc - 1), NVCC_THREADS (2), DOCKER (docker),
+# BUILD_ARGS (more flags for the vLLM build, e.g. "--build-arg FINAL_BASE_IMAGE=...").
 set -euo pipefail
 cd "$(dirname "$0")/.."
 TAG=${1:-hyperinkling:latest}
@@ -22,7 +23,7 @@ fi
 
 "$DOCKER" build --network=host -f vllm/docker/Dockerfile --target vllm-openai \
 	--build-arg torch_cuda_arch_list='8.6' \
-	--build-arg max_jobs="$JOBS" --build-arg nvcc_threads="${NVCC_THREADS:-2}" \
+	${BUILD_ARGS:-} --build-arg max_jobs="$JOBS" --build-arg nvcc_threads="${NVCC_THREADS:-2}" \
 	-t hyperinkling-vllm:sm86 vllm
 "$DOCKER" build --network=host --build-arg VLLM_IMAGE=hyperinkling-vllm:sm86 -t "$TAG" .
 "$DOCKER" run --rm --gpus all --entrypoint python3 "$TAG" scripts/verify-image.py \

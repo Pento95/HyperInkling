@@ -152,6 +152,8 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   only shrink that, so an A4 page at 300 ppi (5488 tokens) passed validation and then
   waited with no error. Fixed in `processing.py` (the override can grow the profiled
   page up to 4096 px); `start.sh` sets `IMAGE_MAX_W`/`_H` and `--encoder-cache-size`.
+- **`disable_any_whitespace` did nothing for Inkling**: its parser wraps JSON in a structural
+  tag, where the xgrammar backend ignores the flag (vllm#68990; drop our part when it merges).
 - **The KV CPU tier needs prefix caching on**; it worked first time with Inkling's
   hybrid groups.
 - **Greedy output depends on the verify length.** Each `SPEC_K` runs different kernel

@@ -94,6 +94,19 @@ of ~40): it changes prefill, not decode, which is bandwidth-bound. DSpark is los
 target verifies every draft); how much it gains depends on the text: most on code, structured
 output and answers that quote the prompt, least on free prose like these summaries.
 
+A field report on a **3090 (not Ti)**, power limit 320 W, gpu-unlock active, 0.1.2, same bench:
+
+| | 1 request, no DSpark | 1 request, DSpark | 6 requests, no DSpark | 6 requests, DSpark |
+|---|---|---|---|---|
+| prefill, per request, 8k context | 5,745 tok/s | 5,770 tok/s | 2,124 tok/s | 2,093 tok/s |
+| prefill, aggregate, 8k context | 5,745 tok/s | 5,770 tok/s | 5,803 tok/s | 5,800 tok/s |
+| decode, per request, 8k context | 123 tok/s | 268 tok/s | 63 tok/s | 102 tok/s |
+| decode, aggregate, 8k context | 123 tok/s | 268 tok/s | 381 tok/s | 611 tok/s |
+| prefill, per request, 32k context | 4,805 tok/s | 4,876 tok/s | 1,979 tok/s | 1,973 tok/s |
+| prefill, aggregate, 32k context | 4,805 tok/s | 4,876 tok/s | 4,888 tok/s | 4,877 tok/s |
+| decode, per request, 32k context | 116 tok/s | 180 tok/s | 54 tok/s | 98 tok/s |
+| decode, aggregate, 32k context | 116 tok/s | 180 tok/s | 326 tok/s | 590 tok/s |
+
 ## Context and the knobs that trade it
 
 Longest single request, 8 requests at once, KV at 8 bits, the defaults otherwise

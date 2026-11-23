@@ -10,7 +10,7 @@ fetched with `hf download --include` only when chosen.
 | 3, context (best effort) | 18, 19, 13, 38, 39, 55 |
 | 4, speed and upstream | 10, 7, 21, 22, 32, 51 |
 
-Released: `ghcr.io/pento95/hyperinkling:0.1.2` (compose default) and two HF checkpoints, the
+Released: `ghcr.io/pento95/hyperinkling:0.1.3` (compose default) and two HF checkpoints, the
 original (README = docs/MODEL_CARD.md) and the uncensored one (README =
 docs/MODEL_CARD_UNCENSORED.md): re-upload a card when it changes. A new image goes with a new
 tag (`scripts/build-image.sh` refuses a published one) and the compose default.
