@@ -6,9 +6,9 @@ fetched with `hf download --include` only when chosen.
 
 | phase | items |
 |---|---|
-| 2, the checkpoint (new files on HF) | 8, 11, 12, 33 |
-| 3, context (best effort) | 18, 19, 13, 38, 39, 55 |
-| 4, speed and upstream | 10, 7, 21, 22, 32, 51 |
+| 2, the checkpoint (new files on HF) | 33 |
+| 3, context (best effort) | 18, 13, 55 |
+| 4, speed and upstream | 58, 10, 7, 21, 22, 32 |
 
 Released: `ghcr.io/pento95/hyperinkling:0.1.3` (compose default) and two HF checkpoints, the
 original (README = docs/MODEL_CARD.md) and the uncensored one (README =
@@ -21,24 +21,16 @@ Where each idea comes from: **[HQ]** HyperQwen (github.com/syv-ai/HyperQwen, `pa
 [#69141](https://github.com/vllm-project/vllm/pull/69141) (compressed-tensors experts),
 **[AX]** github.com/agent2x0r/inkling2-sm86-kernels (2x3090 bring-up, `labs/`, `csrc/`),
 **[C3]** club-3090 (github.com/noonghunna/club-3090, its `vllm-inkling` image recipe),
-**[LC]** [llm-compressor](https://github.com/vllm-project/llm-compressor), **[IK]** the model's
+**[CD]** crazydiamond-on-ampere (github.com/Mr-Moonsilver/crazydiamond-on-ampere, KV in
+host RAM), **[LC]** [llm-compressor](https://github.com/vllm-project/llm-compressor), **[IK]** the model's
 own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 
 ## Phase 2: the checkpoint
 
-8. **Drafter GPTQ** [NS]: low priority, INT4 RTN accepts like bf16 on counting (6.6 vs 6.7).
-11. **Unembed INT4 GPTQ** [HQ fast variant]: ~0.25 ms per step, and the drafter's base
-    logits read half as much. Judge by the KL median. Needs 13 (the W4 kernel reaches ~500
-    GB/s on 201k x 2304, INT8 ~900).
-12. **Attention 4-bit** [NS] (GPTQ + int4 GEMV): halves the bytes, but the small attention
-    matrices are latency-bound (35): measure the step, not GB/s.
-    Also only layers 0-5 and 18-23, the loop core staying INT8: half the bytes saved but
-    12 of the 48 visits. Keep it if the KL median does not get worse and the context or the step
-    gains. Does not apply to 11: the head runs once per token.
 33. **llm-compressor / compressed-tensors** [LC, AR #69141]: llm-compressor calibrates GPTQ,
     AWQ and SmoothQuant schemes on the HF model and writes compressed-tensors checkpoints;
     #69141 runs such experts (W4A16, W4A8, W8A8, FP8) on Humming. Three uses here:
-    (a) a second calibration of the experts, attention and head (11, 12) to compare with
+    (a) a second calibration of the experts, attention and head to compare with
     `prepare/gptq_experts.py` by KL median; (b) loading compressed-tensors W4A16 experts by
     repacking to the Marlin layout, so community quantizations run unchanged;
     (c) W8A8 INT8 for prefill: sm86's INT8 tensor cores run at twice the bf16 rate and
@@ -48,10 +40,12 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 
 ## Phase 3: context (best effort: no DSpark, vision off the GPU)
 
-18. **4-bit KV for the global layers** [HQ KVarN]: halves the per-token KV. Then the wizard
-    needs a 4-bit column.
-19. **Least-routed experts in host RAM when the context needs room** [BS]: the way toward
-    1M without DSpark and without the vision tower on the GPU.
+18. **4-bit V in the global KV** [HQ KVarN]: KL median 0.0034 (0.0031 as served) with V in
+    4 bits, groups of 32, asymmetric, K left in E4M3: ~+20% context. K is the sensitive half
+    (K and V 4-bit g128 0.0047), a fixed codebook without scales fails on V's outlier dimensions
+    (0.0042 at best), and V 4-bit on the windowed layers too costs 0.0046, so vLLM's equal pages
+    per group need a planner change.
+
 13. **Drafter W4 at 6-16 requests** [NS]: past ~21 rows the W4 kernels
     are tensor-core bound (int4 halves the bytes per MAC, so the bound comes at half the
     rows of INT8): 1.3 ms per step at 6 requests. fp16 accumulation doubles the MMA rate on
@@ -61,14 +55,14 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 55. **Sources in bf16** (other fine-tunes): `prepare/quantize_experts.py` and
     `gptq_experts.py` read only the release's NVFP4/MXFP8 experts (as the uncensored source
     is), and a bf16 Inkling 2 Mini does not fit 24 GiB to generate the corpus and capture.
-38. **Drafter SWA layers padded into the global groups' size** [NS]: the KV manager groups 9
-    layers per block; the drafter's 2 SWA layers pad to 9 (the "350% padding" warning).
-    Small real waste per block; merging that bucket with another frees it.
-39. **Fewer bits for the least-routed experts** [NS, BS]: captured routing gives each
-    expert's frequency; 3-bit (or 2-bit) for the tail frees GiBs of context. Marlin is 4/8
-    bit only: needs a mixed-bit MoE kernel. KL median decides.
-
 ## Phase 4: speed and polish
+
+58. **Short prompts beside a long prefill** [CD's scheduler, vLLM's option]:
+    `--long-prefill-token-threshold 1024` (half of `NBT`) as a `start.sh` default. With a 120k
+    prefill running, the TTFT of ~1.5k-token prompts falls from 26.6 s (mean) to 1.9 s, the long
+    one's rises 39.5 -> 47 s and a decoding stream goes 60 -> 55 tok/s; 1536 gives 3.6 s / 43 s,
+    512 1.5 s / 58 s; `-adaptive` changes nothing. Nothing when a request is alone (33.5 s), same
+    wall time at 6 equal requests, extraction bench within noise.
 
 7. **Per-request verify length** [BS draft policy, vLLM adaptive verification]: needs decode
    graphs with per-request query lengths; docs/varlen-decode-investigation.md maps the
@@ -95,10 +89,6 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 32. **BASE to vLLM main when #69165 merges** [AR]: `patches/BASE` is its head today
     (`scripts/setup-vllm.sh` stops if a force-push removed it). #69165 hit a sampler-warmup
     OOM at `max_num_seqs` 256: keep the wizard's cap.
-51. **Against club-3090's image** [C3]: PR noonghunna/club-3090#2135 (open) adds one-card
-    slugs on `ghcr.io/noonghunna/vllm-inkling-club3090` (private so far): `single-max` 180k
-    without drafter, `single-fast` 100k with DSpark, both NBT 512, 2 requests, release
-    checkpoint. Once it pulls: `bench/context_bench.py` against both on this GPU.
 
 ## To consider
 
@@ -110,6 +100,32 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 
 ## Tried and dropped
 
+- Fewer bits, KL median (as served 0.0031, round to nearest with clip search): attention INT4
+  0.0081 (g32 0.0064, only layers 0-5 and 18-23 0.0048, g32 there 0.0042), INT6 0.0036; LM head
+  INT4 0.0042 (g64 0.0039) for ~13k tokens of context and a slower kernel; 3-bit for the 32 / 64
+  / 128 least-routed experts 0.0040 / 0.0060 / 0.0138, 2-bit for 16 0.0040.
+- Least-routed experts in host RAM [BS]: routing is flat (the 8 rarest of 128 take 1.7% of the
+  routes, 32 take 11%, 64 29%): 8 experts free ~0.75 GiB and cost ~1 ms per decoded token.
+- DSpark tuned for temperature 1.0: adaptive candidates 1,2,4,7 / 1,2,3,4,5,7 / 1,2,3, greedy
+  drafts and no lookup are within noise of the defaults or worse; `SPEC=off` is 5% (chat) to
+  2.1x (structured) slower.
+- A bf16 drafter (a bound for drafter GPTQ): 1-9% slower at one request, +4% at 6 (noise).
+- Padding of the drafter's sliding-window layers: ~15 MiB per live request (~850 tokens).
+- Against club-3090's image [C3] (`single-fast`, release checkpoint, 100k limit, NBT 512, 2 requests), decode of one
+  request at temperature 1.0, `bench/spec_bench.py`: chat 86 tok/s (here 144), code 144 (227),
+  struct 195 (288), prose 90 (157), doc 178 (246); KV pool 113k tokens (268k).
+- `NBT` above 2048: 3072 costs ~27k tokens of context and gives +1-2% prefill at 8k and 32k;
+  4096 ~65k and +5-6%. With the KV overflow in host RAM (2 GiB) the context goes 370k -> 342k and a 299k request decodes
+  at 35 tok/s instead of 52 (more of it in RAM) with no faster prefill. With 18 the cost per
+  chunk is the same and its KL does not depend on the chunk (0.0034 at 2048 and 3072).
+- KV overflow in host RAM [CD]: works, left out by choice (branch `hyperinkling/kv-host` of the
+  local `vllm/`). Blocks past the GPU's in host memory mapped in the same address range, prefill
+  through a GPU stage; lossless (KL scores and greedy text identical to the GPU-only ones).
+  Longest request 318k with 1 GiB, 370k with 2, 421k with 3. Past the GPU's share decode pays
+  ~0.7 ms per step per 1k tokens in RAM: at 1 GiB 130 tok/s at 266k and 63 at 299k, at 3 GiB 49
+  at 299k and 23 at 401k (154 at 266k all on the GPU, 76 at 308k with `SPEC=off`).
+- The whole KV in host RAM: dense global attention reads all of it at each step (25 GB/s over
+  PCIe against 900); CD's engine can because its attention is sparse.
 - Loop-core attention (layers 6-17) in bf16, as [hxyulin's recipe](https://huggingface.co/hxyulin/Inkling-2-Mini-Outer-Attention-FP8)
   does: all load-time conversions and the FP8 KV together cost 0.0001 of KL median (0.0030 ->
   0.0031), for ~17k tokens of context.

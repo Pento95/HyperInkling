@@ -68,6 +68,10 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   whole prefill chunk. Plus the window below the shared-prefix junction vLLM detects (where
   requests with the same system prompt diverge): without it they would hit only when a step
   happens to end there (`bench/prefix_hit.py`).
+- **Host memory in the KV's address range**: `cuMemCreate` with a `HOST_NUMA` location maps
+  beside device pages (VMM), and Triton kernels read it unchanged at ~25 GB/s. Decode reads a
+  block once per step; prefill attention reads the KV once per query tile, so host pages must
+  be staged on the GPU first (FOLLOWUPS, "Tried and dropped").
 - **Embeddings via UVA** (HyperQwen's `qwen3_5-embed-uva` mechanism): only the looked-up
   rows cross PCIe; frees ~23k tokens of KV.
 
@@ -108,8 +112,7 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
 - **A drafter-only INT4 copy of the LM head for the base logits does not pay**:
   393 vs 550 us at 7 rows, worse from 21 rows up (the W4 kernel reaches
   ~500 GB/s against INT8's ~900 on this 201k x 2304 shape), -1.5% step time at one
-  request for 0.23 GiB (~12k tokens of context). Revisit only with a faster W4 GEMV, or
-  as part of an INT4 GPTQ head shared with the target (FOLLOWUPS 11).
+  request for 0.23 GiB (~12k tokens of context). Revisit only with a faster W4 GEMV.
 - **Drafter KV in FP8 needed the drafter's `Attention` to get a cache config** (without
   one it is always bf16, whatever `kv_cache_dtype` the speculative config says) and a
   FlashAttention impl that only writes KV (FlashAttention refuses fp8 on SM8x; the draft
