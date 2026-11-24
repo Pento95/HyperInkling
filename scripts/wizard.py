@@ -170,8 +170,8 @@ def main():
 
     adaptive = "n"
     if spec == "dspark":
-        print("\n3a) Adaptive verify length and drafts from the context: +41-43% while the "
-              "answer copies the prompt, +20% at 6 requests, for "
+        print("\n3a) Adaptive verify length and drafts from the context: +43% while the "
+              "answer copies the prompt, +4-10% on free text and code, for "
               f"~{fmt_tokens(ADAPTIVE_COST)} of context.")
         adaptive = ask("   enable", "yn", "y")
 

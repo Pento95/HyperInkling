@@ -8,9 +8,9 @@ fetched with `hf download --include` only when chosen.
 |---|---|
 | 2, the checkpoint (new files on HF) | 33 |
 | 3, context (best effort) | 18, 13, 55 |
-| 4, speed and upstream | 58, 10, 7, 21, 22, 32 |
+| 4, speed and upstream | 10, 7, 21, 22, 32 |
 
-Released: `ghcr.io/pento95/hyperinkling:0.1.3` (compose default) and two HF checkpoints, the
+Released: `ghcr.io/pento95/hyperinkling:0.1.4` (compose default) and two HF checkpoints, the
 original (README = docs/MODEL_CARD.md) and the uncensored one (README =
 docs/MODEL_CARD_UNCENSORED.md): re-upload a card when it changes. A new image goes with a new
 tag (`scripts/build-image.sh` refuses a published one) and the compose default.
@@ -55,14 +55,8 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 55. **Sources in bf16** (other fine-tunes): `prepare/quantize_experts.py` and
     `gptq_experts.py` read only the release's NVFP4/MXFP8 experts (as the uncensored source
     is), and a bf16 Inkling 2 Mini does not fit 24 GiB to generate the corpus and capture.
-## Phase 4: speed and polish
 
-58. **Short prompts beside a long prefill** [CD's scheduler, vLLM's option]:
-    `--long-prefill-token-threshold 1024` (half of `NBT`) as a `start.sh` default. With a 120k
-    prefill running, the TTFT of ~1.5k-token prompts falls from 26.6 s (mean) to 1.9 s, the long
-    one's rises 39.5 -> 47 s and a decoding stream goes 60 -> 55 tok/s; 1536 gives 3.6 s / 43 s,
-    512 1.5 s / 58 s; `-adaptive` changes nothing. Nothing when a request is alone (33.5 s), same
-    wall time at 6 equal requests, extraction bench within noise.
+## Phase 4: speed and polish
 
 7. **Per-request verify length** [BS draft policy, vLLM adaptive verification]: needs decode
    graphs with per-request query lengths; docs/varlen-decode-investigation.md maps the
@@ -95,8 +89,9 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 56. **A server-side brake on reasoning loops** [NS]: vLLM has `repetition_detection` (per
     request) and `thinking_token_budget` (needs `--reasoning-config`). As wizard options, after
     checking them with DSpark and tool calls, if loops remain at temperature 1.0.
-57. **Public cases for `bench/loop_eval.py`** [NS]: the README's loop rates come from a private
-    session; synthetic agent transcripts (8k-100k tokens) would make them repeatable.
+57. **Public cases for `bench/loop_eval.py`** [NS]: loops were measured on one private
+    session, too few cases to publish rates; synthetic agent transcripts (8k-100k tokens) would
+    make them repeatable.
 
 ## Tried and dropped
 

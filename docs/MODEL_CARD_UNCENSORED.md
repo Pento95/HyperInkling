@@ -60,10 +60,8 @@ One calibration round (166k tokens) gave 0.0026: doubling it changed nothing mea
 
 ## Sampling
 
-Use temperature 1.0 (the default here) without `top_p`, `top_k` or `min_p` for agents and long
-sessions. The base model's card reports reasoning loops, and narrower sampling makes them more
-frequent: replaying one agent session that had already looped, 1/40 answers loop at 1.0,
-21/40 at 0.5 and 15/40 at 0.8 with `top_p` 0.9, `top_k` 20, `min_p` 0.05. Cap `max_tokens`.
+Temperature 1.0 is the default here, as in the base model. The base model's card reports long
+reasoning loops: cap `max_tokens` and the agent's turns.
 
 ## Speed and context
 

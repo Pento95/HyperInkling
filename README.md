@@ -47,12 +47,8 @@ To build the image yourself instead (~1 hour, compiles vLLM for sm86):
 The OpenAI-compatible API is at `http://127.0.0.1:8080/v1`, model `inkling-2-mini` (alias `local`, see `SERVED_ALIASES`)
 (`GET /health` when it is up; `GET /` is a 404 by design).
 
-**Sampling: temperature 1.0 (the model's default), no `top_p`/`top_k`/`min_p`, for agents and
-long sessions.** The model can fall into reasoning loops (its own card says so) and narrower
-sampling makes it worse: replaying one 41k-token agent session that had already looped, 8% of
-the answers loop at 1.0, 46% at 0.5 and 44% at 0.8 with `top_p` 0.9, `top_k` 20, `min_p` 0.05
-(240 answers each, `bench/loop_eval.py`). The INT4 experts, the INT8 layers, DSpark and the
-abliteration made no measurable difference. Clients should also cap `max_tokens`.
+**Sampling:** temperature 1.0 is the model's default. Its card reports that it can get stuck in
+long reasoning loops: cap `max_tokens` and the agent's turns.
 
 The port is published on 127.0.0.1 only: to serve other machines set `BIND=0.0.0.0` and a
 `VLLM_API_KEY` in `.env` (the wizard does both). With a key, every path except `/health`, `/ping`, `/load` and
@@ -138,13 +134,14 @@ at 1 request (427k at 6), as far as the 24 GiB allow, not to the model's 1M.
 | `MAX_LEN` | `auto` | longest request: `auto` is what the KV cache holds after warmup; a number caps it (and the boot fails if it does not fit) | none | none |
 | `ASYNC` | 1 | async scheduling (two steps in flight) | off: ~17k tokens more | off: -3 to -4% decode |
 | `NBT` | 2048 | prefill chunk (and image encodings per step) | 1024: ~24k tokens more | 1024: -8% prefill, same decode |
+| `LONG_PREFILL` | `NBT`/2 | most tokens of one prompt per step while other requests are there (no limit when it is alone); 0 = off | none | short prompts beside a 120k prefill: TTFT 26.6 -> 1.9 s; that prefill +19% |
 | `IMAGES` | 50 | images per request; 0 = no vision tower | 0: ~37k tokens more | no images |
 | `HYPERINKLING_VISION_HOST` | 0 | vision tower weights in host RAM, copied to the GPU layer by layer per image | 1: ~36k tokens more | +27 ms per A4 page |
 | `IMAGE_MAX_W` / `_H` | 1040 x 1560 | largest image: 1,014 tokens, an A4 page at ~126 ppi (two per 2048 chunk); larger ones are scaled down to it | A4 at 300 ppi (2480 x 3508, with `ENCODER_CACHE=16384`): ~5.5x the tokens per page | 300 ppi: ~5.5x the prefill per page |
 | `MAX_SEQS` | 8 | requests at once | 289k at 1, 274k at 6, 268k at 8, 256k at 16, 197k at 64 | more aggregate decode |
 | `KV_OFFLOAD_GB` | `auto` (60% of RAM - 8 GiB, at most 36) | prefix-cache tier in host RAM (`/dev/shm`) | host RAM only | evicted prefixes come back in 0.1 s instead of seconds |
-| `HYPERINKLING_SPEC_ADAPTIVE` | `2,4,7` | verify length chosen per step from these; empty = the fixed `SPEC_K` schedule | ~5k tokens | with the lookup: +41-43% copying, +20% at 6 requests |
-| `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context instead of DSpark's on a match of 8 tokens or more (lossless) | 6 MB | +7-13% while copying |
+| `HYPERINKLING_SPEC_ADAPTIVE` | `2,4,7` | verify length chosen per step from these; empty = the fixed `SPEC_K` schedule | ~5k tokens | with the lookup, against `SPEC_K`: +43% copying, +4-10% on free text and code, within noise at 6 requests |
+| `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context instead of DSpark's on a match of 8 tokens or more (lossless) | 6 MB | +10% while copying |
 | `SPEC_K` | `[[1,2,4],[3,6,3]]` | drafts verified per step, by batch size, when the adaptive length is off | none | |
 | `SPEC_DRAFT` | `probabilistic` | drafts sampled from the draft distribution | none | +15-20% on structured output at temperature > 0 |
 | `HYPERINKLING_MOE_ORDER` | 1 | each expert's rows in a fixed order: the same prefill gives the same numbers bit for bit (generation with DSpark still varies between runs) | none | 0: +0.4% decode at 6 requests |
@@ -277,6 +274,9 @@ round with a new seed; a second round of 166k tokens changed nothing measurable 
   bring-up with SM86 kernel labs): ideas for the next steps (FOLLOWUPS.md).
 - [club-3090](https://github.com/noonghunna/club-3090), which serves Inkling 2 Mini on 3090s
   too: its release guards (a published tag never moves, the compiled ops checked on the GPU).
+- [crazydiamond-on-ampere](https://github.com/Mr-Moonsilver/crazydiamond-on-ampere) (Apache-2.0):
+  its scheduler (short turns ahead of a long prefill) and its KV in host RAM prompted
+  `LONG_PREFILL` and our host-RAM experiments (FOLLOWUPS.md).
 - [llm-compressor](https://github.com/vllm-project/llm-compressor): the route for calibrated
   quantization of the parts we quantize at load today.
 

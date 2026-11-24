@@ -45,10 +45,10 @@ SPEC_DRAFT=${SPEC_DRAFT:-probabilistic}
 # The verify length chosen online per step (adaptive_k.py) from these candidates;
 # empty = the fixed SPEC_K schedule. Each candidate costs the context of one CUDA graph
 # per batch size: 2,4,7 ~5k tokens (still 262k with 6 requests and vision on the GPU),
-# 1,2,3,4,5,7 ~14k. With the lookup, against SPEC_K: +41-43% copying,
-# +20% at 6 requests, +4-6% chat and prose, the rest within noise.
+# 1,2,3,4,5,7 ~14k. With the lookup, against SPEC_K (temperature 0): +43% copying, +10% code
+# and struct, +4-5% chat and prose, 6 requests within noise.
 export HYPERINKLING_SPEC_ADAPTIVE=${HYPERINKLING_SPEC_ADAPTIVE-2,4,7}
-# Drafts from the request's own context in place of DSpark's (ops/lookup.py): +7-13% on
+# Drafts from the request's own context in place of DSpark's (ops/lookup.py): +10% on
 # top of a long verify length while the answer copies the prompt; lossless. 0 disables.
 export HYPERINKLING_LOOKUP=${HYPERINKLING_LOOKUP-1}
 # Extra speculative-config fields, as a JSON fragment starting with a comma.
@@ -62,6 +62,9 @@ ASYNC=${ASYNC:-1}
 # Prefill chunk: 2048 prefills ~8% faster than 1024 (and encodes two 1024-token images
 # per step); 1024 frees ~20k tokens of context.
 NBT=${NBT:-2048}
+# Most tokens of one prompt per step while other requests are there (none when it is alone):
+# short prompts do not wait for a long prefill. 0 disables.
+LONG_PREFILL=${LONG_PREFILL:-$((NBT / 2))}
 GPU_UTIL=${GPU_UTIL:-0.95}
 KV_DTYPE=${KV_DTYPE:-fp8}        # unit-scale E4M3, emulated on sm86 (ops/e4m3.py)
 # CPU prefix-cache tier in /dev/shm, GiB; 0 disables. auto: 60% of RAM minus 8 GiB, at most
@@ -146,6 +149,7 @@ if [ "$HOST" != 127.0.0.1 ] && [ "$HOST" != localhost ] && [ -z "${VLLM_API_KEY:
 	&& [ ! -f /.dockerenv ]; then
 	echo "[start] warning: serving $HOST without VLLM_API_KEY: anyone who reaches this port can use it." >&2
 fi
+[ "$LONG_PREFILL" != 0 ] && args+=(--long-prefill-token-threshold "$LONG_PREFILL")
 [ "$ASYNC" = 0 ] && args+=(--no-async-scheduling)
 # Decode CUDA graphs by request count: every count up to 8, then coarser steps up to
 # MAX_SEQS (a batch runs in the next larger graph; one without a graph runs eagerly).
