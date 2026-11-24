@@ -48,7 +48,7 @@ SPEC_DRAFT=${SPEC_DRAFT:-probabilistic}
 # 1,2,3,4,5,7 ~14k. With the lookup, against SPEC_K: +41-43% copying,
 # +20% at 6 requests, +4-6% chat and prose, the rest within noise.
 export HYPERINKLING_SPEC_ADAPTIVE=${HYPERINKLING_SPEC_ADAPTIVE-2,4,7}
-# Drafts from the request's own context fused with DSpark's (ops/lookup.py): +7-13% on
+# Drafts from the request's own context in place of DSpark's (ops/lookup.py): +7-13% on
 # top of a long verify length while the answer copies the prompt; lossless. 0 disables.
 export HYPERINKLING_LOOKUP=${HYPERINKLING_LOOKUP-1}
 # Extra speculative-config fields, as a JSON fragment starting with a comma.

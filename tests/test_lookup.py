@@ -37,14 +37,16 @@ def test_copies_the_continuation_of_the_longest_match():
     assert (cache[0] == 0).all() and (cache[2] == 0).all()  # other requests untouched
 
 
-def test_short_match_needs_the_drafter_to_agree():
+def test_taking_a_match_never_depends_on_the_sampled_drafts():
+    # Otherwise the drafts left in place no longer follow their q and the output is biased.
     doc = list(range(200, 230))
-    history = [*doc, 5, *doc[:6]]  # a 6-token match: below nstrong (8)
-    drafts, cache, _ = _run(history, [9] * K)
-    assert drafts == [9] * K and (cache == 0).all()
-    agreeing = doc[6:8] + [9] * (K - 2)
-    drafts, _, _ = _run(history, agreeing)
-    assert drafts == doc[6:13]
+    for length in range(1, 13):
+        history = [*doc, 5, *doc[:length]]
+        continuation = doc[length : length + K]
+        for agree in range(K + 1):
+            _, cache, look = _run(history, continuation[:agree] + [9] * (K - agree))
+            assert look.used[0].item() == (K if length >= look.nmin else 0)
+            assert torch.isinf(cache[1]).any().item() == (length >= look.nmin)
 
 
 def test_period_shorter_than_the_block_fills_only_what_follows():

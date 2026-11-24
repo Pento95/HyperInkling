@@ -45,9 +45,17 @@ To build the image yourself instead (~1 hour, compiles vLLM for sm86):
 `scripts/setup-vllm.sh && scripts/build-image.sh`, then `IMAGE=hyperinkling:latest` in `.env`.
 
 The OpenAI-compatible API is at `http://127.0.0.1:8080/v1`, model `inkling-2-mini` (alias `local`, see `SERVED_ALIASES`)
-(`GET /health` when it is up; `GET /` is a 404 by design). The port is published on
-127.0.0.1 only: to serve other machines set `BIND=0.0.0.0` and a `VLLM_API_KEY` in `.env`
-(the wizard does both). With a key, every path except `/health`, `/ping`, `/load` and
+(`GET /health` when it is up; `GET /` is a 404 by design).
+
+**Sampling: temperature 1.0 (the model's default), no `top_p`/`top_k`/`min_p`, for agents and
+long sessions.** The model can fall into reasoning loops (its own card says so) and narrower
+sampling makes it worse: replaying one 41k-token agent session that had already looped, 8% of
+the answers loop at 1.0, 46% at 0.5 and 44% at 0.8 with `top_p` 0.9, `top_k` 20, `min_p` 0.05
+(240 answers each, `bench/loop_eval.py`). The INT4 experts, the INT8 layers, DSpark and the
+abliteration made no measurable difference. Clients should also cap `max_tokens`.
+
+The port is published on 127.0.0.1 only: to serve other machines set `BIND=0.0.0.0` and a
+`VLLM_API_KEY` in `.env` (the wizard does both). With a key, every path except `/health`, `/ping`, `/load` and
 `/version` needs it, `/metrics` and `/tokenize` included.
 
 Requirements: an RTX 3090 or 3090 Ti with nothing else on it (a display on the same GPU costs
@@ -136,7 +144,7 @@ at 1 request (427k at 6), as far as the 24 GiB allow, not to the model's 1M.
 | `MAX_SEQS` | 8 | requests at once | 289k at 1, 274k at 6, 268k at 8, 256k at 16, 197k at 64 | more aggregate decode |
 | `KV_OFFLOAD_GB` | `auto` (60% of RAM - 8 GiB, at most 36) | prefix-cache tier in host RAM (`/dev/shm`) | host RAM only | evicted prefixes come back in 0.1 s instead of seconds |
 | `HYPERINKLING_SPEC_ADAPTIVE` | `2,4,7` | verify length chosen per step from these; empty = the fixed `SPEC_K` schedule | ~5k tokens | with the lookup: +41-43% copying, +20% at 6 requests |
-| `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context, fused with DSpark's (lossless) | 6 MB | +7-13% while copying |
+| `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context instead of DSpark's on a match of 8 tokens or more (lossless) | 6 MB | +7-13% while copying |
 | `SPEC_K` | `[[1,2,4],[3,6,3]]` | drafts verified per step, by batch size, when the adaptive length is off | none | |
 | `SPEC_DRAFT` | `probabilistic` | drafts sampled from the draft distribution | none | +15-20% on structured output at temperature > 0 |
 | `HYPERINKLING_MOE_ORDER` | 1 | each expert's rows in a fixed order: the same prefill gives the same numbers bit for bit (generation with DSpark still varies between runs) | none | 0: +0.4% decode at 6 requests |

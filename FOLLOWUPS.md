@@ -100,6 +100,14 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     without drafter, `single-fast` 100k with DSpark, both NBT 512, 2 requests, release
     checkpoint. Once it pulls: `bench/context_bench.py` against both on this GPU.
 
+## To consider
+
+56. **A server-side brake on reasoning loops** [NS]: vLLM has `repetition_detection` (per
+    request) and `thinking_token_budget` (needs `--reasoning-config`). As wizard options, after
+    checking them with DSpark and tool calls, if loops remain at temperature 1.0.
+57. **Public cases for `bench/loop_eval.py`** [NS]: the README's loop rates come from a private
+    session; synthetic agent transcripts (8k-100k tokens) would make them repeatable.
+
 ## Tried and dropped
 
 - Loop-core attention (layers 6-17) in bf16, as [hxyulin's recipe](https://huggingface.co/hxyulin/Inkling-2-Mini-Outer-Attention-FP8)

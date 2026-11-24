@@ -64,6 +64,13 @@ items each; about +-1 to +-3 points of noise):
 | tool calls, exact (names only) | 0.645 (0.735) | 0.615 (0.710) |
 | DocVQA as strict JSON, ANLS (valid JSON) | 0.938 (99.5%) | 0.935 (99.5%) |
 
+## Sampling
+
+Use temperature 1.0 (the default here) without `top_p`, `top_k` or `min_p` for agents and long
+sessions. The base model's card reports reasoning loops, and narrower sampling makes them more
+frequent: replaying one agent session that had already looped, 1/40 answers loop at 1.0,
+16/40 at 0.5 and 14/40 at 0.8 with `top_p` 0.9, `top_k` 20, `min_p` 0.05. Cap `max_tokens`.
+
 ## Speed with HyperInkling (RTX 3090 Ti)
 
 RTX 3090 Ti undervolted to 350 W with [gpu-unlock](https://github.com/zagitta/gpu-unlock)

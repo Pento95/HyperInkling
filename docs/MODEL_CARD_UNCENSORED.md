@@ -58,6 +58,13 @@ flips an expert dominate the mean. Measured before the server was repeatable (0.
 
 One calibration round (166k tokens) gave 0.0026: doubling it changed nothing measurable.
 
+## Sampling
+
+Use temperature 1.0 (the default here) without `top_p`, `top_k` or `min_p` for agents and long
+sessions. The base model's card reports reasoning loops, and narrower sampling makes them more
+frequent: replaying one agent session that had already looped, 1/40 answers loop at 1.0,
+21/40 at 0.5 and 15/40 at 0.8 with `top_p` 0.9, `top_k` 20, `min_p` 0.05. Cap `max_tokens`.
+
 ## Speed and context
 
 The same as the original checkpoint served by HyperInkling (same architecture, sizes and

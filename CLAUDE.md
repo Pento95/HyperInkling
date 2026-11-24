@@ -98,6 +98,8 @@ Benchmarks and quality (all need a running server):
 - `bench/spec_bench.py [port] [max_tokens] [temp|user]`: decode and draft acceptance per kind
   of text, at concurrency 1 and 6 (`user` = 0.2 for structured output, 0.5 otherwise).
   Sampling noise is about +-5%: decide on temperature 0 and step times.
+- `bench/loop_eval.py cases.jsonl out.json`: share of answers in a repetition loop per
+  sampling setting; cases are chat requests (tools are declared, never run).
 - `bench/evalscope_perf.sh <name> [port]`: 10 minutes of AA-LCR prompts (256-64k tokens) with
   `metrics_window.py` alongside. `bench/profile_spec.sh`: kernel time per step under nsys.
 - `bench/quality_battery.py download|run`: GSM8K, Hermes tool calls, DocVQA as strict JSON,

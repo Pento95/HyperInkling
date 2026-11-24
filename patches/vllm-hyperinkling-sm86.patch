@@ -1,4 +1,4 @@
-From 1fb00c5caea31509a4d9f57d239f0c4410b4213d Mon Sep 17 00:00:00 2001
+From 961e6526788d947da7a71ead1305602207ae3d79 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -55,10 +55,10 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   acceptance and measured decode step times; decode graphs for every
   candidate length.
 - Context lookup drafting (HYPERINKLING_LOOKUP=1, ops/lookup.py, after
-  HyperQwen's dflash2-lookup-drafting): the longest suffix match in the
-  request's history is fused with the DSpark drafts, point masses in the
-  draft-logits cache keep rejection sampling exact; the token history is
-  kept on the GPU while it is on.
+  HyperQwen's dflash2-lookup-drafting): a suffix match of 8 tokens or more in
+  the request's history replaces the DSpark drafts (a choice that never
+  depends on them), point masses in the draft-logits cache keep rejection
+  sampling exact; the token history is kept on the GPU while it is on.
 - sconv metadata: padding rows start at num_actual_tokens, so the
   >256-token tile skip in _sconv_kernel keeps the cache taps of a tile
   that mixes real and padding rows (upstream bug).
@@ -93,7 +93,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 ++++++++++++++
  vllm/models/inkling2/nvidia/ops/linear_w8.py  | 139 +++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
- vllm/models/inkling2/nvidia/ops/lookup.py     | 245 ++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/lookup.py     | 233 +++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_marlin.py | 272 ++++++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_sm120.py  |   6 +-
  vllm/models/inkling2/nvidia/ops/sconv.py      |   3 +-
@@ -107,7 +107,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/v1/engine/core.py                        |  84 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 36 files changed, 2058 insertions(+), 119 deletions(-)
+ 36 files changed, 2046 insertions(+), 119 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -2135,25 +2135,24 @@ index 9c5fe9ce3c..f6551a7e9e 100644
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/lookup.py b/vllm/models/inkling2/nvidia/ops/lookup.py
 new file mode 100644
-index 0000000000..ed02984e29
+index 0000000000..9103f9b745
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/lookup.py
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,233 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Drafting from the request's own context (HYPERINKLING_LOOKUP=1).
 +
 +The DSpark drafter sees a 1024-token window; a document the answer quotes can be
 +far beyond it. One Triton program per request finds the most recent occurrence of
-+the longest suffix (NMIN..NMAX tokens) of the token history and proposes the
-+tokens that followed it. The proposal is fused with the drafter's: a match of
-+`nstrong` tokens or more replaces the drafts on its own, a shorter one (down to
-+`nmin`) only where the drafter independently proposed the same first `agree_min`
-+tokens.
++the longest suffix (up to NMAX tokens) of the token history; a match of `nmin`
++tokens or more replaces the drafts with the tokens that followed it.
 +
 +Lossless: every position taken from the lookup gets a point mass on the proposed
 +token in the draft-logits cache, a legal q for the rejection sampler (acceptance
-+becomes p(x)).
++becomes p(x)). Whether to take it must depend on the history only, never on the
++sampled drafts: choosing after seeing them leaves drafts that no longer follow
++their q, and the output no longer follows p.
 +
 +After HyperQwen's dflash2-lookup-drafting (syv-ai/HyperQwen, Apache-2.0).
 +"""
@@ -2244,8 +2243,6 @@ index 0000000000..ed02984e29
 +    idx_mapping_ptr,
 +    idx_mapping_stride,
 +    nmin,
-+    nstrong,
-+    agree_min,
 +    K: tl.constexpr,
 +    BLOCK_K: tl.constexpr,
 +):
@@ -2260,13 +2257,8 @@ index 0000000000..ed02984e29
 +    kmask = idx < K
 +    match_len = tl.load(len_ptr + req)
 +    valid = tl.load(valid_ptr + req)
-+    drafted = tl.load(draft_ptr + req * draft_stride + idx, mask=kmask, other=0)
 +    looked = tl.load(look_ptr + req * K + idx, mask=kmask, other=0).to(tl.int64)
-+    disagree = (drafted != looked) & (idx < valid) & kmask
-+    # Positions the match did not supply are not agreement.
-+    agree = tl.minimum(tl.min(tl.where(disagree, idx, K)), valid)
-+    take = (match_len >= nstrong) | ((match_len >= nmin) & (agree >= agree_min))
-+    if take & (valid > 0):
++    if (match_len >= nmin) & (valid > 0):
 +        tl.store(
 +            draft_ptr + req * draft_stride + idx, looked, mask=kmask & (idx < valid)
 +        )
@@ -2311,13 +2303,11 @@ index 0000000000..ed02984e29
 +        max_num_reqs: int,
 +        k: int,
 +        device: torch.device,
-+        nmin: int = 6,
-+        nstrong: int = 8,
-+        agree_min: int = 2,
++        nmin: int = 8,
 +        nmax: int = 32,
 +        search_max: int = 1 << 30,
 +    ):
-+        self.k, self.nmin, self.nstrong, self.agree_min = k, nmin, nstrong, agree_min
++        self.k, self.nmin = k, nmin
 +        self.nmax, self.search_max = nmax, search_max
 +        self.tokens = torch.zeros(max_num_reqs, k, dtype=torch.int32, device=device)
 +        self.match_len = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
@@ -2364,8 +2354,6 @@ index 0000000000..ed02984e29
 +            idx_mapping,
 +            idx_mapping_stride,
 +            self.nmin,
-+            self.nstrong,
-+            self.agree_min,
 +            K=self.k,
 +            BLOCK_K=triton.next_power_of_2(self.k),
 +            num_warps=1,
