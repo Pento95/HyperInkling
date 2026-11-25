@@ -31,6 +31,14 @@ SERVED_ALIASES=${SERVED_ALIASES:-local}
 # the server behind something that authenticates (a VPN, a reverse proxy).
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8080}
+# Status page (scripts/status_page.py): a second process beside the engine, reading it over
+# 127.0.0.1 - /metrics counters, nvidia-smi for the card it was given, and PID 1's argv for
+# the shape it started with. Read-only, stdlib only, about 0.5% of one core. DASHBOARD=0 off.
+# DASHBOARD_HOST is the address *inside* the container (compose publishes it on DASH_BIND,
+# 127.0.0.1 by default: the published address is what decides who can reach the page).
+DASHBOARD=${DASHBOARD:-1}
+DASHBOARD_HOST=${DASHBOARD_HOST:-$HOST}
+DASHBOARD_PORT=${DASHBOARD_PORT:-8082}
 MAX_SEQS=${MAX_SEQS:-8}
 # Speculative decoding with the bundled DSpark drafter (on unless SPEC=off). The
 # block drafter always drafts 7 tokens; SPEC_K says how many of them the target
@@ -196,6 +204,14 @@ echo "=================================================="
 WARMUP=${WARMUP:-1}
 if [ "$WARMUP" = 1 ] && [ -z "${PROFILE:-}" ]; then
 	python3 "$REPO/scripts/warmup.py" "$PORT" "$SERVED_NAME" "$HOST" &
+fi
+# The page starts with the engine and goes with it: PID 1 is vLLM, so the container owns both
+# lifecycles. It only ever reads, so it is never a reason not to serve - no wait, no failure
+# path. Off when profiling: a clean process tree is the point of PROFILE=1.
+if [ "$DASHBOARD" != 0 ] && [ -z "${PROFILE:-}" ]; then
+	python3 "$REPO/scripts/status_page.py" --bind "$DASHBOARD_HOST" --port "$DASHBOARD_PORT" \
+		--url "http://127.0.0.1:$PORT" &
+	echo "Status page: http://$([ "$DASHBOARD_HOST" = 0.0.0.0 ] && echo localhost || echo "$DASHBOARD_HOST"):$DASHBOARD_PORT"
 fi
 exec taskset -c "$CPUS" "${wrap[@]}" vllm serve "$MODEL" \
 	--served-model-name "$SERVED_NAME" $SERVED_ALIASES --host "$HOST" --port "$PORT" \

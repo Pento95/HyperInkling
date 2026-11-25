@@ -72,6 +72,29 @@ python3 scripts/wizard.py         # the same questions, writes .env
 Tested on Fedora 44 (gcc 15 next to the default gcc 16, CUDA 13.3). Other distributions
 should work where CUDA 13 and a gcc it accepts are installed; that is best effort.
 
+### Status page
+
+`start.sh` starts a small dashboard beside the engine: **http://127.0.0.1:8082** (compose
+publishes it on `DASH_BIND`, localhost by default). One file, standard library only, no
+dependencies and no assets: it reads the server's own `/metrics`, `/version`, `/load` and
+`/v1/models`, `nvidia-smi` for the card the container was given, and the engine's command
+line for the shape it started with - so what it shows is what the launcher derived, not what
+`.env` said. Read-only: about 0.5% of one core and 29 MB.
+
+| | |
+|---|---|
+| Live | decode and prefill tok/s (2 s window), draft acceptance, GPU utilization - 15 min of 1 s samples |
+| Since boot | requests by `finish_reason`, running/waiting, preemptions, admission rejections, prompt tokens by source, prefix hits (GPU cache and CPU tier), drafted/verified/accepted tokens, tool calls, KV usage, TTFT |
+| Started as | `--max-num-seqs`, prefill chunk and long-prefill cap, KV dtype and headroom, CPU tier, DSpark window, image limits |
+
+`GET /api/status` is the same data as JSON (with the history), and `GET /health` answers 503
+while the engine is not - enough to wire it to a monitor. `DASHBOARD=0` turns it off,
+`DASHBOARD_PORT` moves it. vLLM is PID 1, so the page starts with the engine and goes with
+it; it never writes and never restarts anything.
+
+vLLM exposes no per-request detail (no slot states, no per-request progress), so everything
+on the page is aggregate-since-boot - and the page says so under its own footer.
+
 ## Speed
 
 RTX 3090 Ti undervolted to 350 W with [gpu-unlock](https://github.com/zagitta/gpu-unlock)
@@ -252,10 +275,10 @@ round with a new seed; a second round of 166k tokens changed nothing measurable 
 | `scripts/wizard.py` | asks the questions, writes `.env` |
 | `Dockerfile`, `docker-compose.yml`, `scripts/build-image.sh` | the container |
 | `patches/` | the vLLM patch and its base commit (`BASE`) |
-| `scripts/` | `setup-vllm.sh`, `build-vllm.sh`, `serve-try.sh`, `quick_bench.py`, `warmup.py`, `verify-image.py` |
+| `scripts/` | `setup-vllm.sh`, `build-vllm.sh`, `serve-try.sh`, `quick_bench.py`, `warmup.py`, `status_page.py`, `verify-image.py` |
 | `prepare/` | INT4 packing, RTN and GPTQ converters, calibration corpus and capture |
 | `bench/` | speed (fixed contexts, per kind of text, long prompts, server-side metrics), memory matrix, KL eval, quality battery, profiles |
-| `tests/` | kernel and processor tests (`venv/bin/python -m pytest -q tests/`) |
+| `tests/` | kernel and processor tests (`venv/bin/python -m pytest -q tests/`; `test_status_page.py` needs no GPU and no server) |
 | `docs/` | measured tables |
 
 ## Credits

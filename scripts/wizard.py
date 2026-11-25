@@ -235,6 +235,10 @@ def main():
                check=lambda v: v == "auto" or v >= 0 or print("  0 or more, or auto"))
 
     expose = ask("\n10) Reachable from other machines? (needs an API key)", "yn", "n")
+    dash = ask("\n11) Status page on http://127.0.0.1:8082: live decode and prefill rates, "
+               "prefix hits, draft\n     acceptance, KV usage, the card's temperature and watts. "
+               "Read-only, runs beside\n     the engine, localhost only unless you set DASH_BIND.",
+               "yn", "y")
     env = {
         "MAX_SEQS": seqs,
         "MAX_LEN": max_len,
@@ -243,6 +247,7 @@ def main():
         "NBT": nbt,
         "KV_OFFLOAD_GB": tier,
         "GPU_UTIL": round(0.95 - headroom / 24, 3),
+        "DASHBOARD": 1 if dash == "y" else 0,
     }
     repo, local = CHECKPOINTS[checkpoint]
     if checkpoint != "original":  # compose downloads HF_REPO into models/CHECKPOINT

@@ -75,6 +75,51 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
 - **Embeddings via UVA** (HyperQwen's `qwen3_5-embed-uva` mechanism): only the looked-up
   rows cross PCIe; frees ~23k tokens of KV.
 
+## Status page (scripts/status_page.py)
+
+- **A second process in the same container, not a second service.** A separate compose service
+  cannot read what the page shows: the CPU tier and the multimodal processor cache live in the
+  engine's private `/dev/shm` (`ipc: private`), the engine's argv is the shape it started with,
+  and a service that wants `nvidia-smi` has to be granted the GPU - which lets it allocate VRAM
+  on the card. Beside the engine costs one Python process (measured: 0.5% of one core, 29 MB
+  with the 900-sample ring) and keeps PID 1 = vLLM, so signals, the Dockerfile healthcheck and
+  `docker compose logs` behave exactly as before. It is started the way `warmup.py` already is:
+  backgrounded before the `exec`, and never a reason not to serve. Skipped under `PROFILE=1`,
+  where a clean process tree is the point.
+- **Uptime from `process_start_time_seconds`, not `docker inspect`.** The engine exports its own
+  start time; measured 1.5 s from the container's `State.StartedAt` (23,629 s vs 23,631 s of
+  uptime on the two readers at once), so the page needs no docker CLI, no socket and no host
+  privileges - and works when it runs outside the container too. A counter reset (generation
+  tokens going backwards) flushes the windows and re-reads it, which is also how a restart is
+  caught without asking anything.
+- **The GPU tile is whichever card NVML gives this process.** Inside a container the host's GPU 1
+  is index 0 and no other card is visible; shipping an index in the image would be a host
+  assumption. No index asked, no index assumed; with no `nvidia-smi` the tile degrades and the
+  rest of the page is unaffected.
+- **One file: no stylesheet, no webfont.** Every `var(--…)` used by the markup is defined in the
+  token block at the top of `HTML`, and a test fails if one is missing - an undefined custom
+  property is silent (the color simply is not there). Outfit (SIL OFL 1.1) is the closest
+  freely-licensed match for the look if anyone wants it: `/web/` exists for that opt-in, serves
+  two extensions, and refuses anything that resolves outside `web/`.
+- **The API key is forwarded** (`VLLM_API_KEY` is in the page's own environment inside the
+  container): `--api-key` guards `/metrics` and `/v1/models`, leaving only `/health`, `/ping`,
+  `/load` and `/version` open, so a keyed server would otherwise show a half-empty page.
+- **Metric lookups key on the exact metric name**, so `vllm:generation_tokens_total` can never
+  pick up `…_created` (the classic Prometheus footgun). `get_one` takes the first series when a
+  name carries several label sets; that cannot happen for one served model, which is the only
+  shape here, and `get_all` sums where multiple series are expected (prompt tokens by `source`).
+- **`--flag=value` is read as well as the space form** `start.sh` emits. A native install copies
+  vLLM's own docs, and a panel row quietly missing because of a spelling would be worse than the
+  panel not existing.
+- **`prompt_tps` under-samples prefill bursts (measured, open).** Its window is 1 s
+  (`PROMPT_WINDOW_S`), while a ~1k-token prefix-cached prefill finishes in ~0.2 s: whether the
+  number appears at all depends on where the sample lands. Two instances reading the same
+  engine 0.3 s apart saw byte-identical per-sample deltas (2889, 2151, 2075, 1504, 1500, 1339
+  tokens) and reported medians of 8.9 and 249 tok/s for the same 45 seconds - so the field is
+  correct but reads as luck, and `CACHE_TTL` (5 s) can hold a stale payload across a whole
+  burst. Options: widen the window to ~5 s and label it, or keep 1 s and accept the gaps.
+  Decode is unaffected (2 s window, medians 49.5 vs 49.4).
+
 ## DSpark (speculative decoding)
 
 - **It is a block drafter: it always drafts 7 tokens** (`num_speculative_tokens` must be
