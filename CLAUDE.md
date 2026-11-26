@@ -46,6 +46,7 @@ Key mechanisms of the port (spread across several files):
 - Loop controllers and sconv taps on Triton batched GEMVs (`ops/bgemv.py`).
 - Marlin rows in a fixed order per expert (`order_rows`, `HYPERINKLING_MOE_ORDER`): the same
   prefill alone gives the same numbers bit for bit (generation with DSpark does not repeat).
+- Tool calls: `HYPERINKLING_TOOL_GRAMMAR` (`vllm/parser/inkling.py`), xgrammar on the tool blocks.
 - `HYPERINKLING_CAPTURE_DIR` enables the MoE input/routing capture hook used by GPTQ.
 - DSpark speculative decoding (on by default, `SPEC`): the block drafter always drafts 7;
   `SPEC_K` sets how many the target verifies per batch size (vLLM dynamic speculative
@@ -54,6 +55,9 @@ Key mechanisms of the port (spread across several files):
   Online verify length (`HYPERINKLING_SPEC_ADAPTIVE`, default 2,4,7):
   `vllm/v1/spec_decode/dynamic/adaptive_k.py`. Context lookup drafts (`HYPERINKLING_LOOKUP`,
   default on): `ops/lookup.py`.
+- KV pool sized from the memory free after warmup, less `KEEP_FREE_GB` (default 2 GiB, never
+  below the measured activation peak) instead of vLLM's ~3.25 GiB margin
+  (`HYPERINKLING_KV_KEEP_FREE_GIB`, `v1/worker/extensible_kv_cache.py`).
 - Images over the profiled page are scaled down in `processing.py` (`fit_to_budget`);
   `HYPERINKLING_VISION_HOST=1` streams the vision tower from host RAM per layer (`model.py`).
 - The small loop kernels carry the reference numerics (fixed summation orders, no FMA
@@ -73,13 +77,13 @@ PORT=18030 ./start.sh                 # test instance on another port
 PROFILE=<name> ./start.sh             # Nsight Systems; POST /start_profile, /stop_profile
 scripts/serve-try.sh <log> [args]     # short-context eager boot of the original checkpoint, :18030
 
-venv/bin/python -m pytest -q tests/                          # kernel tests (GPU; test_auth.py not)
+venv/bin/python -m pytest -q tests/                          # needs the GPU, except test_{auth,status_page,tool_grammar,json_whitespace}.py
 venv/bin/python -m pytest -q -s tests/test_bgemv.py -k <name>  # one test, with timings
 ruff check bench prepare tests scripts                        # lint: ruff 0.17.6 (as CI), rules in ruff.toml
 ```
 
 CI (`.github/workflows/checks.yml`, no GPU): the patch applies to BASE, ruff, shell syntax,
-the wizard. Release side: `scripts/wizard.py` (questions -> `.env`, from `docs/memory_matrix.tsv`),
+the wizard. Release side: `scripts/status_page.py` (+ `.html`, the dashboard `start.sh` runs), `scripts/wizard.py` (questions -> `.env`, from `docs/memory_matrix.tsv`),
 `Dockerfile` + `docker-compose.yml` + `scripts/build-image.sh` (vLLM's own Dockerfile on
 `./vllm`, sm86 only),
 `bench/memory_matrix.sh` (longest request per knob combination: one boot each with
@@ -104,12 +108,16 @@ Benchmarks and quality (all need a running server):
   `metrics_window.py` alongside. `bench/profile_spec.sh`: kernel time per step under nsys.
 - `bench/quality_battery.py download|run`: GSM8K, Hermes tool calls, DocVQA as strict JSON,
   on public data (`bench/quality-data/`, not in git); compare two servers at the same settings.
+- `bench/tool_json.py [port] [repeats]`: validity of nested, strict, forced and long streamed
+  tool calls.
 - `bench/extract_bench.py`: document extraction on public data (shared Italian system
   prompt, 1-3 DocVQA pages, JSON or summary), closed loop with `metrics_window.py` alongside.
 - `bench/greedy_ref.py save|compare`, `bench/copy_test.py`: output and acceptance checks.
 - `bench/prefix_hit.py [port]`: prefix hits of requests sharing only a system prompt, and warm
   answers against cold ones.
 - `bench/diverge.py`: first layer visit where two runs of a request differ (capture hook).
+- `bench/memory_stress.py [port] [burst]`: peak GPU memory under waves of long requests (run
+  `quality_battery.py run docvqa` alongside); how `KEEP_FREE_GB` was chosen.
 - `bench/w4_gemv.py`, `bench/w8_gemv.py`: W4/W8 GEMV tiles against a grid search (no server).
 - `bench/long_decode.py`, `bench/offload_test.py`, `bench/moe_kernels.py`.
 

@@ -1,4 +1,4 @@
-From 961e6526788d947da7a71ead1305602207ae3d79 Mon Sep 17 00:00:00 2001
+From 92059aee1e256bab735642a02431a7e53f7728c2 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -59,24 +59,33 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   the request's history replaces the DSpark drafts (a choice that never
   depends on them), point masses in the draft-logits cache keep rejection
   sampling exact; the token history is kept on the GPU while it is on.
-- sconv metadata: padding rows start at num_actual_tokens, so the
-  >256-token tile skip in _sconv_kernel keeps the cache taps of a tile
-  that mixes real and padding rows (upstream bug).
 - disable_any_whitespace also reaches structural tags, which is how Inkling's
   parser asks for JSON (the server-wide part of vllm#68990).
+- Tool calls (parser/inkling.py): HYPERINKLING_TOOL_GRAMMAR=1 constrains each
+  tool block to JSON, and to the parameter schemas when a tool is strict;
+  reasoning and text stay free, except that a required or named tool_choice
+  leaves only reasoning and calls, and parallel_tool_calls=false stops at one.
+  Arguments after a misplaced brace are returned whole instead of cut there.
+- Long streamed tool arguments without re-parsing them at every delta: the
+  arg_value_extender of vllm#69297 (MedUnes), with its tests; merged in main,
+  so it goes when BASE moves to main.
 - Serving, after HyperQwen: --api-key guards every path but /health,
   /ping, /load, /version (auth-deny-default); stall sentinel
   (VLLM_ENGINE_STALL_SENTINEL_S, engine-stall-sentinel); continuous usage
   kept while a tool parser buffers deltas (continuous-stream-usage).
+- Extensible KV cache sizing: HYPERINKLING_KV_KEEP_FREE_GIB keeps that much
+  free after warmup (at least the measured activation peak) in place of the
+  margin plus reserve (~3.25 GiB here).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
+ tests/parser/engine/test_inkling.py           |  94 +++++-
+ tests/v1/worker/test_extensible_kv_cache.py   |  16 ++
  vllm/config/vllm.py                           |   4 +
  vllm/entrypoints/common/cli_args.py           |   7 +-
  .../openai/chat_completion/serving.py         |   1 +
  .../serve/middleware/authenticate.py          |  34 ++-
  vllm/envs.py                                  |   6 +
- vllm/models/inkling/nvidia/ops/sconv.py       |  10 +-
  vllm/models/inkling/nvidia/sconv_swa_attn.py  | 141 ++++++++-
  vllm/models/inkling2/nvidia/attention.py      |  43 ++-
  vllm/models/inkling2/nvidia/dspark.py         | 164 ++++++++---
@@ -101,13 +110,16 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  vllm/models/inkling2/quant_config.py          |  14 +-
  vllm/models/inkling2/speculator.py            |  24 +-
  vllm/models/inkling2/speculator_config.py     |  13 +-
+ vllm/parser/inkling.py                        | 249 +++++++++++++++-
+ vllm/parser/utils.py                          |  12 +-
  vllm/v1/core/kv_cache_manager.py              |   3 +
  vllm/v1/core/sched/scheduler.py               |  38 ++-
  vllm/v1/core/single_type_kv_cache_manager.py  |   4 +
  vllm/v1/engine/core.py                        |  84 ++++++
  vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
- 36 files changed, 2046 insertions(+), 119 deletions(-)
+ vllm/v1/worker/extensible_kv_cache.py         |  11 +
+ 40 files changed, 2402 insertions(+), 135 deletions(-)
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -115,8 +127,154 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 vllm/models/inkling2/nvidia/ops/moe_marlin.py
  create mode 100644 vllm/v1/spec_decode/dynamic/adaptive_k.py
 
+diff --git a/tests/parser/engine/test_inkling.py b/tests/parser/engine/test_inkling.py
+index 09290177e8..508df55e54 100644
+--- a/tests/parser/engine/test_inkling.py
++++ b/tests/parser/engine/test_inkling.py
+@@ -9,6 +9,7 @@ cases mirror the Rust unified parser's tests
+ (`rust/src/parser/src/unified/inkling.rs`) where applicable.
+ """
+ 
++import dataclasses
+ import json
+ 
+ import pytest
+@@ -33,7 +34,12 @@ from vllm.parser.engine.registered_adapters import (
+     InklingParserToolAdapter,
+ )
+ from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
+-from vllm.parser.inkling import InklingParser, _inkling_arg_converter, inkling_config
++from vllm.parser.inkling import (
++    InklingParser,
++    _inkling_arg_converter,
++    _inkling_arg_value_extender,
++    inkling_config,
++)
+ from vllm.parser.parser_manager import ParserManager
+ from vllm.sampling_params import SamplingParams
+ from vllm.v1.structured_output.backend_xgrammar import validate_xgrammar_grammar
+@@ -261,6 +267,92 @@ class TestArgConverter:
+             _inkling_arg_converter('{"name":"x","args":[1]}', False)
+ 
+ 
++# Escapes, braces, non-ASCII and marker-like text that must stay inside the value.
++LONG_ARG_LINE = 'if a < b: print("x\\y", {"k": [1, "}"]})  # <|end_message \u00e9\n'
++
++
++def _long_tool_block(lines: int) -> str:
++    args = json.dumps(
++        {"path": "/repo/app.py", "mode": 644, "content": LONG_ARG_LINE * lines}
++    )
++    return _tool_block("write_file", args)
++
++
++class TestArgValueExtender:
++    """The open `args` object streams without re-running the converter."""
++
++    @pytest.mark.parametrize("chunk_size", [1, 7, 64])
++    def test_long_call_streams_non_streaming_arguments(
++        self, mock_tokenizer, mock_request, chunk_size
++    ):
++        text = _long_tool_block(lines=200)
++
++        results = _stream(InklingParser(mock_tokenizer), mock_request, text, chunk_size)
++        result = InklingParser(mock_tokenizer).extract_tool_calls(text, mock_request)
++
++        assert (
++            collect_tool_arguments(results) == result.tool_calls[0].function.arguments
++        )
++
++    def test_conversions_do_not_grow_with_argument_length(
++        self, mock_tokenizer, mock_request
++    ):
++        base = inkling_config()
++
++        def streaming_conversions(lines: int) -> int:
++            calls = 0
++
++            def counting_converter(raw_args: str, partial: bool) -> str:
++                nonlocal calls
++                calls += partial
++                return _inkling_arg_converter(raw_args, partial)
++
++            parser = InklingParser(
++                mock_tokenizer,
++                parser_engine_config=dataclasses.replace(
++                    base, arg_converter=counting_converter
++                ),
++            )
++            _stream(parser, mock_request, _long_tool_block(lines), 4)
++            return calls
++
++        assert streaming_conversions(lines=20) == streaming_conversions(lines=200)
++
++    def test_string_extender_stops_at_closing_quote(self):
++        extend = _inkling_arg_value_extender('{"name":"f","args":{"a":"x')
++        assert extend is not None
++        assert [extend(d) for d in ["{y}", '\\"', "z\\\\", '"']] == [
++            "{y}",
++            '\\"',
++            "z\\\\",
++            None,
++        ]
++
++    def test_nested_extender_stops_when_value_closes(self):
++        extend = _inkling_arg_value_extender('{"name":"f","args":{"a":{"b":"}')
++        assert extend is not None
++        assert [extend(d) for d in ['"', ',"c":[1,', "2]", "}"]] == [
++            '"',
++            ',"c":[1,',
++            "2]",
++            None,
++        ]
++
++    @pytest.mark.parametrize(
++        "raw_args",
++        [
++            '{"name":"f"',
++            '{"name":"f","args":{"a":"x"}',
++            '{"name":"f","args":{"a":"x","b',
++            '{"name":"f","args":{"a":',
++            '{"name":"f","args":{"a": ',
++        ],
++        ids=["args_not_started", "args_closed", "key", "value_not_started", "ws"],
++    )
++    def test_no_extender_unless_value_is_open(self, raw_args):
++        assert _inkling_arg_value_extender(raw_args) is None
++
++
+ class TestNonStreaming:
+     @pytest.mark.parametrize("suffix", ["", END_MESSAGE, END_SAMPLING])
+     def test_bare_text_after_model_opener(self, parser, mock_request, suffix):
+diff --git a/tests/v1/worker/test_extensible_kv_cache.py b/tests/v1/worker/test_extensible_kv_cache.py
+index 291608d16b..ebafc4910a 100644
+--- a/tests/v1/worker/test_extensible_kv_cache.py
++++ b/tests/v1/worker/test_extensible_kv_cache.py
+@@ -237,6 +237,22 @@ def test_measure_kv_cache_bytes():
+         )
+         == gib // 2
+     )
++    # A fixed amount kept free replaces margin and reserve, floored at the peak;
++    # an explicit budget still caps it.
++    fixed = dict(
++        requested_memory=20 * gib,
++        transient_peak_bytes=gib,
++        torch_reserve_growth_bytes=2 * gib,
++        **{**common, "margin_floor_bytes": gib},
++    )
++    assert measure_kv_cache_bytes(keep_free_bytes=2 * gib, **fixed) == 5 * gib
++    assert measure_kv_cache_bytes(keep_free_bytes=gib // 2, **fixed) == 6 * gib
++    assert (
++        measure_kv_cache_bytes(
++            keep_free_bytes=gib, **{**fixed, "requested_memory": 8 * gib}
++        )
++        == 5 * gib
++    )
+     # The result never goes negative.
+     assert measure_kv_cache_bytes(requested_memory=2 * gib, **common) == 0
+ 
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index 4ea6278f6c..ffb634b5b9 100644
+index b1dcbf0732..570ce6e9c0 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -792,8 +792,12 @@ class VllmConfig:
@@ -249,36 +407,6 @@ index 83f31dcf20..f70a8fbeb2 100644
      # Timeout in seconds for waiting for engine cores to become ready
      # during startup. Default is 600 seconds (10 minutes).
      "VLLM_ENGINE_READY_TIMEOUT_S": lambda: int(
-diff --git a/vllm/models/inkling/nvidia/ops/sconv.py b/vllm/models/inkling/nvidia/ops/sconv.py
-index 28101ec960..d8a27b5ce0 100644
---- a/vllm/models/inkling/nvidia/ops/sconv.py
-+++ b/vllm/models/inkling/nvidia/ops/sconv.py
-@@ -245,9 +245,12 @@ def _seq_metadata_kernel(
-     padded = offs < num_padded_tokens
-     query_start = tl.load(qsl_ptr + lo)
-     tl.store(seq_idx_ptr + offs, tl.where(actual, lo, 0), mask=padded)
-+    # Padding rows (slot_mapping -1, all taps masked) start past every request, so
-+    # starts stay non-decreasing for the sconv tile skip (inkling2 ops/sconv.py
-+    # SKIP_IDLE_CACHE).
-     tl.store(
-         query_start_ptr + offs,
--        tl.where(actual, query_start, 0),
-+        tl.where(actual, query_start, num_actual_tokens),
-         mask=padded,
-     )
- 
-@@ -262,9 +265,8 @@ def sconv_seq_metadata(
- ) -> None:
-     """Fill static per-token seq_idx / query_start buffers in one launch.
- 
--    Replaces the arange + searchsorted + clamp + gather + 2x copy chain of the
--    sconv metadata build with a single kernel writing both persistent buffers.
--    Padded rows are filled with zero and must have `slot_mapping == -1`.
-+    Padded rows get seq_idx 0 and query_start `num_actual_tokens`, and must have
-+    `slot_mapping == -1`.
-     """
-     if num_padded_tokens is None:
-         num_padded_tokens = num_actual_tokens
 diff --git a/vllm/models/inkling/nvidia/sconv_swa_attn.py b/vllm/models/inkling/nvidia/sconv_swa_attn.py
 index 47285b1129..e1b0d455b9 100644
 --- a/vllm/models/inkling/nvidia/sconv_swa_attn.py
@@ -1270,13 +1398,13 @@ index 93fe44c4a3..e96974721c 100644
          plan = experts.plan(x.shape[0])
          routing, quantized = route(
 diff --git a/vllm/models/inkling2/nvidia/ops/__init__.py b/vllm/models/inkling2/nvidia/ops/__init__.py
-index bc0f45f003..f6381104e7 100644
+index b2956da17e..1993d34801 100644
 --- a/vllm/models/inkling2/nvidia/ops/__init__.py
 +++ b/vllm/models/inkling2/nvidia/ops/__init__.py
-@@ -39,3 +39,21 @@ def use_native_e4m3() -> bool:
+@@ -40,3 +40,21 @@ def use_native_e4m3() -> bool:
      from vllm.platforms import current_platform
  
-     return current_platform.has_device_capability(89)
+     return current_platform.has_device_capability(90)
 +
 +
 +@functools.cache
@@ -1643,12 +1771,12 @@ index 293c39f635..c0f8c263f5 100644
              x.stride(0),
              0,
 diff --git a/vllm/models/inkling2/nvidia/ops/e4m3.py b/vllm/models/inkling2/nvidia/ops/e4m3.py
-index 11465fa902..152349eeea 100644
+index 808c0db47c..ca73718fa8 100644
 --- a/vllm/models/inkling2/nvidia/ops/e4m3.py
 +++ b/vllm/models/inkling2/nvidia/ops/e4m3.py
-@@ -94,3 +94,13 @@ def cast_store(x, dtype: tl.constexpr):
+@@ -95,3 +95,13 @@ def cast_store(x, dtype: tl.constexpr):
      """`x` cast to pointer element type `dtype`, where uint8 stands for e4m3
-     below SM89."""
+     below SM90."""
      return _e4m3_bits(x.to(tl.float32)) if dtype == tl.uint8 else x.to(dtype)
 +
 +
@@ -1661,10 +1789,10 @@ index 11465fa902..152349eeea 100644
 +    bits = ((x & 0x7F) << 7) | ((x & 0x80) << 8)
 +    return bits.to(tl.uint16).to(tl.float16, bitcast=True)
 diff --git a/vllm/models/inkling2/nvidia/ops/linear.py b/vllm/models/inkling2/nvidia/ops/linear.py
-index 57aa7937d2..4dc63f30f7 100644
+index cc5c0db327..73f0893c99 100644
 --- a/vllm/models/inkling2/nvidia/ops/linear.py
 +++ b/vllm/models/inkling2/nvidia/ops/linear.py
-@@ -237,7 +237,7 @@ def k_group_partials(
+@@ -238,7 +238,7 @@ def k_group_partials(
              num_warps=4 if block_n == 64 else 8,
              num_stages=2 if sm120 else 4 if block_n == 64 else 3,
              enable_fp_fusion=False,
@@ -2683,7 +2811,7 @@ index 8a438dd37a..6b5c51a0f4 100644
          return out
      assert weight.dtype == torch.uint8
 diff --git a/vllm/models/inkling2/nvidia/ops/sconv.py b/vllm/models/inkling2/nvidia/ops/sconv.py
-index 67a3607a3e..d2df98d288 100644
+index 7b2fd6d9ae..de5d76d81b 100644
 --- a/vllm/models/inkling2/nvidia/ops/sconv.py
 +++ b/vllm/models/inkling2/nvidia/ops/sconv.py
 @@ -264,7 +264,8 @@ def _conv(
@@ -2918,6 +3046,375 @@ index 0d367f8309..dcc7b20b89 100644
              # The target's clipped, unit-scale FP8 cache does not describe the
              # draft's unnormalized values. Keep the draft cache in BF16.
              if spec.kv_cache_dtype is None:
+diff --git a/vllm/parser/inkling.py b/vllm/parser/inkling.py
+index d1edad1cb9..930b9daa0f 100644
+--- a/vllm/parser/inkling.py
++++ b/vllm/parser/inkling.py
+@@ -26,16 +26,24 @@ from __future__ import annotations
+ 
+ import functools
+ import json
++import os
+ from collections.abc import Sequence
+ from typing import TYPE_CHECKING
+ 
++import regex as re
+ from xgrammar import StructuralTag
+ from xgrammar.structural_tag import (
+     AnyTextFormat,
++    ConstStringFormat,
+     Format,
++    JSONSchemaFormat,
++    OrFormat,
++    PlusFormat,
+     SequenceFormat,
+     StarFormat,
++    TagFormat,
+     TokenFormat,
++    TokenTriggeredTagsFormat,
+ )
+ 
+ from vllm.entrypoints.generate.base.protocol import ExtractedToolCallInformation
+@@ -44,11 +52,12 @@ from vllm.parser.abstract_parser import structured_outputs_to_format
+ from vllm.parser.engine.events import EventType
+ from vllm.parser.engine.parser_engine import ParserEngine
+ from vllm.parser.engine.parser_engine_config import (
++    ArgValueExtender,
+     ParserEngineConfig,
+     ParserState,
+     Transition,
+ )
+-from vllm.parser.utils import extract_json_member_object
++from vllm.parser.utils import find_json_member_object
+ from vllm.renderers.inkling_encoding import (
+     AUDIO_END,
+     CONTENT_AUDIO_INPUT,
+@@ -101,6 +110,9 @@ INKLING_CONTROL_TOKENS = (
+ )
+ 
+ 
++_JSON_STRING = re.compile(r'"(?:[^"\\]|\\.)*"?', re.DOTALL)
++
++
+ def _inkling_arg_converter(raw_args: str, partial: bool) -> str:
+     """Carve the `args` object out of the tool-call JSON wrapper.
+ 
+@@ -110,14 +122,139 @@ def _inkling_arg_converter(raw_args: str, partial: bool) -> str:
+     converter, `_compute_arg_delta` streams the wrapper verbatim into
+     the OpenAI `arguments` field (`converter is None -> raw delta`,
+     unconditionally; `stream_arg_deltas=False` does not stop it).
+-    `extract_json_member_object` returns a prefix-stable verbatim
++    `find_json_member_object` bounds a prefix-stable verbatim
+     substring, which the engine's argument-delta diffing requires.
+     """
+-    span = extract_json_member_object(raw_args, "args")
+-    if span is None:
++    bounds = find_json_member_object(raw_args, "args")
++    if bounds is None:
+         # No args value yet (streaming) or none at all (treat as empty).
+         return "" if partial else "{}"
+-    return span
++    start, end = bounds
++    if not partial and end is not None:
++        end = _malformed_args_end(raw_args, start, end)
++    return raw_args[start:end]
++
++
++def _malformed_args_end(raw_args: str, start: int, end: int) -> int:
++    """Where the args of a complete call end. `end` is the brace that balances;
++    an array still open there was closed with a brace (`[{..}}` for `[{..}]`),
++    so the args run on to the end of the wrapper."""
++    span = _JSON_STRING.sub("", raw_args[start:end])
++    if span.count("[") <= span.count("]"):
++        return end
++    # A complete call has one more closing brace than opening ones, and its last
++    # brace is the wrapper's.
++    braces = _JSON_STRING.sub("", raw_args).rstrip()
++    wrapper_end = len(raw_args.rstrip())
++    if braces.endswith("}") and braces.count("}") > braces.count("{"):
++        wrapper_end = len(raw_args[: wrapper_end - 1].rstrip())
++    return max(end, wrapper_end)
++
++
++def _tool_grammar_enabled() -> bool:
++    return os.environ.get("HYPERINKLING_TOOL_GRAMMAR") == "1"
++
++
++def _tool_functions(tools: Sequence[Tool]) -> list:
++    # Chat Completions nests the function, Responses does not.
++    functions = [getattr(tool, "function", tool) for tool in tools]
++    return [f for f in functions if getattr(f, "name", None)]
++
++
++def _tool_payload(function) -> Format:
++    """The payload of a call to `function`, with its schema when it is strict."""
++    strict = getattr(function, "strict", None)
++    return SequenceFormat(
++        elements=[
++            ConstStringFormat(value=f'{{"name":{json.dumps(function.name)},"args":'),
++            JSONSchemaFormat(
++                json_schema=(strict and function.parameters) or {"type": "object"},
++                # The renderer declares properties sorted by name.
++                any_order=True,
++            ),
++            ConstStringFormat(value="}"),
++        ]
++    )
++
++
++def _one_of(formats: list[Format]) -> Format:
++    return formats[0] if len(formats) == 1 else OrFormat(elements=formats)
++
++
++def _any_tool_payload(functions: list) -> Format:
++    """Any JSON arguments, unless a tool is strict: then each tool's own payload."""
++    if any(getattr(f, "strict", None) for f in functions):
++        return _one_of([_tool_payload(f) for f in functions])
++    return JSONSchemaFormat(
++        json_schema={
++            "type": "object",
++            "properties": {"name": {"type": "string"}, "args": {"type": "object"}},
++            "required": ["name", "args"],
++            "additionalProperties": False,
++        }
++    )
++
++
++def _inkling_arg_value_extender(raw_args: str) -> ArgValueExtender | None:
++    """Extend the open trailing value of the `args` object until it closes.
++
++    `_inkling_arg_converter` returns a verbatim span of `raw_args`, so while
++    the last member value is open every delta appends to the converted JSON
++    as is: a string streams it, other values are held by the engine without
++    re-running the converter. Returns None before the value starts, so the
++    converter decides whether a string value may stream.
++    """
++    bounds = find_json_member_object(raw_args, "args")
++    if bounds is None:
++        return None
++    span = raw_args[bounds[0] : bounds[1]]
++    depth = 0
++    in_string = escape = in_value = False
++    for ch in span:
++        if in_string:
++            if escape:
++                escape = False
++            elif ch == "\\":
++                escape = True
++            elif ch == '"':
++                in_string = False
++        elif ch == '"':
++            in_string = True
++        elif ch in "{[":
++            depth += 1
++        elif ch in "}]":
++            depth -= 1
++        elif depth == 1 and ch in ":,":
++            in_value = ch == ":"
++    if depth < 1 or not in_value or span[-1] in ": \t\r\n":
++        return None
++    is_string = in_string and depth == 1
++
++    def extend(delta: str) -> str | None:
++        nonlocal depth, in_string, escape
++        for ch in delta:
++            if in_string:
++                if escape:
++                    escape = False
++                elif ch == "\\":
++                    escape = True
++                elif ch == '"':
++                    in_string = False
++                    if is_string:
++                        return None
++            elif ch == '"':
++                in_string = True
++            elif ch in "{[":
++                depth += 1
++            elif ch in "}]":
++                depth -= 1
++                if depth <= 1:
++                    return None
++            elif depth == 1 and ch in ", \t\r\n":
++                return None
++        return delta
++
++    return extend
+ 
+ 
+ @functools.cache
+@@ -244,6 +381,7 @@ def inkling_config() -> ParserEngineConfig:
+         token_id_terminals={},
+         transitions=transitions,
+         arg_converter=_inkling_arg_converter,
++        arg_value_extender=_inkling_arg_value_extender,
+         stream_arg_deltas=True,
+         tool_args_json=True,
+         strip_trailing_reasoning_whitespace=True,
+@@ -283,12 +421,17 @@ class InklingParser(ParserEngine):
+             return request
+         structured_outputs = request.extract_structured_outputs()
+         if structured_outputs is None or (
+-            structured_outputs.json is None and not structured_outputs.json_object
++            # A forced call leaves no text block for a response format.
++            structured_outputs.structural_tag is None
++            and request.tools
++            and request.tool_choice not in ("auto", "none", None)
++            and _tool_grammar_enabled()
+         ):
++            return self._constrain_tool_calls(request)
++        if structured_outputs.json is None and not structured_outputs.json_object:
+             return request
+         if request.tools and request.tool_choice not in ("auto", "none", None):
+-            # TODO: constrain required and named tool choices to tool calls.
+-            return request
++            return request  # the tool grammar is off
+         json_format = structured_outputs_to_format(structured_outputs)
+ 
+         vocab = self.vocab
+@@ -308,13 +451,9 @@ class InklingParser(ParserEngine):
+             )
+         output_format: Format
+         if prefix is None:
+-            excludes = [token for token in INKLING_CONTROL_TOKENS if token in vocab]
+-            thinking_block = SequenceFormat(
+-                elements=[model, thinking, AnyTextFormat(excludes=excludes), end]
+-            )
+             output_format = SequenceFormat(
+                 elements=[
+-                    StarFormat(content=thinking_block),
++                    StarFormat(content=self._thinking_block(model, thinking, end)),
+                     model,
+                     text,
+                     json_format,
+@@ -323,7 +462,88 @@ class InklingParser(ParserEngine):
+             )
+         else:
+             output_format = SequenceFormat(elements=[json_format, end])
+-        tag = StructuralTag(format=output_format)
++        self._set_grammar(request, StructuralTag(format=output_format))
++        return request
++
++    def _constrain_tool_calls(
++        self, request: ChatCompletionRequest | ResponsesRequest
++    ) -> ChatCompletionRequest | ResponsesRequest:
++        """Constrain the tool blocks to valid JSON (HYPERINKLING_TOOL_GRAMMAR=1).
++
++        Reasoning and text stay free, except that a required or named tool choice
++        leaves only reasoning blocks followed by calls.
++        """
++        choice = request.tool_choice
++        if not _tool_grammar_enabled() or not request.tools or choice == "none":
++            return request
++        functions = _tool_functions(request.tools)
++        single = request.parallel_tool_calls is False
++        vocab = self.vocab
++        model, thinking, invoke, end = (
++            TokenFormat(token=vocab[token])
++            for token in (
++                MESSAGE_MODEL,
++                CONTENT_THINKING,
++                CONTENT_INVOKE_TOOL_JSON,
++                END_MESSAGE,
++            )
++        )
++        name = getattr(getattr(choice, "function", choice), "name", None)
++        if name:
++            functions = [f for f in functions if f.name == name]
++        continued = isinstance(request, ChatCompletionRequest) and (
++            request.continue_final_message
++        )
++        if functions and (name or choice == "required") and not continued:
++            call = _one_of(
++                [
++                    SequenceFormat(
++                        elements=[
++                            model,
++                            ConstStringFormat(value=f.name),
++                            invoke,
++                            _tool_payload(f),
++                            end,
++                        ]
++                    )
++                    for f in functions
++                ]
++            )
++            output_format: Format = SequenceFormat(
++                elements=[
++                    StarFormat(content=self._thinking_block(model, thinking, end)),
++                    call if single or name else PlusFormat(content=call),
++                ]
++            )
++        else:
++            output_format = TokenTriggeredTagsFormat(
++                trigger_tokens=[invoke.token],
++                tags=[
++                    TagFormat(
++                        begin=invoke,
++                        content=_any_tool_payload(_tool_functions(request.tools)),
++                        end=end,
++                    )
++                ],
++                stop_after_first=single,
++            )
++        self._set_grammar(request, StructuralTag(format=output_format))
++        return request
++
++    def _thinking_block(
++        self, model: TokenFormat, thinking: TokenFormat, end: TokenFormat
++    ) -> Format:
++        vocab = self.vocab
++        excludes = [token for token in INKLING_CONTROL_TOKENS if token in vocab]
++        return SequenceFormat(
++            elements=[model, thinking, AnyTextFormat(excludes=excludes), end]
++        )
++
++    @staticmethod
++    def _set_grammar(
++        request: ChatCompletionRequest | ResponsesRequest, tag: StructuralTag
++    ) -> None:
++        """Constrain `request` from its first token, reasoning included."""
+         grammar = StructuredOutputsParams(structural_tag=json.dumps(tag.model_dump()))
+         if isinstance(request, ChatCompletionRequest):
+             request.structured_outputs = grammar
+@@ -331,7 +551,6 @@ class InklingParser(ParserEngine):
+         else:
+             request._parser_structured_outputs = grammar
+         request._grammar_from_parser = True
+-        return request
+ 
+     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
+         """Seed the initial parsing state from the prompt tail.
+diff --git a/vllm/parser/utils.py b/vllm/parser/utils.py
+index 4a771be285..90aaf2cec7 100644
+--- a/vllm/parser/utils.py
++++ b/vllm/parser/utils.py
+@@ -111,6 +111,13 @@ def extract_json_member_object(raw: str, key: str) -> str | None:
+     the previous one; the scanner is string/escape-aware so a matching literal
+     inside another value cannot mislead it, and it recovers a partial span when
+     the wrapper is truncated (where `json.loads` would fail)."""
++    bounds = find_json_member_object(raw, key)
++    return None if bounds is None else raw[bounds[0] : bounds[1]]
++
++
++def find_json_member_object(raw: str, key: str) -> tuple[int, int | None] | None:
++    """Start and end of the span `extract_json_member_object` returns; the end
++    is `None` while the object is unterminated."""
+     depth = 0
+     in_string = False
+     escape = False
+@@ -139,10 +146,7 @@ def extract_json_member_object(raw: str, key: str) -> str | None:
+                 return None
+             if raw[value_start] != "{":
+                 raise ValueError(f"member {key!r} must be a JSON object")
+-            value_end = scan_json_object_end(raw, value_start)
+-            if value_end is None:
+-                return raw[value_start:]
+-            return raw[value_start:value_end]
++            return value_start, scan_json_object_end(raw, value_start)
+         elif ch in "{[":
+             depth += 1
+         elif ch in "}]":
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
 index 91f9e26ffd..4a3a61bca3 100644
 --- a/vllm/v1/core/kv_cache_manager.py
@@ -3032,10 +3529,10 @@ index 84dfa53f19..e3921fc6db 100644
          """Return a reservation, or None to use the allocation-based admission check."""
          return None
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 6c83d46bb1..099aa36f27 100644
+index 56cfeddefc..bfe460a0a9 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
-@@ -127,6 +127,70 @@ HANDSHAKE_TIMEOUT_MINS = 5
+@@ -128,6 +128,70 @@ HANDSHAKE_TIMEOUT_MINS = 5
  _R = TypeVar("_R")  # Return type for collective_rpc
  
  
@@ -3106,7 +3603,7 @@ index 6c83d46bb1..099aa36f27 100644
  class EngineCore:
      """Inner loop of vLLM's Engine."""
  
-@@ -1417,6 +1481,24 @@ class EngineCoreProc(EngineCore):
+@@ -1404,6 +1468,24 @@ class EngineCoreProc(EngineCore):
                  internal_dp_balancing,
              )
  
@@ -3131,7 +3628,7 @@ index 6c83d46bb1..099aa36f27 100644
              # Initialize fault tolerance settings.
              self.enable_fault_tolerance = (
                  vllm_config.parallel_config.enable_fault_tolerance
-@@ -1890,6 +1972,8 @@ class EngineCoreProc(EngineCore):
+@@ -1877,6 +1959,8 @@ class EngineCoreProc(EngineCore):
              self.output_queue.put_nowait(output)
          # Post-step hook.
          self.post_step(model_executed)
@@ -3332,6 +3829,52 @@ index d5c2ec4ecc..9d2620836e 100644
 +
 +    tag.format = convert(tag.format)
 +    return tag
+diff --git a/vllm/v1/worker/extensible_kv_cache.py b/vllm/v1/worker/extensible_kv_cache.py
+index 079fffb171..911ec62d04 100644
+--- a/vllm/v1/worker/extensible_kv_cache.py
++++ b/vllm/v1/worker/extensible_kv_cache.py
+@@ -4,6 +4,7 @@
+ 
+ import copy
+ import gc
++import os
+ from bisect import bisect_right
+ from collections.abc import Generator
+ from contextlib import contextmanager
+@@ -606,6 +607,7 @@ def measure_kv_cache_bytes(
+     torch_reserve_growth_bytes: int = 0,
+     margin_floor_bytes: int = KV_CACHE_MARGIN_FLOOR_BYTES,
+     margin_fraction: float = KV_CACHE_MARGIN_FRACTION,
++    keep_free_bytes: int | None = None,
+ ) -> int:
+     """Bytes the KV cache may occupy given the memory measured after warmup.
+ 
+@@ -616,9 +618,15 @@ def measure_kv_cache_bytes(
+     larger of transient_peak_bytes and torch_reserve_growth_bytes is then kept
+     free in full. The margin guards physical memory, so it never reduces an
+     explicit budget that already leaves that much free.
++
++    keep_free_bytes replaces margin and reserve with one amount kept free,
++    never less than transient_peak_bytes.
+     """
+     non_kv_used = init_free_memory - free_memory - committed_bytes
+     headroom = free_memory + committed_bytes
++    if keep_free_bytes is not None:
++        keep = max(keep_free_bytes, transient_peak_bytes)
++        return max(min(requested_memory - non_kv_used, headroom - keep), 0)
+     margin = max(margin_floor_bytes, int(transient_peak_bytes * margin_fraction))
+     available = min(requested_memory - non_kv_used, headroom - margin)
+     available -= max(transient_peak_bytes, torch_reserve_growth_bytes)
+@@ -653,6 +661,9 @@ def measure_kv_cache_blocks(
+         transient_peak_bytes=transient_peak,
+         torch_reserve_growth_bytes=kv_cache.torch_reserve_growth_bytes,
+     )
++    # HyperInkling: a fixed amount kept free after warmup, GiB (start.sh KEEP_FREE_GB).
++    if keep_free := os.environ.get("HYPERINKLING_KV_KEEP_FREE_GIB"):
++        measured["keep_free_bytes"] = int(float(keep_free) * (1 << 30))
+     available = measure_kv_cache_bytes(requested_memory=requested_memory, **measured)
+     utilization = vllm_config.cache_config.gpu_memory_utilization
+     # Explicit values just under 1.0 are mostly habits from estimate-based
 -- 
 2.56.1
 

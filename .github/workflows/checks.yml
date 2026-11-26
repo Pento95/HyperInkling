@@ -27,3 +27,5 @@ jobs:
         run: for f in start.sh scripts/*.sh bench/*.sh prepare/*.sh; do bash -n "$f"; done
       - name: wizard with every default
         run: yes '' | python3 scripts/wizard.py --print
+      - name: status page
+        run: pipx run pytest -q tests/test_status_page.py

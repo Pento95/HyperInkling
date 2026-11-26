@@ -2,7 +2,7 @@
 
 **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Thinking Machines
 Lab, Apache-2.0) on one RTX 3090 / 3090 Ti, with vLLM.** Text and images (document pages),
-tool calls, strict JSON output, ~268k tokens of context per request, several requests at
+tool calls, strict JSON output, ~340k tokens of context per request, several requests at
 once, and the model's own DSpark drafter for speculative decoding.
 
 Upstream vLLM runs Inkling 2 Mini on Hopper and Blackwell. This repository is the port to
@@ -35,6 +35,9 @@ or [OpenUncensored's abliterated version](https://huggingface.co/OpenUncensored/
 quantized the same way
 ([Pentium95/Inkling-2-Mini-Uncensored-W4A16-g128-gptq](https://huggingface.co/Pentium95/Inkling-2-Mini-Uncensored-W4A16-g128-gptq),
 KL median 0.0027 against its source as served). Compose downloads it at the first start.
+
+The container restarts after a crash (three times), not when the machine boots:
+`RESTART=unless-stopped` in `.env` does that.
 
 The wizard's answers are in `.env`, which compose reads at every start: next time, just
 `docker compose up -d`. To keep several setups, save copies and pick one before starting:
@@ -74,26 +77,11 @@ should work where CUDA 13 and a gcc it accepts are installed; that is best effor
 
 ### Status page
 
-`start.sh` starts a small dashboard beside the engine: **http://127.0.0.1:8082** (compose
-publishes it on `DASH_BIND`, localhost by default). One file, standard library only, no
-dependencies and no assets: it reads the server's own `/metrics`, `/version`, `/load` and
-`/v1/models`, `nvidia-smi` for the card the container was given, and the engine's command
-line for the shape it started with - so what it shows is what the launcher derived, not what
-`.env` said. Read-only: about 0.5% of one core and 29 MB.
-
-| | |
-|---|---|
-| Live | decode and prefill tok/s (2 s window), draft acceptance, GPU utilization - 15 min of 1 s samples |
-| Since boot | requests by `finish_reason`, running/waiting, preemptions, admission rejections, prompt tokens by source, prefix hits (GPU cache and CPU tier), drafted/verified/accepted tokens, tool calls, KV usage, TTFT |
-| Started as | `--max-num-seqs`, prefill chunk and long-prefill cap, KV dtype and headroom, CPU tier, DSpark window, image limits |
-
-`GET /api/status` is the same data as JSON (with the history), and `GET /health` answers 503
-while the engine is not - enough to wire it to a monitor. `DASHBOARD=0` turns it off,
-`DASHBOARD_PORT` moves it. vLLM is PID 1, so the page starts with the engine and goes with
-it; it never writes and never restarts anything.
-
-vLLM exposes no per-request detail (no slot states, no per-request progress), so everything
-on the page is aggregate-since-boot - and the page says so under its own footer.
+`start.sh` serves a read-only page at **http://127.0.0.1:8082**: decode and prefill speed,
+draft acceptance, cache hits, latencies, GPU, and the settings the server started with.
+`GET /api/status` is the same as JSON, `GET /health` follows the engine's. It
+listens where the API does (`DASH_BIND` in Docker, `DASHBOARD_HOST` native, to change it) and
+asks for `VLLM_API_KEY` when one is set (as the password; any user name). `DASHBOARD=0` turns it off, `DASHBOARD_PORT` moves it.
 
 ## Speed
 
@@ -117,7 +105,9 @@ sum over the requests running at once (`bench/context_bench.sh`).
 
 One prompt already fills the GPU (prefill is compute-bound), so 6 at once share the same
 ~6,200 tok/s. gpu-unlock raises the bf16 tensor-core rate (102 TFLOPS on a cuBLAS GEMM instead
-of ~40): it changes prefill, not decode, which is bandwidth-bound. DSpark is lossless (the
+of ~40): it changes prefill, not decode, which is bandwidth-bound
+at the power limits of these tables (a card capped at 250 W sat at its cap in a field report). DSpark's
+cells at one request are one prompt: between prompts they range from 170 to 400 tok/s at 8k (mean 284). DSpark is lossless (the
 target verifies every draft); how much it gains depends on the text: most on code, structured
 output and answers that quote the prompt, least on free prose like these summaries.
 
@@ -142,32 +132,35 @@ Longest single request, 8 requests at once, KV at 8 bits, the defaults otherwise
 
 | vision tower | DSpark (default) | no DSpark |
 |---|---|---|
-| on the GPU (default) | **268k** | 345k |
-| in host RAM | 303k | 385k |
-| none (text only) | 305k | 394k |
+| on the GPU (default) | **340k** | 431k |
+| in host RAM | 375k | 471k |
+| none (text only) | 377k | 473k |
 
-With DSpark and the vision tower on the GPU: 289k at 1 request, 274k at 6, 256k at 16, 235k at 32,
-197k at 64. Async scheduling off gives ~17k more; a prefill chunk of 1024 ~24k more. Without
-DSpark, without the vision tower, with async scheduling off and a 1024 prefill chunk: **432k**
-at 1 request (427k at 6), as far as the 24 GiB allow, not to the model's 1M.
+With DSpark and the vision tower on the GPU: 362k at 1 request, 345k at 6, 326k at 16, 306k at 32,
+268k at 64. Async scheduling off gives ~17k more; a prefill chunk of 1024 ~12k more. Without
+DSpark, without the vision tower, with async scheduling off and a 1024 prefill chunk: **500k**
+at 1 request (495k at 6), as far as the 24 GiB allow, not to the model's 1M.
 
 | knob | default | what it does | context / VRAM | speed |
 |---|---|---|---|---|
-| `SPEC` | `dspark` | speculative decoding with the bundled drafter | ~78k tokens less (268k vs 345k) | 1.5-2x decode at one request, 1.7-1.8x aggregate at 6 |
+| `SPEC` | `dspark` | speculative decoding with the bundled drafter | ~91k tokens less (340k vs 431k) | 1.5-2x decode at one request, 1.7-1.8x aggregate at 6; with many requests decoding at once it stops paying (prose: +11-14% up to 16, even at 32, -23% at 64), so the wizard proposes it off from 32 |
 | `MAX_LEN` | `auto` | longest request: `auto` is what the KV cache holds after warmup; a number caps it (and the boot fails if it does not fit) | none | none |
+| `KEEP_FREE_GB` | 2 | GPU memory kept free after warmup (never below the activation peak vLLM measures); the KV cache gets the rest. The wizard offers 1.5 to 3.5, +1 for a monitor on the GPU | 0.5 less: ~29k tokens more; 1.0 ran out of memory under load | none |
 | `ASYNC` | 1 | async scheduling (two steps in flight) | off: ~17k tokens more | off: -3 to -4% decode |
-| `NBT` | 2048 | prefill chunk (and image encodings per step) | 1024: ~24k tokens more | 1024: -8% prefill, same decode |
+| `NBT` | 2048 | prefill chunk (and image encodings per step) | 1024: ~12k tokens more | 1024: -8% prefill, same decode |
 | `LONG_PREFILL` | `NBT`/2 | most tokens of one prompt per step while other requests are there (no limit when it is alone); 0 = off | none | short prompts beside a 120k prefill: TTFT 26.6 -> 1.9 s; that prefill +19% |
 | `IMAGES` | 50 | images per request; 0 = no vision tower | 0: ~37k tokens more | no images |
-| `HYPERINKLING_VISION_HOST` | 0 | vision tower weights in host RAM, copied to the GPU layer by layer per image | 1: ~36k tokens more | +27 ms per A4 page |
+| `HYPERINKLING_VISION_HOST` | 0 | vision tower weights in host RAM, copied to the GPU layer by layer per image | 1: ~35k tokens more | +27 ms per A4 page |
 | `IMAGE_MAX_W` / `_H` | 1040 x 1560 | largest image: 1,014 tokens, an A4 page at ~126 ppi (two per 2048 chunk); larger ones are scaled down to it | A4 at 300 ppi (2480 x 3508, with `ENCODER_CACHE=16384`): ~5.5x the tokens per page | 300 ppi: ~5.5x the prefill per page |
-| `MAX_SEQS` | 8 | requests at once | 289k at 1, 274k at 6, 268k at 8, 256k at 16, 197k at 64 | more aggregate decode |
+| `MAX_SEQS` | 8 | requests at once | 362k at 1, 345k at 6, 340k at 8, 326k at 16, 268k at 64 | more aggregate decode |
 | `KV_OFFLOAD_GB` | `auto` (60% of RAM - 8 GiB, at most 36) | prefix-cache tier in host RAM (`/dev/shm`) | host RAM only | evicted prefixes come back in 0.1 s instead of seconds |
 | `HYPERINKLING_SPEC_ADAPTIVE` | `2,4,7` | verify length chosen per step from these; empty = the fixed `SPEC_K` schedule | ~5k tokens | with the lookup, against `SPEC_K`: +43% copying, +4-10% on free text and code, within noise at 6 requests |
 | `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context instead of DSpark's on a match of 8 tokens or more (lossless) | 6 MB | +10% while copying |
-| `SPEC_K` | `[[1,2,4],[3,6,3]]` | drafts verified per step, by batch size, when the adaptive length is off | none | |
+| `SPEC_K` | `[[1,2,4],[3,8,3]]` | drafts verified per step, by batch size, when the adaptive length is off | none | |
 | `SPEC_DRAFT` | `probabilistic` | drafts sampled from the draft distribution | none | +15-20% on structured output at temperature > 0 |
 | `HYPERINKLING_MOE_ORDER` | 1 | each expert's rows in a fixed order: the same prefill gives the same numbers bit for bit (generation with DSpark still varies between runs) | none | 0: +0.4% decode at 6 requests |
+| `HYPERINKLING_TOOL_GRAMMAR` | 1 | tool calls constrained to valid JSON, and to the schema of tools with `strict: true`; `tool_choice` `required` or a named tool forces the call | none | decode within noise (1 and 6 requests); no broken calls in the test where 8 of 12 were |
+| `JSON_COMPACT` | 1 | constrained JSON (`response_format`, tool calls) without whitespace between tokens | none | none measured: the model already writes compact tool calls |
 | `WARMUP` | 1 | requests at the shapes vLLM's warmup leaves out, right after `/health` | none | no compile stalls on the first requests (4 s at boot, 14 s after an update) |
 | `HOST` / `VLLM_API_KEY` | 127.0.0.1 / none | who can connect | none | none |
 
@@ -278,7 +271,7 @@ round with a new seed; a second round of 166k tokens changed nothing measurable 
 | `scripts/` | `setup-vllm.sh`, `build-vllm.sh`, `serve-try.sh`, `quick_bench.py`, `warmup.py`, `status_page.py`, `verify-image.py` |
 | `prepare/` | INT4 packing, RTN and GPTQ converters, calibration corpus and capture |
 | `bench/` | speed (fixed contexts, per kind of text, long prompts, server-side metrics), memory matrix, KL eval, quality battery, profiles |
-| `tests/` | kernel and processor tests (`venv/bin/python -m pytest -q tests/`; `test_status_page.py` needs no GPU and no server) |
+| `tests/` | kernel and processor tests (`venv/bin/python -m pytest -q tests/`) |
 | `docs/` | measured tables |
 
 ## Credits

@@ -67,7 +67,7 @@ reasoning loops: cap `max_tokens` and the agent's turns.
 
 The same as the original checkpoint served by HyperInkling (same architecture, sizes and
 kernels): see [its card](https://huggingface.co/Pentium95/Inkling-2-Mini-W4A16-g128-gptq) and
-HyperInkling's README. ~268k tokens of context with DSpark, 8 requests and the vision tower on
+HyperInkling's README. ~340k tokens of context with DSpark, 8 requests and the vision tower on
 the GPU.
 
 ## Use

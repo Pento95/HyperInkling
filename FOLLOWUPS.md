@@ -7,10 +7,11 @@ fetched with `hf download --include` only when chosen.
 | phase | items |
 |---|---|
 | 2, the checkpoint (new files on HF) | 33 |
-| 3, context (best effort) | 18, 13, 55 |
-| 4, speed and upstream | 10, 7, 21, 22, 32 |
+| 3, context | 58, 18, 60, 13, 55 |
+| 4, speed and upstream | 58, 64, 22, 10, 7, 21, 32 |
+| 5, tool calls | 61 |
 
-Released: `ghcr.io/pento95/hyperinkling:0.1.4` (compose default) and two HF checkpoints, the
+Released: `ghcr.io/pento95/hyperinkling:0.1.5` (compose default) and two HF checkpoints, the
 original (README = docs/MODEL_CARD.md) and the uncensored one (README =
 docs/MODEL_CARD_UNCENSORED.md): re-upload a card when it changes. A new image goes with a new
 tag (`scripts/build-image.sh` refuses a published one) and the compose default.
@@ -21,6 +22,7 @@ Where each idea comes from: **[HQ]** HyperQwen (github.com/syv-ai/HyperQwen, `pa
 [#69141](https://github.com/vllm-project/vllm/pull/69141) (compressed-tensors experts),
 **[AX]** github.com/agent2x0r/inkling2-sm86-kernels (2x3090 bring-up, `labs/`, `csrc/`),
 **[C3]** club-3090 (github.com/noonghunna/club-3090, its `vllm-inkling` image recipe),
+**[LU]** github.com/lulakien/inkling2-mini-3090-recipe,
 **[CD]** crazydiamond-on-ampere (github.com/Mr-Moonsilver/crazydiamond-on-ampere, KV in
 host RAM), **[LC]** [llm-compressor](https://github.com/vllm-project/llm-compressor), **[IK]** the model's
 own structure, **[NS]** ours (measurements in this repo, nsys profiles).
@@ -40,11 +42,31 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 
 ## Phase 3: context (best effort: no DSpark, vision off the GPU)
 
-18. **4-bit V in the global KV** [HQ KVarN]: KL median 0.0034 (0.0031 as served) with V in
-    4 bits, groups of 32, asymmetric, K left in E4M3: ~+20% context. K is the sensitive half
-    (K and V 4-bit g128 0.0047), a fixed codebook without scales fails on V's outlier dimensions
-    (0.0042 at best), and V 4-bit on the windowed layers too costs 0.0046, so vLLM's equal pages
-    per group need a planner change.
+18. **K8V4: K in E4M3, V in 4 bits after a randomized Hadamard rotation, one scale and zero point
+    per vector (g128)** [HQ KVarN, vLLM `int4_per_token_head`]. Decided: the new default, with 8-bit V as a
+    wizard option. Global layers only: ~+27% of the context they hold (before padding and what
+    does not scale). Simulated at 131k tokens (3 AA-LCR documents, against bf16 KV on the same
+    weights, KL median / mean / top-1):
+
+    | V | 8-bit E4M3 | RHT g128 | RHT g64 | RHT g32 | RHT g128 symmetric | g16 | g32 | g64 | g128 |
+    |---|---|---|---|---|---|---|---|---|---|
+    | median | 0.0005 | **0.0006** | 0.0006 | 0.0006 | 0.0007 | 0.0006 | 0.0006 | 0.0007 | 0.0007 |
+    | mean | 0.0029 | **0.0036** | 0.0035 | 0.0034 | 0.0037 | 0.0033 | 0.0035 | 0.0037 | 0.0039 |
+    | top-1 | 98.15% | **97.96%** | 97.96% | 98.00% | 97.85% | 98.03% | 97.97% | 97.90% | 97.82% |
+
+    5-bit V (RHT g128) is E4M3's equal (0.0005 / 0.0031 / 98.12%) and K in 6 bits with the rotation costs nothing more
+    (0.0006 / 0.0035 / 97.96%), but neither packs like 4 and 8 bits; K at 4-5 bits and V at 3 bits are out (K 0.0012 /
+    0.0008, V 0.0010).
+    No worse with depth (96-131k: 0.0004 for RHT g128, 0.0003 for E4M3); needles at 64k and 120k are
+    40/40 for every variant, too easy to tell them apart. K is the sensitive half (K and V 4-bit
+    g128: 0.0047 on the short transcripts, against 0.0031); V 4-bit on the windowed layers too costs
+    0.0046. Missing: the kernels (write with the rotation; decode and prefill reading packed V,
+    the rotation undone once on the attention output, which is linear in V), a planner change (vLLM has
+    equal pages per group; vllm#69031 gives full and windowed layers different formats),
+    then decode speed, acceptance and the KL of the real format. Starting points:
+    `vllm/v1/attention/ops/int4_per_token_head.py` (nibbles, RHT, zero point in the scale's
+    mantissa); `turboquant_k8v4` is a backend of its own. Upstream as an issue first, once it
+    works, and only after #69165.
 
 13. **Drafter W4 at 6-16 requests** [NS]: past ~21 rows the W4 kernels
     are tensor-core bound (int4 halves the bytes per MAC, so the bound comes at half the
@@ -57,6 +79,33 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     is), and a bf16 Inkling 2 Mini does not fit 24 GiB to generate the corpus and capture.
 
 ## Phase 4: speed and polish
+
+58. **DFlash2 drafter**, [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)
+    (Apache-2.0, 495M parameters, 5 layers, all with a 2048 window, block 8 = 7 drafts per request,
+    16 candidates per position). Tokens per verify step on our W4 target, greedy, 7 drafts verified,
+    700-token answers (DFlash2 offline in fp32, DSpark as served):
+
+    | | chat | prose | code | struct | doc | all |
+    |---|---|---|---|---|---|---|
+    | DFlash2 | 2.99 | 2.24 | 4.25 | 4.16 | 3.86 | **3.34** |
+    | DSpark | 1.84 | 1.54 | 3.39 | 3.31 | 3.23 | 2.44 |
+
+    Acceptance by position (all 7 verified): chat 0.70 / 0.46 / 0.30 / 0.22 / 0.15 / 0.10 / 0.06, code 0.83 / 0.64 /
+    0.53 / 0.43 / 0.34 / 0.27 / 0.22. How it was measured: the target's features for the whole text from one prefill
+    (a dump hook in `Inkling2DSparkModel.precompute_and_store_context_kv`, `.local/df/hook.patch`), the drafter run
+    offline in PyTorch on them (`.local/df/offline.py`, greedy walk of the selector); the drafter weights are in
+    `.local/df/drafter`.
+    Layers in INT4 g128 (round to nearest) with the INT8 head: 3.29 (INT4 g32 3.31, INT8 3.34). Verifying
+    2 / 3 / 4 / 5 / 7: 2.35 / 2.73 / 2.98 / 3.15 / 3.34, so 4 drafts already beat DSpark at 7. Uncensored
+    checkpoint: 3.37 against 2.44. It also has no global KV (DSpark's costs 2 KiB per token, up to ~12% of the context). The port:
+    vLLM has DFlash2, not with Inkling; features = DSpark's (visits 5, 23, 41 and the final norm),
+    the target's `embed_norm` on the borrowed embeddings, softcap after the selector's
+    correction, candidates from the first 200,058 ids (llama.cpp#33049 fixes the same three). Then
+    INT4 layers, the shared INT8 head, the lookup and the adaptive verify length, and tok/s at 1 and 6
+    requests. Not measured: temperature above 0, tok/s. Published checkpoints keep `mtp.safetensors` (636 MB):
+    images up to 0.1.5 need it; when DFlash2 becomes the default the wizard downloads only the chosen
+    drafter (DFlash2 from its own repository, 990 MB in bf16), DSpark stays an option.
+    2DSD (drafting across the loops) exists only for a research variant of the model.
 
 7. **Per-request verify length** [BS draft policy, vLLM adaptive verification]: needs decode
    graphs with per-request query lengths; docs/varlen-decode-investigation.md maps the
@@ -78,14 +127,51 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     candidate: ~1-2% in all.
 21. **Rust frontend** for the native build: vendored OpenSSL needs Perl `FindBin` (the
     container builds it).
-22. **Upstream PRs**: the processing.py dummy-size fix and the oversized-image downscale are
-    real upstream bugs; so is the sconv padding-row fix (NOTES).
+22. **Upstream PRs**, one at a time; vLLM's `AGENTS.md` wants a human who reviewed every line and ran the
+    tests, the `pr-checklist` skill, its PR template, disclosure of AI use.
+    - Truncated tool arguments (misplaced brace): branch `inkling-misplaced-brace` on the owner's fork,
+      ready but not opened. On a real server: 16 of 16 broken calls were cut, 0 of 20 with the fix
+      (in 8 of them the wrapper's brace stays: the model wrote one closer too few, so it
+      cannot be told apart; the description must say it). Neighbours: #51141 (replaces the streaming
+      conversion), #69297 (in our patch), #69347.
+    - Tool grammar: comment on #54120 (open, stalled; does not fit Inkling 2: the model writes its own
+      `<|message_model|>`, reasoning comes first, calls carry the name before the marker).
+    - #69297: our timings as a comment.
+    - Images over the encoder budget that wait forever: #68203 / #68204 (open) cover it; a comment there, no PR of ours.
+    - Candidates to agree on first (they come from HyperQwen): continuous usage while a parser
+      buffers, `--api-key` on every path, the stall sentinel.
 32. **BASE to vLLM main when #69165 merges** [AR]: `patches/BASE` is its head today
     (`scripts/setup-vllm.sh` stops if a force-push removed it). #69165 hit a sampler-warmup
     OOM at `max_num_seqs` 256: keep the wizard's cap.
 
+64. **No speculation above a batch size** [NS]. Aggregate decode, prose, 512 tokens, `MAX_SEQS=64`
+    (`scripts/quick_bench.py`), DSpark against `SPEC=off`: 1 request 148-164 / 136 tok/s, 8: 588 / 527,
+    16: 900 / 798, 32: 1264 / 1263, 64: 1432 / 1860. The adaptive verify length chooses among 2, 4, 7, never 0;
+    vLLM's schedule accepts k = 0 per batch size. Next: 0 as a candidate (its cost measured like the others,
+    with or without the drafter's pass), its decode graphs' context, then code and structured text, where
+    the break-even should move above 32. Until then the wizard proposes `SPEC=off` from 32 requests.
+
+## Phase 5: tool calls
+
+61. **Undeclared tools**: without `strict` the grammar leaves the name free, and the model sometimes
+    calls a tool that does not exist (2-3 of 24 on a one-tool request). Constraining only the
+    payload's name would be worse: the model has already named the tool in the block's header, and
+    would then call another one with the wrong arguments. It has to hold from the header, that is a grammar of
+    the whole answer (reasoning, text or a declared name).
+60. **CPU-tier miss at prompt length 63 modulo 64** [NS]: such a prompt is not found in host RAM the first
+    time (13 other lengths are; a second recompute makes it hit). Also before the rebase. Look at
+    `SconvStateManager`'s tail against the chunk that the first generated token completes.
+
 ## To consider
 
+59. **From [lulakien/inkling2-mini-3090-recipe](https://github.com/lulakien/inkling2-mini-3090-recipe)** [LU]
+    (one or two 3090s, the release's NVFP4 experts; its single-GPU decode and context are below ours). Worth trying:
+    - far path in the prefill attention (`FAR_ATTN`): the relative bias reaches 1,024 keys back, so the key blocks
+      before that skip bias, masks and `-inf` handling: x1.13-1.15 on the kernel with FP8 KV, x1.25 with bf16 (500k cold -13%).
+      It changes outputs at fp32 rounding level, and that kernel serves decode there;
+    - `moe_align` as a parallel kernel (193 -> 42 us at 8,192 routes) and a two-pass `attn_res`, both
+      bit-identical: +3.4% prefill on one GPU together;
+      Already here or worse here: FP8 KV, sconv tail, INT8 at load, the draft length by batch size.
 56. **A server-side brake on reasoning loops** [NS]: vLLM has `repetition_detection` (per
     request) and `thinking_token_budget` (needs `--reasoning-config`). As wizard options, after
     checking them with DSpark and tool calls, if loops remain at temperature 1.0.

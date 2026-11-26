@@ -19,6 +19,9 @@ ENV_FILE=${ENV_FILE-.env}
 if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
 	while IFS='=' read -r key value; do
 		case "$key" in ''|'#'*|UID|GID) continue ;; esac
+		# As Compose reads it: CR and one pair of surrounding quotes dropped.
+		value=${value%$'\r'}
+		case "$value" in \"*\"|\'*\') value=${value:1:${#value}-2} ;; esac
 		if [ -z "${!key+set}" ]; then export "$key=$value"; fi
 	done < "$ENV_FILE"
 fi
@@ -31,11 +34,8 @@ SERVED_ALIASES=${SERVED_ALIASES:-local}
 # the server behind something that authenticates (a VPN, a reverse proxy).
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8080}
-# Status page (scripts/status_page.py): a second process beside the engine, reading it over
-# 127.0.0.1 - /metrics counters, nvidia-smi for the card it was given, and PID 1's argv for
-# the shape it started with. Read-only, stdlib only, about 0.5% of one core. DASHBOARD=0 off.
-# DASHBOARD_HOST is the address *inside* the container (compose publishes it on DASH_BIND,
-# 127.0.0.1 by default: the published address is what decides who can reach the page).
+# Status page (scripts/status_page.py) beside the engine, read-only: 0 disables
+# it. It listens where the server does and asks for the same VLLM_API_KEY.
 DASHBOARD=${DASHBOARD:-1}
 DASHBOARD_HOST=${DASHBOARD_HOST:-$HOST}
 DASHBOARD_PORT=${DASHBOARD_PORT:-8082}
@@ -73,6 +73,15 @@ NBT=${NBT:-2048}
 # Most tokens of one prompt per step while other requests are there (none when it is alone):
 # short prompts do not wait for a long prefill. 0 disables.
 LONG_PREFILL=${LONG_PREFILL:-$((NBT / 2))}
+# Tool calls constrained to valid JSON (to the schema when the tool has strict: true); the
+# model misplaces brackets in nested arguments otherwise. 0 leaves them free.
+export HYPERINKLING_TOOL_GRAMMAR=${HYPERINKLING_TOOL_GRAMMAR:-1}
+# JSON the server constrains comes out without whitespace between tokens; 0 leaves it free.
+JSON_COMPACT=${JSON_COMPACT:-1}
+# GPU memory kept free after warmup, GiB (at least the activation peak vLLM measured): the
+# KV cache gets the rest. 1.5 to 3.5; vLLM's own sizing (unset: '') keeps ~3.25. 1.0 ran
+# out of memory under load. A display on this GPU needs ~1 more.
+export HYPERINKLING_KV_KEEP_FREE_GIB=${KEEP_FREE_GB-2}
 GPU_UTIL=${GPU_UTIL:-0.95}
 KV_DTYPE=${KV_DTYPE:-fp8}        # unit-scale E4M3, emulated on sm86 (ops/e4m3.py)
 # CPU prefix-cache tier in /dev/shm, GiB; 0 disables. auto: 60% of RAM minus 8 GiB, at most
@@ -124,7 +133,7 @@ if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${PORT}$"; then
 	exit 1
 fi
 if ! pgrep -f '[v]llm serve' > /dev/null; then
-	for f in /dev/shm/vllm_offload_*.mmap /dev/shm/VLLM_OBJECT_STORAGE_SHM_BUFFER_*; do
+	for f in /dev/shm/vllm_offload_*.mmap /dev/shm/VLLM_OBJECT_STORAGE_SHM_BUFFER_* /dev/shm/vllm_mm_*; do
 		[ -e "$f" ] || continue
 		echo "[start] removing orphaned $f ($(du -h "$f" | cut -f1))"
 		rm -f "$f"
@@ -187,7 +196,7 @@ fi
 
 echo "=================================================="
 echo "HyperInkling: $(basename "$MODEL") as '$SERVED_NAME' on $HOST:$PORT"
-echo "Context $([ "$MAX_LEN" = auto ] && echo "auto (what the GPU holds)" || echo "$MAX_LEN")/request, $MAX_SEQS concurrent, prefill chunk $NBT, async scheduling $ASYNC"
+echo "Context $([ "$MAX_LEN" = auto ] && echo "auto (what the GPU holds)" || echo "$MAX_LEN")/request, $MAX_SEQS concurrent, prefill chunk $NBT, async scheduling $ASYNC, $([ -n "$HYPERINKLING_KV_KEEP_FREE_GIB" ] && echo "$HYPERINKLING_KV_KEEP_FREE_GIB GiB" || echo "vLLM's margin") kept free"
 echo "KV $KV_DTYPE, prefix cache on, CPU tier ${KV_OFFLOAD_GB} GiB"
 if [ -n "$HYPERINKLING_SPEC_ADAPTIVE" ]; then verify="adaptive over $HYPERINKLING_SPEC_ADAPTIVE"
 else verify="by batch size $SPEC_K"; fi
@@ -205,13 +214,13 @@ WARMUP=${WARMUP:-1}
 if [ "$WARMUP" = 1 ] && [ -z "${PROFILE:-}" ]; then
 	python3 "$REPO/scripts/warmup.py" "$PORT" "$SERVED_NAME" "$HOST" &
 fi
-# The page starts with the engine and goes with it: PID 1 is vLLM, so the container owns both
-# lifecycles. It only ever reads, so it is never a reason not to serve - no wait, no failure
-# path. Off when profiling: a clean process tree is the point of PROFILE=1.
-if [ "$DASHBOARD" != 0 ] && [ -z "${PROFILE:-}" ]; then
-	python3 "$REPO/scripts/status_page.py" --bind "$DASHBOARD_HOST" --port "$DASHBOARD_PORT" \
-		--url "http://127.0.0.1:$PORT" &
-	echo "Status page: http://$([ "$DASHBOARD_HOST" = 0.0.0.0 ] && echo localhost || echo "$DASHBOARD_HOST"):$DASHBOARD_PORT"
+# 127.0.0.1 unless the engine binds one address only.
+if [ "$DASHBOARD" = 1 ] && [ -z "${PROFILE:-}" ]; then
+	engine=$HOST
+	case "$engine" in 0.0.0.0|::) engine=127.0.0.1 ;; esac
+	case "$engine" in *:*) engine="[$engine]" ;; esac
+	python3 "$REPO/scripts/status_page.py" --parent --bind "$DASHBOARD_HOST" \
+		--port "$DASHBOARD_PORT" --url "http://$engine:$PORT" &
 fi
 exec taskset -c "$CPUS" "${wrap[@]}" vllm serve "$MODEL" \
 	--served-model-name "$SERVED_NAME" $SERVED_ALIASES --host "$HOST" --port "$PORT" \
@@ -219,7 +228,7 @@ exec taskset -c "$CPUS" "${wrap[@]}" vllm serve "$MODEL" \
 	--max-num-batched-tokens "$NBT" --gpu-memory-utilization "$GPU_UTIL" \
 	--kv-cache-dtype "$KV_DTYPE" --enable-prefix-caching \
 	--reasoning-parser inkling --enable-auto-tool-choice --tool-call-parser inkling \
-	--structured-outputs-config '{"backend":"xgrammar","disable_any_whitespace":true}' \
+	--structured-outputs-config "{\"backend\":\"xgrammar\",\"disable_any_whitespace\":$([ "$JSON_COMPACT" = 1 ] && echo true || echo false)}" \
 	--limit-mm-per-prompt "{\"image\":{\"count\":$IMAGES,\"width\":$IMAGE_MAX_W,\"height\":$IMAGE_MAX_H}}" \
 	--mm-processor-cache-type shm --mm-processor-cache-gb "$MM_CACHE_GB" \
 	--encoder-cache-size "$ENCODER_CACHE" \

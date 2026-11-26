@@ -1,6 +1,6 @@
 #!/bin/bash
 # Recreate ./vllm: vllm-project/vllm at the commit in patches/BASE (the head of PR
-# #69165, Inkling 2 on SM80/86/89, one commit on main), plus HyperInkling's sm86
+# #69165, Inkling 2 on SM80/86/89), plus HyperInkling's sm86
 # port (patches/vllm-hyperinkling-sm86.patch) as one commit on branch
 # hyperinkling/sm86. Then build with scripts/build-vllm.sh.
 set -euo pipefail

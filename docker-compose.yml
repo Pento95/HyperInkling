@@ -20,22 +20,33 @@ x-gpu: &gpu
 
 services:
   prepare:
-    image: ${IMAGE:-ghcr.io/pento95/hyperinkling:0.1.4}
+    image: ${IMAGE:-ghcr.io/pento95/hyperinkling:0.1.5}
     # The checkpoint in ./models belongs to the host user (the wizard writes UID/GID).
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       HF_HOME: /app/models/.hf-home
     entrypoint: ["/bin/bash", "-c"]
+    # Downloads unless every file the weight index names is there: hf download resumes, and
+    # puts the small files in place long before the weights.
     command:
-      - >-
-        test -f /app/models/${CHECKPOINT:-Inkling-2-Mini-W4A16-g128-gptq}/config.json ||
-        hf download ${HF_REPO:-Pentium95/Inkling-2-Mini-W4A16-g128-gptq}
-        --local-dir /app/models/${CHECKPOINT:-Inkling-2-Mini-W4A16-g128-gptq}
+      - |
+        dir=/app/models/${CHECKPOINT:-Inkling-2-Mini-W4A16-g128-gptq}
+        python3 - "$$dir" <<'EOF' ||
+        import json, pathlib, sys
+        d = pathlib.Path(sys.argv[1])
+        try:
+            shards = set(json.loads((d / "model.safetensors.index.json").read_text())["weight_map"].values())
+        except (OSError, ValueError, KeyError):
+            sys.exit(1)
+        need = shards | {"config.json", "tokenizer.json", "mtp.safetensors"}
+        sys.exit(not all((d / f).is_file() for f in need))
+        EOF
+        hf download ${HF_REPO:-Pentium95/Inkling-2-Mini-W4A16-g128-gptq} --local-dir "$$dir"
     volumes:
       - ./models:/app/models
 
   hyperinkling:
-    image: ${IMAGE:-ghcr.io/pento95/hyperinkling:0.1.4}
+    image: ${IMAGE:-ghcr.io/pento95/hyperinkling:0.1.5}
     <<: *gpu
     depends_on:
       prepare:
@@ -47,17 +58,13 @@ services:
       MODEL: /app/models/${CHECKPOINT:-Inkling-2-Mini-W4A16-g128-gptq}
       HOST: 0.0.0.0
       PORT: "8000"
-      # The status page runs beside the engine (DASHBOARD=0 turns it off). It binds all
-      # interfaces inside the container because a published port needs that; DASH_BIND is
-      # what decides reachability from outside, and it stays on localhost by default - a
-      # published port is not filtered by the host firewall, so 0.0.0.0 here is a real
-      # exposure decision, not a formality.
-      DASHBOARD: ${DASHBOARD:-1}
+      # All interfaces inside the container; DASH_BIND (BIND's value unless set) decides
+      # who reaches the page.
       DASHBOARD_HOST: 0.0.0.0
-      DASHBOARD_PORT: "${DASHBOARD_PORT:-8082}"
+      DASHBOARD_PORT: "8082"
     ports:
       - "${BIND:-127.0.0.1}:${PORT:-8080}:8000"
-      - "${DASH_BIND:-127.0.0.1}:${DASHBOARD_PORT:-8082}:${DASHBOARD_PORT:-8082}"
+      - "${DASH_BIND:-${BIND:-127.0.0.1}}:${DASHBOARD_PORT:-8082}:8082"
     # The CPU prefix-cache tier (KV_OFFLOAD_GB) and the image processor cache live in
     # /dev/shm: room for both.
     shm_size: "${SHM_GB:-48}gb"
@@ -65,7 +72,13 @@ services:
     volumes:
       - ./models:/app/models
       - jit-cache:/cache
-    restart: unless-stopped
+    # Retries a crash; does not start at boot and does not retry a broken setup forever.
+    restart: "${RESTART:-on-failure:3}"
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
 
 volumes:
   jit-cache:

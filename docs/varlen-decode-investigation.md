@@ -57,12 +57,6 @@ Shorthand: `CPU_total` is `query_start_loc_cpu[-1]`. `dev_total` is `query_start
       return max_decode_query_len(vllm_config)  # or 1 + num_speculative_tokens
   ```
   and/or set `_cudagraph_support = ALWAYS`. Optionally replace line 80 by a value that does not depend on the CPU total (the kernel only needs an upper bound; padded rows are already protected by slot_mapping).
-- **Possible pre-existing bug (conv tile skip):**
-  - In the sconv kernel, `SKIP_IDLE_CACHE = num_tokens > 256` (inkling2/nvidia/ops/sconv.py:423,461).
-  - The kernel assumes request starts are non-decreasing (comment l.342-346): `tile_reads_cache = qstart[last] > first-(W-1)`, where `last` is the last row of the tile.
-  - Padding rows past `CPU_total` get `query_start = 0` (builder kernel l.246-251).
-  - A tile that straddles the real/padding boundary then sees `qstart[last] = 0`, so `tile_reads_cache` is False. The real decode tokens in that tile, which are the ones that need the cached taps, skip the cache loads.
-  - This applies to any padded decode graph with more than 256 tokens, not only varlen. See doubts.
 
 ## 2. `Inkling2AttentionMetadataBuilder` (inkling2/nvidia/attention.py:75-105)
 

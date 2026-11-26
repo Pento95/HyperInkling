@@ -95,12 +95,12 @@ server at boot.
 
 | vision tower | DSpark (default) | no DSpark |
 |---|---|---|
-| on the GPU (default) | **268k** | 345k |
-| in host RAM | 303k | 385k |
-| none (text only) | 305k | 394k |
+| on the GPU (default) | **340k** | 431k |
+| in host RAM | 375k | 471k |
+| none (text only) | 377k | 473k |
 
-Async scheduling off gives ~17k more, a 1024-token prefill chunk ~24k more. Without DSpark and
-the vision tower, async off, chunk 1024: 432k.
+Async scheduling off gives ~17k more, a 1024-token prefill chunk ~12k more. Without DSpark and
+the vision tower, async off, chunk 1024: 500k.
 
 ## Use
 

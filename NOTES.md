@@ -77,48 +77,13 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
 
 ## Status page (scripts/status_page.py)
 
-- **A second process in the same container, not a second service.** A separate compose service
-  cannot read what the page shows: the CPU tier and the multimodal processor cache live in the
-  engine's private `/dev/shm` (`ipc: private`), the engine's argv is the shape it started with,
-  and a service that wants `nvidia-smi` has to be granted the GPU - which lets it allocate VRAM
-  on the card. Beside the engine costs one Python process (measured: 0.5% of one core, 29 MB
-  with the 900-sample ring) and keeps PID 1 = vLLM, so signals, the Dockerfile healthcheck and
-  `docker compose logs` behave exactly as before. It is started the way `warmup.py` already is:
-  backgrounded before the `exec`, and never a reason not to serve. Skipped under `PROFILE=1`,
-  where a clean process tree is the point.
-- **Uptime from `process_start_time_seconds`, not `docker inspect`.** The engine exports its own
-  start time; measured 1.5 s from the container's `State.StartedAt` (23,629 s vs 23,631 s of
-  uptime on the two readers at once), so the page needs no docker CLI, no socket and no host
-  privileges - and works when it runs outside the container too. A counter reset (generation
-  tokens going backwards) flushes the windows and re-reads it, which is also how a restart is
-  caught without asking anything.
-- **The GPU tile is whichever card NVML gives this process.** Inside a container the host's GPU 1
-  is index 0 and no other card is visible; shipping an index in the image would be a host
-  assumption. No index asked, no index assumed; with no `nvidia-smi` the tile degrades and the
-  rest of the page is unaffected.
-- **One file: no stylesheet, no webfont.** Every `var(--…)` used by the markup is defined in the
-  token block at the top of `HTML`, and a test fails if one is missing - an undefined custom
-  property is silent (the color simply is not there). Outfit (SIL OFL 1.1) is the closest
-  freely-licensed match for the look if anyone wants it: `/web/` exists for that opt-in, serves
-  two extensions, and refuses anything that resolves outside `web/`.
-- **The API key is forwarded** (`VLLM_API_KEY` is in the page's own environment inside the
-  container): `--api-key` guards `/metrics` and `/v1/models`, leaving only `/health`, `/ping`,
-  `/load` and `/version` open, so a keyed server would otherwise show a half-empty page.
-- **Metric lookups key on the exact metric name**, so `vllm:generation_tokens_total` can never
-  pick up `…_created` (the classic Prometheus footgun). `get_one` takes the first series when a
-  name carries several label sets; that cannot happen for one served model, which is the only
-  shape here, and `get_all` sums where multiple series are expected (prompt tokens by `source`).
-- **`--flag=value` is read as well as the space form** `start.sh` emits. A native install copies
-  vLLM's own docs, and a panel row quietly missing because of a spelling would be worse than the
-  panel not existing.
-- **`prompt_tps` under-samples prefill bursts (measured, open).** Its window is 1 s
-  (`PROMPT_WINDOW_S`), while a ~1k-token prefix-cached prefill finishes in ~0.2 s: whether the
-  number appears at all depends on where the sample lands. Two instances reading the same
-  engine 0.3 s apart saw byte-identical per-sample deltas (2889, 2151, 2075, 1504, 1500, 1339
-  tokens) and reported medians of 8.9 and 249 tok/s for the same 45 seconds - so the field is
-  correct but reads as luck, and `CACHE_TTL` (5 s) can hold a stale payload across a whole
-  burst. Options: widen the window to ~5 s and label it, or keep 1 s and accept the gaps.
-  Decode is unaffected (2 s window, medians 49.5 vs 49.4).
+- **A second process in the engine's container**, not a compose service: a service would need
+  the GPU (to run `nvidia-smi`), and the launch settings come from the engine's command line.
+  `start.sh` execs the engine, so the page's parent is the engine and it exits with it.
+- Rates use a 10 s window: vLLM counts a prompt's tokens when its prefill ends.
+- It listens where the server does. It reads `/metrics` with `VLLM_API_KEY`, so it asks its own
+  visitors for that key: the page never shows more than the API would.
+- `vllm:tool_call_parser_invocations` counts streaming deltas, not tool calls: not shown.
 
 ## DSpark (speculative decoding)
 
@@ -163,9 +128,17 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   FlashAttention impl that only writes KV (FlashAttention refuses fp8 on SM8x; the draft
   attention runs in `block_decode_attention`, which reads the emulated E4M3 cache). Its
   pages then pack with the target's instead of being padded to them.
-- **Longest request** (DSpark, vision tower on the GPU, 8 requests, FP8 KV): 268k,
-  285k with async off (`docs/memory_matrix.tsv`). The global layers hold almost all of it; async scheduling costs
+- **Longest request** (DSpark, vision tower on the GPU, 8 requests, FP8 KV): 340k,
+  357k with async off (`docs/memory_matrix.tsv`). The global layers hold almost all of it; async scheduling costs
   ~17k tokens (two in-flight tails) for +3-4% decode.
+- **The KV pool keeps `KEEP_FREE_GB` (2 GiB) free after warmup, not vLLM's ~3.25.** With `MAX_LEN=auto` vLLM
+  sizes the extensible KV cache from the memory free after warmup, less the larger of the activation peak T (1.57
+  GiB) and torch's reservation growth G (2.07), plus a margin `max(1 GiB, 0.75 T)` (`measure_kv_cache_bytes`).
+  Under load (the longest request, then 8 x ~40k, 8 x 30k, 16 x 6k, a wave as wide as `MAX_SEQS` and 80 DocVQA
+  pages, together; `bench/memory_stress.py` with `bench/quality_battery.py`), 2.0 held at 8, 16 and 64 requests, with the
+  vision tower in host RAM and with 1240x1760 pages and the CPU tier; 1.5 held at 8 and 64; 1.0 ran out of memory
+  (`torch.OutOfMemoryError`). The amount never goes below T. 2.0 is +27% of pool at 8 requests, +37% at 64.
+  `GPU_UTIL` between 0.95 and 0.98 changes nothing: the headroom binds, not the budget. Upstream: vllm#68184.
 - **Measure the context limit with `MAX_LEN=auto`.** vLLM checks a fixed limit before the
   warmup (without the transient activations and CUDA graphs, ~1.5 GiB here, so its estimate
   is optimistic) and again after it; `--max-model-len -1` fits the limit after warmup in one
@@ -178,7 +151,7 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   change (sconv builder, the decode combine kernel's row bound, ...) is mapped in a code
   investigation (docs/varlen-decode-investigation.md, FOLLOWUPS 7). `adaptive_k.py` chooses one length per step instead,
   on by default with candidates 2,4,7 (~5k tokens of decode graphs; 1,2,3,4,5,7 costs
-  ~14k and no longer fits 262k with the vision tower on the GPU, for little more speed).
+  ~14k, for little more speed).
 - basalt (jesdga95/basalt, MIT, Blackwell only) runs the same drafter: its draft policy
   picks each window by expected tokens per ms, from stated per-draft chances
   (`include/basalt/spec/draft_policy.hpp`); vLLM's `enable_adaptive_verification` is the
@@ -186,11 +159,6 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
 
 ## Gotchas met
 
-- **Padding rows broke the sconv tile skip** (upstream code): above 256 tokens `_sconv_kernel`
-  skips the cache loads of a tile unless its last row's request starts within W-1 rows, and
-  padding rows had `query_start = 0`. A padded batch whose real tokens end mid-tile lost
-  the cache taps of the last request. Padding rows now start at `num_actual_tokens`
-  (`inkling/nvidia/ops/sconv.py`; `tests/test_sconv_padding.py`).
 - **`git am` drops a bracketed subject prefix**: `scripts/setup-vllm.sh` uses
   `--keep-non-patch`, or the commit loses `[hyperinkling]` and `build-image.sh` refuses it.
 
@@ -202,6 +170,20 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   page up to 4096 px); `start.sh` sets `IMAGE_MAX_W`/`_H` and `--encoder-cache-size`.
 - **`disable_any_whitespace` did nothing for Inkling**: its parser wraps JSON in a structural
   tag, where the xgrammar backend ignores the flag (vllm#68990; drop our part when it merges).
+- **Inkling tool calls have no grammar upstream** (`structural_tag_model = None`): `strict` and
+  `tool_choice: required` change nothing, and on arguments with an array of objects the model
+  can write `}` for `]` at p ~ 1 (prefill and decode agree, DSpark or not, the original checkpoint too).
+  `HYPERINKLING_TOOL_GRAMMAR` constrains the tool blocks from the first token (the triggers are
+  token ids) and makes `required`, a named tool and `parallel_tool_calls: false` hold. vLLM rewrites invalid arguments in the
+  history to `{}`, so a model cannot see its own broken call.
+- **Streamed tool arguments were quadratic** (upstream, vllm#69297, in our patch): the parser
+  re-read the whole call at every delta and stalled the API server; 5,000 characters cost
+  1.6 s of CPU, now 0.04 s.
+- **A prefix hit answers slightly differently from a recompute** (`bench/prefix_hit.py`: mean total
+  variation 0.03-0.06, cold against cold 0.002-0.015), except when the hit is at a multiple
+  of the prefill chunk. Likely the chunk split (another batch, another Marlin block); not proven.
+- **`/dev/shm` leaks**: a stopped server can leave `vllm_offload_*` and `vllm_mm_*` files (6 GB each for the
+  image cache); `start.sh` removes them, and the tier needs the previous server's memory back first.
 - **The KV CPU tier needs prefix caching on**; it worked first time with Inkling's
   hybrid groups.
 - **Greedy output depends on the verify length.** Each `SPEC_K` runs different kernel
@@ -215,6 +197,10 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   speculation, no prefix cache). Generation with the served defaults is not repeatable, even
   one request at a time (8 greedy prompts twice: 2 with the same tokens): the adaptive verify
   length follows wall time and the drafts are sampled, so kernel shapes change. Not isolated. `bench/diverge.py` finds the first differing layer visit.
+- **A test chain must not `wait` with no argument** while `start_server` has a server in the background: it waits for
+  the server too (`server-lib.sh`). Check a long chain on a timer; a stalled one looks like a busy GPU in `nvidia-smi`.
+- **KL on long contexts**: the 22 transcripts average 1.5k tokens (2.7k at most); a KV format is judged at 64k-128k
+  against bf16 KV on the same weights (the original does not fit), with prefill chunks that read the cache.
 - **KL: compare medians.** A small numeric difference flips an expert and the rest of the
   sequence follows, so a few positions dominate the mean. Image-pad positions must be excluded
   (token id 200054; prompt_logprobs are keyed by token id).

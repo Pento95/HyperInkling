@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HyperInkling status</title>
+<style>
+:root{color-scheme:light dark;--bg:#f6f7f9;--card:#fff;--line:#dde3ea;--ink:#1c2126;--muted:#626c76;
+  --ok:#0f9f78;--warn:#b8770a;--bad:#d62839;--info:#0b7fd4;--mono:ui-monospace,Consolas,monospace}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1014;--card:#151a1f;--line:#28303a;--ink:#e9edf1;
+  --muted:#8d97a3;--ok:#35d0a5;--warn:#f0b429;--bad:#f2555f;--info:#4aa3ff}}
+*{box-sizing:border-box}
+body{margin:0 auto;max-width:1200px;padding:24px 16px;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,sans-serif}
+header{display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap}
+h1{font-size:22px;margin:0}h2{font-size:15px;margin:0 0 8px}
+.muted{color:var(--muted);font-size:13px;overflow-wrap:anywhere}
+#state{font-weight:600}#state.ok{color:var(--ok)}#state.busy{color:var(--warn)}#state.down{color:var(--bad)}
+.grid{display:grid;gap:12px;margin:16px 0;grid-template-columns:repeat(auto-fit,minmax(205px,1fr))}
+.wide{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;min-width:0}
+.big{font:500 24px var(--mono)}
+svg{display:block;width:100%;height:56px;margin-top:6px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td{padding:5px 0;border-top:1px solid var(--line);vertical-align:top}
+tr:first-child td{border-top:0}
+td:last-child{font-family:var(--mono);text-align:right;overflow-wrap:anywhere}
+</style>
+</head>
+<body>
+<header><h1 id="model">HyperInkling</h1><span id="state">connecting</span></header>
+<div class="muted" id="sub"></div>
+<div class="grid" id="charts"></div>
+<div class="grid wide">
+  <div class="card"><h2>Since boot</h2><table id="counters"></table></div>
+  <div class="card"><h2>Started with</h2><table id="settings"></table></div>
+</div>
+<div class="muted" id="foot"></div>
+<script>
+const $ = id => document.getElementById(id);
+const el = (tag, text, cls) => Object.assign(document.createElement(tag), {textContent: text, className: cls || ""});
+const num = (n, d = 0) => n == null ? "–" : n.toLocaleString("en-US", {maximumFractionDigits: d});
+const pct = (a, b) => b ? (100 * a / b).toFixed(1) + "%" : "–";
+const gib = n => (n / 2 ** 30).toFixed(1) + " GiB";
+const secs = s => s == null ? "–" : s < 1 ? (s * 1000).toFixed(1) + " ms" : s.toFixed(2) + " s";
+const span = s => s < 3600 ? Math.floor(s / 60) + " min" : Math.floor(s / 3600) + " h " + Math.floor(s % 3600 / 60) + " min";
+const share = v => v == null ? "–" : Math.round(v * 100) + "%";
+
+// [history key, title, color, value formatter, fixed maximum]
+const CHARTS = [
+  ["decode", "Decode", "--ok", v => num(v) + " tok/s"],
+  ["prefill", "Prefill (computed)", "--info", v => num(v) + " tok/s"],
+  ["acceptance", "Draft acceptance", "--ok", share, 1],
+  ["gpu", "GPU", "--warn", v => num(v) + "%", 100],
+  ["kv", "KV cache in use", "--info", share, 1],
+];
+const cards = {};
+for (const [key, title] of CHARTS) {
+  const card = el("div", "", "card");
+  card.innerHTML = '<div class="muted"></div><div class="big">–</div><div class="muted"></div><svg viewBox="0 0 300 56" preserveAspectRatio="none" role="img"></svg>';
+  const [name, value, note, svg] = card.children;
+  name.textContent = title;
+  svg.setAttribute("aria-label", title + " history");
+  cards[key] = {value, note, svg};
+  $("charts").append(card);
+}
+
+let history = [], boot = null;
+function draw(svg, key, color, top, now, length) {
+  const max = top || Math.max(1, ...history.map(h => h[key] || 0));
+  let path = "", gap = true;
+  for (const h of history) {
+    if (h[key] == null) { gap = true; continue; }
+    path += (gap ? "M" : "L") + (300 - (now - h.t) / length * 300).toFixed(1) + "," + (54 - h[key] / max * 52).toFixed(1);
+    gap = false;
+  }
+  svg.innerHTML = `<path d="${path}" fill="none" stroke="var(${color})" stroke-width="1.6" vector-effect="non-scaling-stroke"/>`;
+}
+function rows(table, pairs) {
+  $(table).replaceChildren(...pairs.map(([k, v]) => { const tr = el("tr", ""); tr.append(el("td", k), el("td", v)); return tr; }));
+}
+function render(d) {
+  const live = d.up && d.live || {}, running = live.running || 0;
+  $("state").className = d.up ? running ? "busy" : "ok" : "down";
+  $("state").textContent = d.up ? running ? `${running} running, ${live.waiting} waiting` : "idle" : "down";
+  $("model").textContent = d.model || "HyperInkling";
+  $("sub").textContent = [d.root, d.max_model_len && num(d.max_model_len) + " tokens per request",
+    d.version && "vLLM " + d.version, d.up && d.boot && "up " + span(d.time - d.boot)].filter(Boolean).join(" · ");
+  for (const [key, , color, format, top] of CHARTS) {
+    const value = key === "gpu" ? d.gpu && d.gpu.util : live[key];
+    cards[key].value.textContent = value == null ? "–" : format(value);
+    const peak = Math.max(0, ...history.map(h => h[key] || 0));
+    cards[key].note.textContent = key === "gpu"
+      ? d.gpu ? `${num(d.gpu.used_mib)} / ${num(d.gpu.total_mib)} MiB · ${num(d.gpu.temp_c)} °C · ${num(d.gpu.power_w)} / ${num(d.gpu.limit_w)} W · ${d.gpu.sm_mhz} MHz` : "nvidia-smi unavailable"
+      : "peak " + format(peak);
+    draw(cards[key].svg, key, color, top, d.time, d.history_s);
+  }
+  const c = d.counters;
+  if (c) {
+    const f = c.finished, hits = c.gpu_hits + c.cpu_hits;
+    rows("counters", [
+      ["Finished", num(Object.values(f).reduce((a, b) => a + b, 0))],
+      ...Object.entries(f).filter(([, n]) => n).map(([k, n]) => ["· " + k, num(n)]),
+      ["Generated tokens", num(c.generated)],
+      ["Prompt tokens", num(c.prompt)],
+      ["· from the GPU prefix cache", `${num(c.gpu_hits)} (${pct(c.gpu_hits, c.prompt)})`],
+      ["· from the CPU tier", `${num(c.cpu_hits)} (${pct(c.cpu_hits, c.prompt)})`],
+      ["· computed", `${num(c.computed)} (${pct(c.computed, c.prompt)})`],
+      ["Draft tokens accepted", `${num(c.accepted)} (${pct(c.accepted, c.verified)} of verified)`],
+      ["Tokens per verify step", c.drafts ? (1 + c.accepted / c.drafts).toFixed(2) : "–"],
+      ["Mean TTFT / queue", secs(c.ttft_s) + " / " + secs(c.queue_s)],
+      ["Mean time between steps", secs(c.itl_s)],
+      ["CPU tier stored / loaded", gib(c.offload_stored) + " / " + gib(c.offload_loaded)],
+      ["Preemptions / rejections", num(c.preemptions) + " / " + num(c.rejected)],
+    ]);
+  }
+  const s = d.settings;
+  rows("settings", s ? [
+    ["Concurrent requests", s.max_seqs],
+    ["Prefill chunk", s.nbt + (s.long_prefill ? `, long prompts ${s.long_prefill}` : "")],
+    ["KV cache", `${s.kv_dtype}, ` + (s.keep_free_gib ? `${s.keep_free_gib} GiB kept free` : `GPU ${s.gpu_util}`)],
+    ["CPU tier", s.offload_gib ? s.offload_gib + " GiB" : "off"],
+    ["Speculation", s.spec.method ? `${s.spec.method}, drafts ${s.spec.num_speculative_tokens}` : "off"],
+    ["Images per request", s.image.count ? `${s.image.count}, up to ${s.image.width}×${s.image.height}` : "off"],
+  ] : [["Settings", "not read (the engine is not the parent process)"]]);
+  $("foot").textContent = `Rates over ${d.window_s} s, charts over ${d.history_s / 60} min. Aggregates only: vLLM exposes no per-request progress.`;
+}
+async function poll() {
+  try {
+    const since = history.length ? history[history.length - 1].t : 0;
+    const d = await (await fetch("api/status?since=" + since, {cache: "no-store"})).json();
+    if (d.boot !== boot) { if (boot != null) history = []; boot = d.boot; }
+    history = history.concat(d.history).filter(h => h.t > d.time - d.history_s);
+    render(d);
+  } catch (e) {
+    $("state").className = "down";
+    $("state").textContent = "status page unreachable";
+  }
+}
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

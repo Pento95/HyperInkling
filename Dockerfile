@@ -24,10 +24,8 @@ COPY docs/ docs/
 ENV HOME=/cache VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1 HF_XET_HIGH_PERFORMANCE=1 \
     HOST=0.0.0.0 PORT=8000
 
-EXPOSE 8000
-# The status page scripts/status_page.py, which start.sh starts beside the engine (DASHBOARD=0
-# turns it off). Read-only; it shows the counters of this server and the card it was given.
-EXPOSE 8082
+# 8000 the API, 8082 the status page.
+EXPOSE 8000 8082
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
     CMD python3 -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('PORT', '8000'), timeout=4)" || exit 1
 ENTRYPOINT ["/app/start.sh"]

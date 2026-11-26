@@ -23,7 +23,7 @@ start_server() {
 	local port=$1 log=$2; shift 2
 	require_free "$port"
 	rm -f "$log"
-	setsid env "$@" > "$log" 2>&1 &
+	setsid env DASHBOARD=0 "$@" > "$log" 2>&1 &
 	SERVER_PID=$!
 }
 

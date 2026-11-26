@@ -7,7 +7,8 @@ Inkling 2 Mini on one RTX 3090 / 3090 Ti with those choices.
 
 The server fits the longest request to the GPU at boot (MAX_LEN=auto); the context shown
 for each choice comes from docs/memory_matrix.tsv, measured on an RTX 3090 Ti with nothing
-else on the GPU (bench/memory_matrix.sh), KV cache at 8 bits per value.
+else on the GPU (bench/memory_matrix.sh), KV cache at 8 bits per value, 2 GiB
+kept free after warmup.
 Standard library only, so it runs wherever Python 3.9+ does (Linux, macOS, Windows).
 """
 
@@ -16,6 +17,8 @@ import csv
 import math
 import os
 import secrets
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,7 +29,14 @@ MAX_CONTEXT = 1_048_576  # the model's own limit
 # drafter adds its own full-attention layer), to turn GiB into tokens.
 KIB_PER_TOKEN = {"dspark": 18, "off": 16}
 # Decode tok/s of one request, 8k context, RTX 3090 Ti (README).
-DECODE_1 = {"dspark": 254, "off": 131}
+DECODE_1 = {"dspark": 267, "off": 131}
+# GPU memory kept free after warmup (start.sh KEEP_FREE_GB): the matrix's value, and the
+# range measured under load (1.0 ran out of memory).
+KEEP_FREE_DEFAULT, KEEP_FREE_MIN, KEEP_FREE_MAX = 2.0, 1.5, 3.5
+DISPLAY_GIB = 1.0  # what a desktop on the same GPU may take
+# Requests decoding together at which DSpark's aggregate decode equals no speculation (prose,
+# 512 tokens, scripts/quick_bench.py): +11-14% at 1-16, even at 32, -23% at 64.
+SPEC_BREAK_EVEN = 32
 # Context the adaptive verify length (its CUDA graphs) and the context lookup take.
 ADAPTIVE_COST = 5_120
 CELL = 40  # px per image token side (40 px patches, 2x2 merge)
@@ -128,6 +138,19 @@ def ram_gib():
     return None
 
 
+def display_active():
+    """Whether nvidia-smi reports a display on the first GPU: True, False or None."""
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=display_active", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    first = out.strip().splitlines()[:1]
+    return first[0].strip() == "Enabled" if first else None
+
+
 def fmt_tokens(n):
     return f"{n / 1000:.0f}k" if n < 1_000_000 else f"{n / 1_048_576:.2f}M"
 
@@ -166,7 +189,12 @@ def main():
           f"~{DECODE_1['off']} (more on code and structured output, less on free prose); "
           f"longest request {ctx(vision, 'dspark', True, seqs, 2048)}")
     print(f"   n) no: longest request {ctx(vision, 'off', True, seqs, 2048)}")
-    spec = "dspark" if ask("   choice", "yn", "y") == "y" else "off"
+    many = seqs >= SPEC_BREAK_EVEN
+    if many:
+        print(f"   With {seqs} requests decoding together DSpark stops paying: on prose it breaks "
+              f"even at {SPEC_BREAK_EVEN},\n   and is 23% slower in aggregate at 64 "
+              "(it still wins while fewer are decoding).")
+    spec = "dspark" if ask("   choice", "yn", "n" if many else "y") == "y" else "off"
 
     adaptive = "n"
     if spec == "dspark":
@@ -200,14 +228,24 @@ def main():
     print(f"\n6) Async scheduling (two steps in flight): +3-4% decode; off: {gain}.")
     async_ = ask("   enable", "yn", "y") == "y"
 
-    headroom = ask("\n7) GiB of GPU memory to leave free (a display on this GPU: 1)",
-                   default=0.0, cast=float, check=lambda v: 0 <= v <= 4)
+    shown = display_active()
+    seen = {True: " (nvidia-smi: yes)", False: " (nvidia-smi: no)", None: ""}[shown]
+    display = ask(f"\n7) Is a monitor connected to this GPU{seen}? A desktop on it takes up to "
+                  f"~{DISPLAY_GIB:g} GiB.", "yn", "y" if shown else "n") == "y"
+    per_half = fmt_tokens(2**19 / KIB_PER_TOKEN[spec])
+    engine_free = ask(f"   GiB kept free for vLLM after warmup, {KEEP_FREE_MIN} to {KEEP_FREE_MAX}: "
+                      f"each 0.5 less is ~{per_half} more\n   context and less margin for "
+                      "activation peaks (1.0 ran out of memory)",
+                      default=KEEP_FREE_DEFAULT, cast=float,
+                      check=lambda v: KEEP_FREE_MIN <= v <= KEEP_FREE_MAX
+                      or print(f"  {KEEP_FREE_MIN} to {KEEP_FREE_MAX}"))
+    keep_free = engine_free + (DISPLAY_GIB if display else 0)
 
     longest = expected(rows, vision, spec, async_, seqs, nbt)
     if longest:
         if adaptive == "n" and spec == "dspark":
             longest += ADAPTIVE_COST
-        longest -= int(headroom * 2**20 / KIB_PER_TOKEN[spec])
+        longest -= int((keep_free - KEEP_FREE_DEFAULT) * 2**20 / KIB_PER_TOKEN[spec])
     print(f"\n8) Longest request: auto fits it to the GPU at boot (expected "
           f"~{fmt_tokens(longest) if longest else '?'}); a number caps it (prompts above it "
           "are refused; a cap that does not fit stops the boot).")
@@ -235,10 +273,10 @@ def main():
                check=lambda v: v == "auto" or v >= 0 or print("  0 or more, or auto"))
 
     expose = ask("\n10) Reachable from other machines? (needs an API key)", "yn", "n")
-    dash = ask("\n11) Status page on http://127.0.0.1:8082: live decode and prefill rates, "
-               "prefix hits, draft\n     acceptance, KV usage, the card's temperature and watts. "
-               "Read-only, runs beside\n     the engine, localhost only unless you set DASH_BIND.",
+    dash = ask("\n11) Status page on http://127.0.0.1:8082 (speeds, cache hits, GPU; read-only)?",
                "yn", "y")
+    grammar = ask("\n12) Constrain tool calls to valid JSON (and to the schema of strict tools)? The "
+                  "model breaks\n    some nested arguments otherwise.", "yn", "y")
     env = {
         "MAX_SEQS": seqs,
         "MAX_LEN": max_len,
@@ -246,8 +284,9 @@ def main():
         "ASYNC": int(async_),
         "NBT": nbt,
         "KV_OFFLOAD_GB": tier,
-        "GPU_UTIL": round(0.95 - headroom / 24, 3),
-        "DASHBOARD": 1 if dash == "y" else 0,
+        "KEEP_FREE_GB": keep_free,
+        "DASHBOARD": int(dash == "y"),
+        "HYPERINKLING_TOOL_GRAMMAR": int(grammar == "y"),
     }
     repo, local = CHECKPOINTS[checkpoint]
     if checkpoint != "original":  # compose downloads HF_REPO into models/CHECKPOINT

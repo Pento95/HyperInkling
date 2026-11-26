@@ -1,6 +1,7 @@
 """Prefix reuse after eviction: send P1..P4 (different ~17k-token prompts), then
 P1 again, and report each TTFT. With a small GPU KV pool, P4 evicts P1, so the
-last TTFT is a full recompute unless a CPU tier brings P1's prefix back.
+last TTFT is a full recompute unless a CPU tier brings P1's prefix back (a prompt of
+length 63 modulo 64 is recomputed anyway: FOLLOWUPS 60).
 
     venv/bin/python bench/offload_test.py [prompt tokens] [count]
 """
@@ -34,10 +35,12 @@ def ttft(p):
                        "max_tokens": 8, "temperature": 0, "stream": True,
                        "reasoning_effort": "low"}).encode()
     req = urllib.request.Request(URL, body, {"Content-Type": "application/json"})
-    t0 = time.time()
+    t0, first = time.time(), None
+    # Read to the end: leaving at the first token would abort the request.
     for line in urllib.request.urlopen(req, timeout=3600):
-        if line.startswith(b"data: {") and json.loads(line[6:])["choices"]:
-            return time.time() - t0
+        if first is None and line.startswith(b"data: {") and json.loads(line[6:])["choices"]:
+            first = time.time() - t0
+    return first
 
 
 for n, p in enumerate(prompts, 1):
