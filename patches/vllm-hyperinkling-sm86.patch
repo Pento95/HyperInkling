@@ -1,4 +1,4 @@
-From 92059aee1e256bab735642a02431a7e53f7728c2 Mon Sep 17 00:00:00 2001
+From 555d0e31605275e76ee4c013f2231d8beabf8894 Mon Sep 17 00:00:00 2001
 From: Pento95 <173375476+Pento95@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 05:39:42 +0100
 Subject: [PATCH] [hyperinkling] Inkling 2 Mini on Ampere (sm86)
@@ -49,11 +49,20 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
   KV as the target's unit-scale E4M3 (HYPERINKLING_DRAFT_KV_FP8, through a
   KV-write-only FlashAttention impl: the draft's attention runs in
   block_decode_attention).
+- DFlash2 drafts (incoai/Inkling-2-Mini-DFlash2): the Inkling2 DFlash2
+  speculator of our upstream PR (capture ids as-is, the target's embed_norm,
+  selector_softcap_mode); on sm8x the draft's attention runs in
+  block_decode_attention (full CUDA graphs; FlashInfer, chosen for the fp8
+  cache, has none), the shared INT8 head goes through Inkling2LogitsProcessor
+  and the draft linears are INT4 g128 (HYPERINKLING_DRAFT_W4); the context
+  lookup too (its point masses claimed in DFlash2's sparse draft-logits cache).
+- The INT8 LM head computes the real vocabulary's rows only.
 - Online verify length for dynamic speculative decoding
   (v1/spec_decode/dynamic/adaptive_k.py, HYPERINKLING_SPEC_ADAPTIVE): the
   length with the most expected tokens per ms, from decayed per-position
   acceptance and measured decode step times; decode graphs for every
-  candidate length.
+  candidate length. A step that verified no draft leaves the acceptance as it
+  was.
 - Context lookup drafting (HYPERINKLING_LOOKUP=1, ops/lookup.py, after
   HyperQwen's dflash2-lookup-drafting): a suffix match of 8 tokens or more in
   the request's history replaces the DSpark drafts (a choice that never
@@ -79,47 +88,52 @@ gates PDL/TMA, e4m3 conversions and the native conv/mix kernels below SM90):
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
+ tests/models/inkling2/test_dflash2.py         | 193 ++++++++++++
  tests/parser/engine/test_inkling.py           |  94 +++++-
- tests/v1/worker/test_extensible_kv_cache.py   |  16 ++
+ tests/v1/worker/test_extensible_kv_cache.py   |  16 +
  vllm/config/vllm.py                           |   4 +
  vllm/entrypoints/common/cli_args.py           |   7 +-
  .../openai/chat_completion/serving.py         |   1 +
  .../serve/middleware/authenticate.py          |  34 ++-
  vllm/envs.py                                  |   6 +
+ vllm/model_executor/models/qwen3_dflash.py    |   5 +
+ vllm/model_executor/models/qwen3_dflash2.py   |  25 +-
  vllm/models/inkling/nvidia/sconv_swa_attn.py  | 141 ++++++++-
  vllm/models/inkling2/nvidia/attention.py      |  43 ++-
- vllm/models/inkling2/nvidia/dspark.py         | 164 ++++++++---
+ vllm/models/inkling2/nvidia/dspark.py         | 224 ++++++++++++--
  vllm/models/inkling2/nvidia/loop.py           |  12 +
- vllm/models/inkling2/nvidia/model.py          |  86 +++++-
+ vllm/models/inkling2/nvidia/model.py          |  96 +++++-
  vllm/models/inkling2/nvidia/moe.py            | 107 ++++++-
  vllm/models/inkling2/nvidia/ops/__init__.py   |  18 ++
  vllm/models/inkling2/nvidia/ops/attention.py  |   8 +-
  .../inkling2/nvidia/ops/attention_sm90.py     |  21 +-
- vllm/models/inkling2/nvidia/ops/bgemv.py      | 180 ++++++++++++
+ vllm/models/inkling2/nvidia/ops/bgemv.py      | 180 +++++++++++
  vllm/models/inkling2/nvidia/ops/dspark.py     |  22 +-
  vllm/models/inkling2/nvidia/ops/e4m3.py       |  10 +
  vllm/models/inkling2/nvidia/ops/linear.py     |   2 +-
- vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 ++++++++++++++
+ vllm/models/inkling2/nvidia/ops/linear_w4.py  | 210 +++++++++++++
  vllm/models/inkling2/nvidia/ops/linear_w8.py  | 139 +++++++++
  .../inkling2/nvidia/ops/ll_gemm_sm120.py      |  25 +-
- vllm/models/inkling2/nvidia/ops/lookup.py     | 233 +++++++++++++++
- vllm/models/inkling2/nvidia/ops/moe_marlin.py | 272 ++++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/lookup.py     | 284 ++++++++++++++++++
+ vllm/models/inkling2/nvidia/ops/moe_marlin.py | 272 +++++++++++++++++
  vllm/models/inkling2/nvidia/ops/moe_sm120.py  |   6 +-
  vllm/models/inkling2/nvidia/ops/sconv.py      |   3 +-
- vllm/models/inkling2/processing.py            |  50 +++-
+ vllm/models/inkling2/processing.py            |  50 ++-
  vllm/models/inkling2/quant_config.py          |  14 +-
- vllm/models/inkling2/speculator.py            |  24 +-
- vllm/models/inkling2/speculator_config.py     |  13 +-
- vllm/parser/inkling.py                        | 249 +++++++++++++++-
+ vllm/models/inkling2/speculator.py            | 137 ++++++++-
+ vllm/models/inkling2/speculator_config.py     |  97 +++++-
+ vllm/parser/inkling.py                        | 249 ++++++++++++++-
  vllm/parser/utils.py                          |  12 +-
  vllm/v1/core/kv_cache_manager.py              |   3 +
  vllm/v1/core/sched/scheduler.py               |  38 ++-
  vllm/v1/core/single_type_kv_cache_manager.py  |   4 +
  vllm/v1/engine/core.py                        |  84 ++++++
- vllm/v1/spec_decode/dynamic/adaptive_k.py     | 130 +++++++++
+ vllm/v1/spec_decode/dynamic/adaptive_k.py     | 133 ++++++++
  vllm/v1/structured_output/backend_xgrammar.py |  41 ++-
  vllm/v1/worker/extensible_kv_cache.py         |  11 +
- 40 files changed, 2402 insertions(+), 135 deletions(-)
+ .../gpu/spec_decode/speculator_config.py      |  53 ++--
+ 44 files changed, 2978 insertions(+), 156 deletions(-)
+ create mode 100644 tests/models/inkling2/test_dflash2.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/bgemv.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w4.py
  create mode 100644 vllm/models/inkling2/nvidia/ops/linear_w8.py
@@ -127,6 +141,205 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 vllm/models/inkling2/nvidia/ops/moe_marlin.py
  create mode 100644 vllm/v1/spec_decode/dynamic/adaptive_k.py
 
+diff --git a/tests/models/inkling2/test_dflash2.py b/tests/models/inkling2/test_dflash2.py
+new file mode 100644
+index 0000000000..2e66a1a670
+--- /dev/null
++++ b/tests/models/inkling2/test_dflash2.py
+@@ -0,0 +1,193 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Inkling2 with DFlash2 drafts: the speculator chosen for the target, the
++capture ids it hands the target, the draft's input embeddings and the
++selector's soft cap."""
++
++from types import SimpleNamespace
++from unittest import mock
++
++import pytest
++import torch
++
++from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
++from vllm.model_executor.models.qwen3_dflash2 import (
++    CandidateSelector,
++    _score_edges_reference,
++)
++from vllm.models.inkling2.speculator_config import Inkling2DFlash2SpeculatorConfig
++from vllm.v1.worker.gpu.spec_decode import speculator_config as sc
++from vllm.v1.worker.gpu.spec_decode.dflash.config import DFlashSpeculatorConfig
++from vllm.v1.worker.gpu.spec_decode.dflash2.config import DFlash2SpeculatorConfig
++from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
++    get_eagle3_aux_layers_from_config,
++)
++
++_SPEC_DECODE = "vllm.v1.worker.gpu.spec_decode"
++_DFLASH2 = f"{_SPEC_DECODE}.dflash2.config.DFlash2SpeculatorConfig"
++_DFLASH = f"{_SPEC_DECODE}.dflash.config.DFlashSpeculatorConfig"
++
++
++def _spec(text_model_type="inkling2_loop_text", ids=(5, 23, 41, 48), dflash2=True):
++    # Inkling 2 Mini: 24 layers, a 12-layer core run 3 times, 48 visits.
++    text = SimpleNamespace(
++        model_type=text_model_type,
++        loop_config={"num_passes": 3},
++        num_loop_passes=3,
++        num_layer_visits=48,
++        hidden_size=2304,
++    )
++    draft_hf = SimpleNamespace(
++        architectures=["DFlash2DraftModel" if dflash2 else "DFlashDraftModel"],
++        hidden_size=2304,
++        num_target_layers=48,
++        dflash_config={"target_layer_ids": list(ids), "block_size": 8},
++    )
++    return SimpleNamespace(
++        method="dflash",
++        custom_method=None,
++        num_speculative_tokens=None,
++        target_model_config=SimpleNamespace(hf_text_config=text),
++        draft_model_config=SimpleNamespace(
++            hf_config=draft_hf,
++            speculator_config_class=_DFLASH2 if dflash2 else _DFLASH,
++        ),
++    )
++
++
++def _resolve(spec, method):
++    """The config used to set up the draft, then the one that builds the
++    speculator (as SpeculativeConfig runs them)."""
++    spec.method = method
++    configured = sc.get_method_config_class(spec)
++    setup = sc._resolve_checkpoint_config_class(spec, configured)
++    spec.method = "dflash"
++    return setup, sc.get_speculator_config_class(spec)
++
++
++@pytest.mark.parametrize("method", ["dflash", None])
++@pytest.mark.parametrize("text_model_type", ["inkling2_model", "inkling2_loop_text"])
++def test_inkling2_target_specializes_dflash2_drafts(text_model_type, method):
++    setup, speculator = _resolve(_spec(text_model_type), method)
++    assert setup is speculator is Inkling2DFlash2SpeculatorConfig
++
++
++@pytest.mark.parametrize("method", ["dflash", None])
++def test_other_drafts_and_targets_keep_their_speculator(method):
++    # A DFlash (v1) draft of an Inkling2 target, as before this config.
++    _, speculator = _resolve(_spec(dflash2=False), method)
++    assert speculator is DFlashSpeculatorConfig
++    spec = _spec(dflash2=False)
++    with mock.patch.object(
++        DFlashSpeculatorConfig, "adapt_draft_model_config"
++    ) as generic:
++        Inkling2DFlash2SpeculatorConfig.adapt_draft_model_config(spec)
++    generic.assert_called_once_with(spec)
++    # A DFlash2 draft of another target.
++    assert _resolve(_spec("qwen3"), method)[1] is DFlash2SpeculatorConfig
++
++
++def test_no_draft_yet_keeps_the_generic_speculator():
++    # method="dflash" without a model: no draft config to inspect.
++    spec = _spec()
++    spec.draft_model_config = None
++    assert Inkling2DFlash2SpeculatorConfig.specialize(spec) is DFlashSpeculatorConfig
++
++
++def _adapt(spec):
++    with mock.patch.object(DFlash2SpeculatorConfig, "adapt_draft_model_config"):
++        Inkling2DFlash2SpeculatorConfig.adapt_draft_model_config(spec)
++    return spec
++
++
++def test_target_captures_the_draft_ids_without_the_dflash_shift():
++    # The generic DFlash resolver adds 1 to target_layer_ids; Inkling2
++    # captures the input of a visit, and its last id is the final-norm output.
++    spec = _adapt(_spec())
++    assert get_eagle3_aux_layers_from_config(spec) == (5, 23, 41, 48)
++    assert spec.num_speculative_tokens == 7
++
++
++def _reject(spec, match):
++    with pytest.raises(ValueError, match=match):
++        _adapt(spec)
++
++
++@pytest.mark.parametrize(
++    "ids", [(5, 23, 41, 47), (23, 5, 41, 48), (-1, 23, 41, 48), (48,)]
++)
++def test_rejects_ids_that_are_not_visits_then_the_final_norm(ids):
++    _reject(_spec(ids=ids), "target_layer_ids")
++
++
++def test_rejects_other_loop_passes():
++    spec = _spec()
++    spec.target_model_config.hf_text_config.num_loop_passes = 2
++    _reject(spec, "loop passes")
++
++
++@pytest.mark.parametrize(
++    "field,value", [("hidden_size", 4608), ("num_target_layers", 24)]
++)
++def test_rejects_drafts_trained_for_another_target(field, value):
++    spec = _spec()
++    setattr(spec.draft_model_config.hf_config, field, value)
++    _reject(spec, "another target")
++
++
++def test_rejects_fewer_drafts_than_the_block_holds():
++    spec = _spec()
++    spec.num_speculative_tokens = 4
++    _reject(spec, "num_speculative_tokens = 7")
++
++
++def test_draft_embeds_through_the_target_norm():
++    weight = torch.randn(10, 4)
++    draft = SimpleNamespace(
++        embed_tokens=torch.nn.Embedding.from_pretrained(weight),
++        embed_norm=None,
++        has_separate_mask_embedding=False,
++        mask_token_id=9,
++    )
++    ids = torch.tensor([1, 9])
++    torch.testing.assert_close(
++        DFlashQwen3Model.embed_input_ids(draft, ids), weight[ids]
++    )
++    draft.embed_norm = torch.nn.RMSNorm(4, eps=1e-6)
++    expected = draft.embed_norm(weight[ids])
++    torch.testing.assert_close(DFlashQwen3Model.embed_input_ids(draft, ids), expected)
++
++
++def test_soft_cap_after_correction_caps_the_summed_scores(
++    dist_init, default_vllm_config
++):
++    torch.manual_seed(3)
++    batch, steps, top_k, rank, hidden_size, vocab = 2, 3, 4, 8, 16, 32
++    selector = CandidateSelector(
++        hidden_size=hidden_size,
++        vocab_size=vocab,
++        rank=rank,
++        top_k=top_k,
++        params_dtype=torch.float32,
++        prefix="candidate_selector",
++        post_softcap=5.0,
++    )
++    for p in (selector.predecessor_codebook, selector.successor_codebook):
++        p.data.normal_(0, 4)
++    selector.hidden_projection.weight.data.normal_(0, 4)
++    candidate_ids = torch.randint(vocab, (batch, steps, top_k))
++    unary = torch.randn(batch, steps, top_k) * 10
++    hidden = torch.randn(batch, steps, hidden_size)
++    anchors = torch.randint(vocab, (batch,))
++
++    actual = selector(candidate_ids, unary, hidden, anchors)
++    raw = _score_edges_reference(
++        selector.predecessor_codebook,
++        selector.successor_codebook,
++        candidate_ids,
++        unary,
++        selector.hidden_projection(hidden),
++        anchors,
++        top_k,
++    )
++    torch.testing.assert_close(actual, 5.0 * torch.tanh(raw / 5.0))
 diff --git a/tests/parser/engine/test_inkling.py b/tests/parser/engine/test_inkling.py
 index 09290177e8..508df55e54 100644
 --- a/tests/parser/engine/test_inkling.py
@@ -407,6 +620,108 @@ index 83f31dcf20..f70a8fbeb2 100644
      # Timeout in seconds for waiting for engine cores to become ready
      # during startup. Default is 600 seconds (10 minutes).
      "VLLM_ENGINE_READY_TIMEOUT_S": lambda: int(
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index ac6e386f28..600db54eda 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -489,6 +489,9 @@ class DFlashQwen3Model(nn.Module):
+             self.config.hidden_size,
+             prefix=maybe_prefix(prefix, "embed_tokens"),
+         )
++        # Set by a speculator whose target normalizes its input embeddings
++        # (Inkling 2's embed_norm), so the draft sees the same inputs.
++        self.embed_norm: nn.Module | None = None
+ 
+         # Masked query slots are fed to the draft as `mask_token_id`. Most DFlash
+         # checkpoints will have the mask embedding in the vocabulary embedding table
+@@ -544,6 +547,8 @@ class DFlashQwen3Model(nn.Module):
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         embeds = self.embed_tokens(input_ids)
++        if self.embed_norm is not None:
++            embeds = self.embed_norm(embeds)
+         if self.has_separate_mask_embedding and self.mask_token_id is not None:
+             # Replace masked slots with the dedicated mask embedding.
+             is_mask = (input_ids == self.mask_token_id).unsqueeze(-1)
+diff --git a/vllm/model_executor/models/qwen3_dflash2.py b/vllm/model_executor/models/qwen3_dflash2.py
+index 28a445fed0..7b5b4b5a67 100644
+--- a/vllm/model_executor/models/qwen3_dflash2.py
++++ b/vllm/model_executor/models/qwen3_dflash2.py
+@@ -474,9 +474,13 @@ class CandidateSelector(nn.Module):
+         top_k: int,
+         params_dtype: torch.dtype,
+         prefix: str,
++        post_softcap: float | None = None,
+     ) -> None:
+         super().__init__()
+         self.top_k = top_k
++        # Soft cap on the summed unary and edge scores (selector_softcap_mode
++        # "after_correction"); None when the cap is on the unary logits alone.
++        self.post_softcap = post_softcap
+         self.predecessor_codebook = nn.Parameter(
+             torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+         )
+@@ -501,7 +505,7 @@ class CandidateSelector(nn.Module):
+         anchor_token_ids: torch.Tensor,
+     ) -> torch.Tensor:
+         hidden = self.hidden_projection(hidden_states)
+-        return _score_edges(
++        scores = _score_edges(
+             self.predecessor_codebook,
+             self.successor_codebook,
+             candidate_ids,
+@@ -510,6 +514,9 @@ class CandidateSelector(nn.Module):
+             anchor_token_ids,
+             self.top_k,
+         )
++        if self.post_softcap is not None:
++            scores = torch.tanh(scores / self.post_softcap) * self.post_softcap
++        return scores
+ 
+ 
+ class DFlash2Qwen3Model(DFlashQwen3Model):
+@@ -531,6 +538,14 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
+         self.input_embedding_scale = float(
+             draft_config.get("input_embedding_scale", 1.0)
+         )
++        mode = draft_config.get("selector_softcap_mode", "before_correction")
++        if mode not in ("before_correction", "after_correction"):
++            raise ValueError(
++                f"Unknown DFlash2 selector_softcap_mode {mode!r}; expected "
++                "'before_correction' or 'after_correction'."
++            )
++        softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
++        softcap = softcap if softcap > 0 else None
+         # Without its own tag the selector shares the draft head's compile cache.
+         with set_model_tag("dflash2_candidate_selector"):
+             self.candidate_selector = CandidateSelector(
+@@ -540,6 +555,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
+                 top_k=int(draft_config["selector_top_k"]),
+                 params_dtype=vllm_config.model_config.dtype,
+                 prefix=maybe_prefix(prefix, "candidate_selector"),
++                post_softcap=softcap if mode == "after_correction" else None,
+             )
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+@@ -556,12 +572,17 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+         super().__init__(vllm_config=vllm_config, prefix=prefix)
+         draft_config = self.config.dflash_config
+         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
++        softcap = softcap if softcap > 0 else None
++        # The cap goes on the unary logits or, if the selector caps its summed
++        # scores, nowhere here (the cap is monotonic: the same top-k).
++        if self.model.candidate_selector.post_softcap is not None:
++            softcap = None
+         # Candidates index the selector codebooks, which have the draft's
+         # vocabulary; the target's vocabulary can be larger.
+         self.candidate_logits_processor = LogitsProcessor(
+             min(vllm_config.model_config.get_vocab_size(), self.config.vocab_size),
+             scale=float(draft_config.get("output_multiplier", 1.0)),
+-            soft_cap=softcap if softcap > 0 else None,
++            soft_cap=softcap,
+         )
+ 
+     def compute_candidates(
 diff --git a/vllm/models/inkling/nvidia/sconv_swa_attn.py b/vllm/models/inkling/nvidia/sconv_swa_attn.py
 index 47285b1129..e1b0d455b9 100644
 --- a/vllm/models/inkling/nvidia/sconv_swa_attn.py
@@ -708,7 +1023,7 @@ index d1fdc61364..3081660a9e 100644
          add_linear_lora(self.wo_ud, out, output)
          return out
 diff --git a/vllm/models/inkling2/nvidia/dspark.py b/vllm/models/inkling2/nvidia/dspark.py
-index 6e1755a18b..021ca02d30 100644
+index 6e1755a18b..0309c8b137 100644
 --- a/vllm/models/inkling2/nvidia/dspark.py
 +++ b/vllm/models/inkling2/nvidia/dspark.py
 @@ -5,6 +5,7 @@ through a small dense transformer over DFlare-mixed target-feature K/V, then a
@@ -727,7 +1042,7 @@ index 6e1755a18b..021ca02d30 100644
  from vllm.model_executor.model_loader.weight_utils import default_weight_loader
  from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
  from vllm.v1.attention.backends.flash_attn import (
-@@ -50,6 +50,44 @@ from .ops.dspark import (
+@@ -50,6 +50,104 @@ from .ops.dspark import (
  from .ops.linear import linear
  
  
@@ -761,6 +1076,66 @@ index 6e1755a18b..021ca02d30 100644
 +        return _DraftKVImpl
 +
 +
++class BlockDraftImpl(_DraftKVImpl):
++    """A block draft's attention (DFlash2): requests of `block` queries (the
++    anchor and its drafts), each seeing the whole block and the
++    `sliding_window - 1` keys before it, on the draft's KV cache. Runs
++    `block_decode_attention`, which has full CUDA graphs on SM8x."""
++
++    def __init__(self, *args, block: int, **kwargs) -> None:
++        super().__init__(*args, **kwargs)
++        window = args[5] if len(args) > 5 else kwargs.get("sliding_window")
++        # The kernel's window counts the block: `sliding_window - 1` context
++        # keys before the anchor, as the draft was trained.
++        self.window = int(window) - 1 + block if window else 0
++        self.block = block
++
++    def forward(
++        self,
++        layer: nn.Module,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache: torch.Tensor,
++        attn_metadata: FlashAttentionMetadata,
++        output: torch.Tensor,
++        output_scale: torch.Tensor | None = None,
++        output_block_scale: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        assert output_scale is None and output_block_scale is None
++        if attn_metadata is None:  # profiling
++            return output.fill_(0)
++        heads, dim, block = self.num_heads, self.head_size, self.block
++        key_cache, value_cache = kv_cache.transpose(1, 2).split(dim, dim=-1)
++        num_reqs = min(query.shape[0] // block, attn_metadata.seq_lens.shape[0])
++        num_tokens = num_reqs * block
++        num_splits = max(
++            1,
++            plan_decode_attention(
++                self.window > 0, num_reqs, block, heads, self.num_kv_heads, self.window
++            ),
++        )
++        block_decode_attention(
++            query[:num_tokens].view(num_tokens, heads, dim),
++            canonicalize_singleton_dim_strides(key_cache),
++            canonicalize_singleton_dim_strides(value_cache),
++            output.view(-1, heads * dim)[:num_tokens],
++            block_table=attn_metadata.block_table[:num_reqs],
++            cache_seqlens=attn_metadata.seq_lens[:num_reqs],
++            cu_seqlens_q=attn_metadata.query_start_loc[: num_reqs + 1],
++            block=block,
++            window=self.window,
++            num_splits=num_splits,
++        )
++        return output
++
++
++class BlockDraftBackend(FlashAttentionBackend):
++    @staticmethod
++    def get_impl_cls() -> type[FlashAttentionImpl]:
++        return BlockDraftImpl
++
++
 +def _linear(x: torch.Tensor, module: nn.Module) -> torch.Tensor:
 +    """`linear` on the module's weight, or its HyperInkling int4 copy."""
 +    w4 = getattr(module, "hyperinkling_w4", None)
@@ -772,7 +1147,7 @@ index 6e1755a18b..021ca02d30 100644
  class _RMSNorm(nn.Module):
      def __init__(self, hidden_size: int, eps: float) -> None:
          super().__init__()
-@@ -160,14 +198,20 @@ class Inkling2DraftSelfAttention(nn.Module):
+@@ -160,14 +258,20 @@ class Inkling2DraftSelfAttention(nn.Module):
          # Owns the paged KV cache only; the same spec as the target's layers
          # (the scheduler keeps the last sliding_window_size positions before
          # the block, which is what the draft reads).
@@ -794,7 +1169,7 @@ index 6e1755a18b..021ca02d30 100644
          )
          # Keys a block sees: itself and, if local, the window before it.
          self.window = config.sliding_window_size + self.block if is_local else 0
-@@ -192,15 +236,15 @@ class Inkling2DraftSelfAttention(nn.Module):
+@@ -192,15 +296,15 @@ class Inkling2DraftSelfAttention(nn.Module):
          impl.do_kv_cache_update(self.attn, k, v, self.attn.kv_cache, slot_mapping)
  
      def forward(
@@ -813,7 +1188,7 @@ index 6e1755a18b..021ca02d30 100644
              self.num_heads,
              self.num_kv_heads,
              self.eps,
-@@ -244,21 +288,21 @@ class Inkling2DraftSelfAttention(nn.Module):
+@@ -244,21 +348,21 @@ class Inkling2DraftSelfAttention(nn.Module):
                  window=self.window,
                  num_splits=num_splits,
              )
@@ -839,7 +1214,7 @@ index 6e1755a18b..021ca02d30 100644
          if slot_mapping is not None and self.attn.kv_cache.numel() > 0:
              self._write_kv(
                  k, v.view(-1, self.num_kv_heads, self.head_dim), slot_mapping
-@@ -282,8 +326,8 @@ class Inkling2DraftMLP(nn.Module):
+@@ -282,8 +386,8 @@ class Inkling2DraftMLP(nn.Module):
          )
  
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -850,7 +1225,7 @@ index 6e1755a18b..021ca02d30 100644
  
  
  class Inkling2DraftLayer(nn.Module):
-@@ -305,7 +349,7 @@ class Inkling2DraftLayer(nn.Module):
+@@ -305,7 +409,7 @@ class Inkling2DraftLayer(nn.Module):
          positions: torch.Tensor,
          x: torch.Tensor,
          residual: torch.Tensor | None,
@@ -859,7 +1234,7 @@ index 6e1755a18b..021ca02d30 100644
      ) -> tuple[torch.Tensor, torch.Tensor]:
          """Returns this rank's partial MLP output and the residual."""
          if residual is None:
-@@ -313,7 +357,7 @@ class Inkling2DraftLayer(nn.Module):
+@@ -313,7 +417,7 @@ class Inkling2DraftLayer(nn.Module):
              x = self.input_layernorm(x)
          else:
              x = all_reduce_add_rmsnorm(x, residual, self.input_layernorm)
@@ -868,7 +1243,7 @@ index 6e1755a18b..021ca02d30 100644
          x = all_reduce_add_rmsnorm(x, residual, self.post_attention_layernorm)
          return self.mlp(x), residual
  
-@@ -342,6 +386,9 @@ class Inkling2MarkovHead(nn.Module):
+@@ -342,6 +446,9 @@ class Inkling2MarkovHead(nn.Module):
          self.dflare_norm = _RMSNorm(hidden, config.rms_norm_eps)
          self.fold_weight: torch.Tensor | None = None
          self.fold_bias: torch.Tensor | None = None
@@ -878,7 +1253,7 @@ index 6e1755a18b..021ca02d30 100644
          self.rnn_bias: torch.Tensor | None = None
  
      @torch.no_grad()
-@@ -350,15 +397,34 @@ class Inkling2MarkovHead(nn.Module):
+@@ -350,15 +457,34 @@ class Inkling2MarkovHead(nn.Module):
          calls refill the same tensors, which CUDA graphs keep pointing at."""
          projection = self.hidden_out.weight.double()
          bias = self.hidden_out.bias.double()
@@ -916,7 +1291,7 @@ index 6e1755a18b..021ca02d30 100644
  
      def context(self, hidden: torch.Tensor, f_rnn: torch.Tensor) -> torch.Tensor:
          """fp32 `rnn_proj` bias plus its `[hidden, f_rnn]` term for the
-@@ -377,18 +443,19 @@ class Inkling2MarkovHead(nn.Module):
+@@ -377,18 +503,19 @@ class Inkling2MarkovHead(nn.Module):
          self, state: torch.Tensor, prev_tokens: torch.Tensor, context: torch.Tensor
      ) -> tuple[torch.Tensor, torch.Tensor]:
          """One recurrence step; returns the new state and the TP-local bias."""
@@ -940,7 +1315,7 @@ index 6e1755a18b..021ca02d30 100644
          super().__init__()
          self.config = config
          hidden = config.hidden_size
-@@ -406,13 +473,10 @@ class Inkling2DSparkDecoder(nn.Module):
+@@ -406,13 +533,10 @@ class Inkling2DSparkDecoder(nn.Module):
          )
          self.mask_embed = nn.Parameter(torch.zeros(hidden), requires_grad=False)
          self.register_buffer("fuse_alpha", torch.empty_like(self.fuse_weight))
@@ -958,7 +1333,7 @@ index 6e1755a18b..021ca02d30 100644
          # Shared with the target model (see Inkling2DSparkModel.attach_target).
          self.embed_tokens: nn.Module | None = None
          self.embed_norm: nn.Module | None = None
-@@ -434,7 +498,7 @@ class Inkling2DSparkDecoder(nn.Module):
+@@ -434,7 +558,7 @@ class Inkling2DSparkDecoder(nn.Module):
          x = self.embed_block(input_ids)
          residual = None
          for layer in self.layers:
@@ -967,7 +1342,7 @@ index 6e1755a18b..021ca02d30 100644
          assert residual is not None
          return all_reduce_add_rmsnorm(x, residual, self.norm)
  
-@@ -477,9 +541,7 @@ class Inkling2DSparkModel(nn.Module):
+@@ -477,9 +601,7 @@ class Inkling2DSparkModel(nn.Module):
                  "to at most that"
              )
          self.config = config
@@ -978,7 +1353,7 @@ index 6e1755a18b..021ca02d30 100644
          self.lm_head: nn.Module | None = None
  
      @torch.no_grad()
-@@ -501,7 +563,11 @@ class Inkling2DSparkModel(nn.Module):
+@@ -501,7 +623,11 @@ class Inkling2DSparkModel(nn.Module):
          assert self.lm_head is not None
          head = self.model.markov_head
          assert head.rnn_bias is not None
@@ -991,7 +1366,7 @@ index 6e1755a18b..021ca02d30 100644
          head.rnn_bias.copy_(head.rnn_proj.bias)
          self.model.fuse_alpha.copy_(
              torch.softmax(self.model.fuse_weight.float(), dim=-1)
-@@ -525,7 +591,7 @@ class Inkling2DSparkModel(nn.Module):
+@@ -525,7 +651,7 @@ class Inkling2DSparkModel(nn.Module):
              layer.self_attn.store_context_kv(
                  context,
                  context_positions,
@@ -1000,7 +1375,7 @@ index 6e1755a18b..021ca02d30 100644
                  None if context_slot_mappings is None else context_slot_mappings[i],
              )
  
-@@ -544,6 +610,9 @@ class Inkling2DSparkModel(nn.Module):
+@@ -544,6 +670,9 @@ class Inkling2DSparkModel(nn.Module):
      def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
          """TP-local bf16 base logits (bf16 GEMM, as the reference)."""
          assert self.lm_head is not None
@@ -1010,7 +1385,7 @@ index 6e1755a18b..021ca02d30 100644
          return linear(hidden_states, self.lm_head.weight)
  
      def markov_step(
-@@ -586,4 +655,33 @@ class Inkling2DSparkModel(nn.Module):
+@@ -586,4 +715,33 @@ class Inkling2DSparkModel(nn.Module):
              else:
                  param.weight_loader(param, weight, shard)
              loaded.add(name)
@@ -1076,26 +1451,36 @@ index bee8058353..daca53110a 100644
          up = self.controller_gain_forget[streams]
          if use_sm12x_bf16_ll_gemm(pair, down):
 diff --git a/vllm/models/inkling2/nvidia/model.py b/vllm/models/inkling2/nvidia/model.py
-index db9a9bc16b..58cd3b52ab 100644
+index db9a9bc16b..cf72afb786 100644
 --- a/vllm/models/inkling2/nvidia/model.py
 +++ b/vllm/models/inkling2/nvidia/model.py
-@@ -82,6 +82,15 @@ class Inkling2LogitsProcessor(LogitsProcessor):
+@@ -82,6 +82,25 @@ class Inkling2LogitsProcessor(LogitsProcessor):
      """Use the low-M projection while preserving vocab gathering and softcaps."""
  
      def _apply_head(self, lm_head, hidden_states, embedding_bias):
 +        w8 = getattr(lm_head, "hyperinkling_w8", None)
 +        if w8 is not None and embedding_bias is None:
-+            # HyperInkling INT8 head, fp32 logits as the bf16 head computes.
++            # HyperInkling INT8 head, fp32 logits as the bf16 head computes. Only
++            # the real vocabulary's rows: the padding ones would be masked (each
++            # column is computed alone, so the others do not change).
++            n = w8.size_n
++            if (
++                lm_head.tp_size == 1
++                and lm_head.shard_indices.num_org_vocab_padding == 0
++            ):
++                n = min(n, self.org_vocab_size)
 +            out = torch.empty(
-+                (hidden_states.shape[0], w8.size_n),
++                (hidden_states.shape[0], n),
 +                dtype=torch.float32,
 +                device=hidden_states.device,
 +            )
-+            return w8(hidden_states, out)
++            from .ops.linear_w8 import w8_matmul
++
++            return w8_matmul(hidden_states.contiguous(), w8.q[:n], w8.scale[:n], out)
          from vllm.model_executor.layers.linear import UnquantizedLinearMethod
          from vllm.model_executor.layers.vocab_parallel_embedding import (
              UnquantizedEmbeddingMethod,
-@@ -206,8 +215,8 @@ class Inkling2DecoderLayer(nn.Module):
+@@ -206,8 +225,8 @@ class Inkling2DecoderLayer(nn.Module):
          )
          self.mlp_norm = Inkling2RMSNorm(config.hidden_size, eps)
          expert_format: QuantFormat = (
@@ -1106,7 +1491,7 @@ index db9a9bc16b..58cd3b52ab 100644
              else "nvfp4"
          )
          self.mlp = Inkling2MoE(config, expert_format, config.layer_visit_ids(layer_id))
-@@ -811,9 +820,82 @@ class Inkling2ForConditionalGeneration(
+@@ -811,9 +830,82 @@ class Inkling2ForConditionalGeneration(
                  loaded.add(name)
          if self.visual is not None:
              loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual_weights)}
@@ -2263,10 +2648,10 @@ index 9c5fe9ce3c..f6551a7e9e 100644
      )
 diff --git a/vllm/models/inkling2/nvidia/ops/lookup.py b/vllm/models/inkling2/nvidia/ops/lookup.py
 new file mode 100644
-index 0000000000..9103f9b745
+index 0000000000..f1c8baf1b2
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/lookup.py
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,284 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Drafting from the request's own context (HYPERINKLING_LOOKUP=1).
@@ -2423,6 +2808,33 @@ index 0000000000..9103f9b745
 +    tl.store(row + token, 0.0)
 +
 +
++@triton.jit
++def _claim_candidates_kernel(
++    draft_ptr,
++    draft_stride,
++    used_ptr,
++    idx_mapping_ptr,
++    idx_mapping_stride,
++    cached_ptr,
++    num_steps,
++    top_k,
++    BLOCK_K: tl.constexpr,
++):
++    """Grid (requests, K): a sparse draft-logits cache (DFlash2's, which clears
++    only the candidates it wrote last) records each point mass's token as its
++    candidates, so the next step clears it."""
++    req = tl.program_id(0)
++    step = tl.program_id(1)
++    req_state = tl.load(idx_mapping_ptr + req * idx_mapping_stride)
++    if (req_state < 0) | (step >= tl.load(used_ptr + req)):
++        return
++    token = tl.load(draft_ptr + req * draft_stride + step).to(tl.int64)
++    offs = tl.arange(0, BLOCK_K)
++    base = (req_state.to(tl.int64) * num_steps + step) * top_k
++    tokens = tl.zeros_like(offs).to(tl.int64) + token
++    tl.store(cached_ptr + base + offs, tokens, mask=offs < top_k)
++
++
 +class ContextLookup:
 +    """Persistent buffers for one speculator (CUDA-graph safe: no host reads)."""
 +
@@ -2500,9 +2912,33 @@ index 0000000000..9103f9b745
 +                BLOCK_V=4096,
 +                num_warps=4,
 +            )
++
++    def claim_candidates(
++        self,
++        draft_tokens: torch.Tensor,
++        idx_mapping: torch.Tensor,
++        idx_mapping_stride: int,
++        num_reqs: int,
++        cached_candidate_ids: torch.Tensor,
++    ) -> None:
++        """After `apply`, for a cache that clears only its last candidates
++        (`cached_candidate_ids [rows, K, top_k]`)."""
++        top_k = cached_candidate_ids.shape[-1]
++        _claim_candidates_kernel[(num_reqs, self.k)](
++            draft_tokens,
++            draft_tokens.stride(0),
++            self.used,
++            idx_mapping,
++            idx_mapping_stride,
++            cached_candidate_ids,
++            self.k,
++            top_k,
++            BLOCK_K=triton.next_power_of_2(top_k),
++            num_warps=1,
++        )
 diff --git a/vllm/models/inkling2/nvidia/ops/moe_marlin.py b/vllm/models/inkling2/nvidia/ops/moe_marlin.py
 new file mode 100644
-index 0000000000..216edd678b
+index 0000000000..f25fa1f5a6
 --- /dev/null
 +++ b/vllm/models/inkling2/nvidia/ops/moe_marlin.py
 @@ -0,0 +1,272 @@
@@ -2552,8 +2988,8 @@ index 0000000000..216edd678b
 +
 +ExpertFormat = Literal["nvfp4", "mxfp8", "int4"]
 +INT4_GROUP = 128
-+# `moe_align_block_size` places an expert's rows in atomic order, different at every call.
-+# A row's result depends on its Marlin block, so the rows are put in ascending order.
++# `moe_align_block_size` places an expert's rows in atomic order, different at every
++# call. A row's result depends on its Marlin block, so the rows go in ascending order.
 +_MOE_ORDER = os.environ.get("HYPERINKLING_MOE_ORDER", "1") == "1"
 +
 +
@@ -2597,7 +3033,7 @@ index 0000000000..216edd678b
 +    block_m: int,
 +    num_experts: int,
 +) -> None:
-+    """Rewrite `moe_align_block_size`'s `sorted_ids` with each expert's rows ascending."""
++    """Rewrite `moe_align_block_size`'s `sorted_ids`, each expert's rows ascending."""
 +    _order_rows_kernel[(num_experts,)](
 +        ids,
 +        sorted_ids,
@@ -2959,19 +3395,29 @@ index af504ebc6a..c1a70321e6 100644
 +            return "int4"
 +        return "mxfp8" if self.is_mxfp8_layer(layer_id) else "nvfp4"
 diff --git a/vllm/models/inkling2/speculator.py b/vllm/models/inkling2/speculator.py
-index 6beae2b0d5..37bfafbbf5 100644
+index 6beae2b0d5..4a9870acea 100644
 --- a/vllm/models/inkling2/speculator.py
 +++ b/vllm/models/inkling2/speculator.py
-@@ -3,6 +3,8 @@
- """DSpark speculator for the Inkling2 draft: stores the raw target features
- (each draft layer mixes them itself) and runs its recurrent Markov head."""
- 
-+import os
+@@ -1,12 +1,16 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""DSpark speculator for the Inkling2 draft: stores the raw target features
+-(each draft layer mixes them itself) and runs its recurrent Markov head."""
++"""Inkling2 speculators: DSpark, whose draft stores the raw target features
++(each draft layer mixes them itself) and runs its recurrent Markov head, and
++DFlash2, which needs the target's normalized input embeddings."""
 +
++import os
+ 
  import torch
  import torch.nn as nn
  
-@@ -14,7 +16,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ from vllm.config import VllmConfig
++from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
+ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ 
+@@ -14,7 +18,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
  class Inkling2DSparkSpeculator(DSparkSpeculator):
      _speculator_name = "Inkling2 DSpark"
  
@@ -2980,7 +3426,7 @@ index 6beae2b0d5..37bfafbbf5 100644
          super().__init__(vllm_config, device)
          config = self.draft_model_config.hf_config
          assert not self.sample_from_anchor
-@@ -34,6 +36,15 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
+@@ -34,6 +38,15 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
          self.f_rnn = torch.zeros(
              self.max_num_reqs, config.hidden_size, dtype=self.dtype, device=device
          )
@@ -2996,7 +3442,7 @@ index 6beae2b0d5..37bfafbbf5 100644
  
      def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
          # Draft base logits come from a bf16 GEMM, unlike the target's fp32 head.
-@@ -75,3 +86,14 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
+@@ -75,3 +88,121 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                  logits = self.model.markov_logits(base_logits[:, i], bias)
                  prev = self._sample_logits(logits, idx_map[:, i], sample_pos[:, i], i)
              self.draft_tokens[:num_reqs, i] = prev
@@ -3011,11 +3457,118 @@ index 6beae2b0d5..37bfafbbf5 100644
 +                self.draft_tokens,
 +                None if self.draft_logits is None else self.draft_logits.values,
 +            )
++
++
++class Inkling2DFlash2Speculator(DFlash2Speculator):
++    _speculator_name = "Inkling2 DFlash2"
++
++    def __init__(self, vllm_config: VllmConfig, device: torch.device, req_states=None):
++        super().__init__(vllm_config, device)
++        # HYPERINKLING_LOOKUP=1: drafts from the request's own context (ops/lookup.py).
++        self.lookup = None
++        if os.environ.get("HYPERINKLING_LOOKUP") == "1" and req_states is not None:
++            from vllm.models.inkling2.nvidia.ops.lookup import ContextLookup
++
++            self.req_states = req_states
++            self.lookup = ContextLookup(
++                self.max_num_reqs, self.num_speculative_steps, device
++            )
++
++    def _generate_draft(self, num_reqs: int, *args, **kwargs) -> None:
++        super()._generate_draft(num_reqs, *args, **kwargs)
++        if self.lookup is None:
++            return
++        logits = self.draft_logits
++        assert logits is None or logits.row_mapping is None
++        n_spec = self.num_speculative_steps
++        self.lookup.apply(
++            self.req_states.all_token_ids.gpu,
++            self.req_states.total_len.gpu,
++            self.sample_idx_mapping,
++            n_spec,
++            num_reqs,
++            self.draft_tokens,
++            None if logits is None else logits.values,
++        )
++        if logits is not None:
++            self.lookup.claim_candidates(
++                self.draft_tokens,
++                self.sample_idx_mapping,
++                n_spec,
++                num_reqs,
++                self.candidate_sampler.cached_candidate_ids,
++            )
++
++    def load_draft_model(
++        self, target_model: nn.Module, target_attn_layer_names: set[str]
++    ) -> nn.Module:
++        from .nvidia.model import Inkling2LogitsProcessor
++
++        model = super().load_draft_model(target_model, target_attn_layer_names)
++        # The draft shares the target's embed_tokens; Inkling2 normalizes them.
++        model.model.embed_norm = target_model.get_language_model().model.embed_norm
++        # HyperInkling: the shared head may be INT8, which only Inkling2's
++        # processor projects.
++        model.candidate_logits_processor.__class__ = Inkling2LogitsProcessor
++        _use_block_draft_attention(model, self.num_query_per_req)
++        if os.environ.get("HYPERINKLING_DRAFT_W4") == "1":
++            draft = model.model
++            for layer in draft.layers:
++                attn, mlp = layer.self_attn, layer.mlp
++                for linear in (attn.qkv_proj, attn.o_proj, mlp.gate_up_proj):
++                    _W4Apply.install(linear)
++                _W4Apply.install(mlp.down_proj)
++            _W4Apply.install(draft.fc)
++            torch.cuda.empty_cache()
++        return model
++
++
++def _use_block_draft_attention(model: nn.Module, block: int) -> None:
++    """HyperInkling: the draft's attention layers on `BlockDraftBackend` instead of
++    the selected one (FlashInfer on SM8x, without full CUDA graphs). Before the KV
++    cache and the metadata builders, which follow the layers' backend."""
++    from .nvidia.dspark import BlockDraftBackend
++
++    for layer in model.model.layers:
++        attn = layer.self_attn.attn
++        attn.attn_backend = BlockDraftBackend
++        attn.impl = BlockDraftBackend.get_impl_cls()(
++            attn.num_heads,
++            attn.head_size,
++            attn.impl.scale,
++            attn.num_kv_heads,
++            None,
++            attn.sliding_window,
++            attn.kv_cache_dtype,
++            block=block,
++        )
++
++
++class _W4Apply:
++    """HyperInkling: a draft linear's quant method as int4 g128 (round to
++    nearest). The context K/V keeps its own bf16 copy of the K/V weights; draft
++    weights only change which drafts are proposed."""
++
++    def __init__(self, weight: torch.Tensor) -> None:
++        from .nvidia.ops.linear_w4 import W4Linear
++
++        self.w4 = W4Linear(weight)
++
++    @classmethod
++    def install(cls, linear: nn.Module) -> None:
++        linear.quant_method = cls(linear.weight.data)
++        linear.weight.data = linear.weight.data.new_empty((0,))
++
++    def apply(
++        self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
++    ) -> torch.Tensor:
++        y = self.w4(x.reshape(-1, x.shape[-1])).view(*x.shape[:-1], -1)
++        return y if bias is None else y + bias
 diff --git a/vllm/models/inkling2/speculator_config.py b/vllm/models/inkling2/speculator_config.py
-index 0d367f8309..dcc7b20b89 100644
+index 0d367f8309..ac400c40ee 100644
 --- a/vllm/models/inkling2/speculator_config.py
 +++ b/vllm/models/inkling2/speculator_config.py
-@@ -1,8 +1,8 @@
+@@ -1,9 +1,15 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 -from typing import TYPE_CHECKING
@@ -3023,10 +3576,17 @@ index 0d367f8309..dcc7b20b89 100644
 +from typing import TYPE_CHECKING, ClassVar
  
 -from vllm.platforms import current_platform
++from vllm.v1.worker.gpu.spec_decode.dflash.config import DFlashSpeculatorConfig
++from vllm.v1.worker.gpu.spec_decode.dflash2.config import DFlash2SpeculatorConfig
  from vllm.v1.worker.gpu.spec_decode.dspark.config import DSparkSpeculatorConfig
++from vllm.v1.worker.gpu.spec_decode.speculator_config import (
++    SpeculatorConfig,
++    _get_draft_declared_config_class,
++)
  
  if TYPE_CHECKING:
-@@ -11,11 +11,18 @@ if TYPE_CHECKING:
+     from vllm.config import SpeculativeConfig
+@@ -11,14 +17,99 @@ if TYPE_CHECKING:
  
  class Inkling2DSparkSpeculatorConfig(DSparkSpeculatorConfig):
      speculator_class = "vllm.models.inkling2.speculator.Inkling2DSparkSpeculator"
@@ -3046,6 +3606,87 @@ index 0d367f8309..dcc7b20b89 100644
              # The target's clipped, unit-scale FP8 cache does not describe the
              # draft's unnormalized values. Keep the draft cache in BF16.
              if spec.kv_cache_dtype is None:
+                 spec.kv_cache_dtype = "auto"
+             elif spec.kv_cache_dtype not in ("auto", "bfloat16"):
+                 raise ValueError("Inkling2 DSpark on SM12 requires BF16 draft KV")
++
++
++class Inkling2DFlash2SpeculatorConfig(DFlash2SpeculatorConfig):
++    """DFlash2 drafts of Inkling2 (e.g. incoai/Inkling-2-Mini-DFlash2); other
++    DFlash drafts keep the speculator they declare."""
++
++    speculator_class = "vllm.models.inkling2.speculator.Inkling2DFlash2Speculator"
++    # HYPERINKLING_LOOKUP, as for DSpark.
++    prefer_dense_token_history: ClassVar[bool] = (
++        os.environ.get("HYPERINKLING_LOOKUP") == "1"
++    )
++
++    @staticmethod
++    def _is_dflash2(spec: "SpeculativeConfig") -> bool:
++        draft = spec.draft_model_config
++        if draft is None:
++            return False
++        return "DFlash2DraftModel" in (
++            getattr(draft.hf_config, "architectures", None) or []
++        )
++
++    @classmethod
++    def specialize(cls, spec: "SpeculativeConfig") -> type[SpeculatorConfig]:
++        if cls._is_dflash2(spec):
++            return cls
++        # What the generic DFlash config resolves to without this one.
++        declared = _get_draft_declared_config_class(spec)
++        if declared is not None and issubclass(declared, DFlashSpeculatorConfig):
++            return declared
++        return DFlashSpeculatorConfig
++
++    @classmethod
++    def adapt_draft_model_config(cls, spec: "SpeculativeConfig") -> None:
++        if not cls._is_dflash2(spec):
++            DFlashSpeculatorConfig.adapt_draft_model_config(spec)
++            return
++        super().adapt_draft_model_config(spec)
++        draft = spec.draft_model_config.hf_config
++        dflash_config = draft.dflash_config
++        text = spec.target_model_config.hf_text_config
++        loop = text.loop_config
++        if loop is not None and text.num_loop_passes != loop["num_passes"]:
++            raise ValueError(
++                "Inkling2 DFlash2 drafts read hidden states at fixed layer visits; "
++                f"serve them at the checkpoint's {loop['num_passes']} loop passes"
++            )
++        if (
++            draft.hidden_size != text.hidden_size
++            or getattr(draft, "num_target_layers", text.num_layer_visits)
++            != text.num_layer_visits
++        ):
++            raise ValueError(
++                "This DFlash2 draft was trained for another target: its "
++                "hidden_size or num_target_layers differs from Inkling2's "
++                f"({text.hidden_size}, {text.num_layer_visits} layer visits)"
++            )
++        features = list(dflash_config.get("target_layer_ids") or [])
++        if (
++            len(features) < 2
++            or features[0] < 0
++            or features != sorted(set(features))
++            or features[-1] != text.num_layer_visits
++        ):
++            raise ValueError(
++                "Inkling2 DFlash2 target_layer_ids must be sorted target layer "
++                "visits followed by num_layer_visits (the final-norm output)"
++            )
++        # The target captures the input of each listed visit and appends its
++        # final-norm output, which the last id names: no DFlash +1 shift.
++        draft.eagle_aux_hidden_state_layer_ids = features
++        num_spec = int(dflash_config["block_size"]) - 1
++        if spec.num_speculative_tokens is None:
++            spec.num_speculative_tokens = num_spec
++        elif spec.num_speculative_tokens != num_spec:
++            raise ValueError(
++                f"Inkling2 DFlash2 requires num_speculative_tokens = {num_spec} "
++                "(the draft's block_size - 1)"
++            )
 diff --git a/vllm/parser/inkling.py b/vllm/parser/inkling.py
 index d1edad1cb9..930b9daa0f 100644
 --- a/vllm/parser/inkling.py
@@ -3639,10 +4280,10 @@ index 56cfeddefc..bfe460a0a9 100644
          # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
 diff --git a/vllm/v1/spec_decode/dynamic/adaptive_k.py b/vllm/v1/spec_decode/dynamic/adaptive_k.py
 new file mode 100644
-index 0000000000..4cd88f259e
+index 0000000000..aef9adde49
 --- /dev/null
 +++ b/vllm/v1/spec_decode/dynamic/adaptive_k.py
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,133 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HyperInkling: the verify length of each step, chosen online.
@@ -3746,7 +4387,10 @@ index 0000000000..4cd88f259e
 +
 +    def observe_request(self, num_verified: int, num_accepted: int) -> None:
 +        """One request's verdict: drafts 0..num_accepted-1 accepted and, if
-+        any was left, draft num_accepted rejected."""
++        any was left, draft num_accepted rejected. A step that verified no
++        draft (none proposed) says nothing."""
++        if num_verified <= 0:
++            return
 +        reached = min(num_accepted + 1, num_verified)
 +        for i in range(reached):
 +            self.ok[i] = self.ok[i] * _DECAY + (1.0 if i < num_accepted else 0.0)
@@ -3875,6 +4519,86 @@ index 079fffb171..911ec62d04 100644
      available = measure_kv_cache_bytes(requested_memory=requested_memory, **measured)
      utilization = vllm_config.cache_config.gpu_memory_utilization
      # Explicit values just under 1.0 are mostly habits from estimate-based
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator_config.py b/vllm/v1/worker/gpu/spec_decode/speculator_config.py
+index e185f56302..600e84a10e 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator_config.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator_config.py
+@@ -372,6 +372,16 @@ _CONFIG_BY_METHOD: dict[str, str] = {
+ # Combined checkpoints need a model-specific transform before the draft's
+ # architecture can be inspected. Keys use the target's text model type.
+ _CONFIG_BY_TARGET_MODEL_TYPE: dict[str, dict[str, str]] = {
++    "dflash": {
++        # Inkling 2 Small's text config keeps the class's model type; Mini's
++        # checkpoint names its own.
++        "inkling2_model": (
++            "vllm.models.inkling2.speculator_config.Inkling2DFlash2SpeculatorConfig"
++        ),
++        "inkling2_loop_text": (
++            "vllm.models.inkling2.speculator_config.Inkling2DFlash2SpeculatorConfig"
++        ),
++    },
+     "dfly": {
+         "hy_v4": "vllm.models.hy_v4.dfly_config.HYV4DFlySpeculatorConfig",
+         "hy_v4_flash": (
+@@ -442,25 +452,29 @@ def get_method_config_class(spec_config: "SpeculativeConfig") -> type[Speculator
+     if method not in _CONFIG_BY_METHOD:
+         raise ValueError(f"Unsupported speculative method: '{method}'")
+     config_cls = resolve_obj_by_qualname(_CONFIG_BY_METHOD[method])
+-    target_configs = _CONFIG_BY_TARGET_MODEL_TYPE.get(method)
+-    if target_configs is None:
++    target_config_cls = _get_target_config_class(spec_config, method)
++    if target_config_cls is None:
+         return config_cls
++    if not (
++        isinstance(target_config_cls, type)
++        and issubclass(target_config_cls, SpeculatorConfig)
++        and issubclass(target_config_cls, config_cls)
++        and target_config_cls.base_method == method
++    ):
++        raise TypeError(
++            f"Target config {target_config_cls!r} must specialize method {method!r}"
++        )
++    return target_config_cls
++
++
++def _get_target_config_class(spec_config: "SpeculativeConfig", method: str) -> Any:
++    """The target family's config for `method`, if it has one."""
++    target_configs = _CONFIG_BY_TARGET_MODEL_TYPE.get(method)
+     target = spec_config.target_model_config
+-    if target is not None:
+-        model_type = target.hf_text_config.model_type
+-        if qualname := target_configs.get(model_type):
+-            target_config_cls = resolve_obj_by_qualname(qualname)
+-            if not (
+-                isinstance(target_config_cls, type)
+-                and issubclass(target_config_cls, SpeculatorConfig)
+-                and issubclass(target_config_cls, config_cls)
+-                and target_config_cls.base_method == method
+-            ):
+-                raise TypeError(
+-                    f"Target config {qualname!r} must specialize method {method!r}"
+-                )
+-            return target_config_cls
+-    return config_cls
++    if target_configs is None or target is None:
++        return None
++    qualname = target_configs.get(target.hf_text_config.model_type)
++    return None if qualname is None else resolve_obj_by_qualname(qualname)
+ 
+ 
+ def get_speculator_config_class(
+@@ -518,6 +532,11 @@ def _resolve_checkpoint_config_class(
+ 
+     if declared_cls is not None:
+         assert issubclass(declared_cls, DraftModelSpeculatorConfig)
++        # Detected from the draft: the target family may specialize it.
++        assert declared_cls.base_method is not None
++        target_cls = _get_target_config_class(spec_config, declared_cls.base_method)
++        if isinstance(target_cls, type) and issubclass(target_cls, declared_cls):
++            return target_cls
+         return declared_cls
+     for method in _CHECKPOINT_DETECTION_ORDER:
+         config_cls = resolve_obj_by_qualname(_CONFIG_BY_METHOD[method])
 -- 
 2.56.1
 

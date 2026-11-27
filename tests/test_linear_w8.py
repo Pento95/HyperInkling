@@ -16,6 +16,7 @@ from vllm.models.inkling2.nvidia.ops.linear_w8 import (
     W8Linear,
     dequantize_int8,
     quantize_int8,
+    w8_matmul,
 )
 
 CKPT = os.path.join(
@@ -69,3 +70,17 @@ def test_w8_multi(tokens):
         want = x.float() @ dense[lo:hi].T
         assert got.shape == want.shape
         assert ((got.float() - want).norm() / want.norm()).item() < 5e-3
+
+
+@pytest.mark.parametrize("tokens", [1, 8, 40, 200])
+def test_w8_head_real_rows_bitwise(tokens):
+    """The LM head computes only the real vocabulary's rows (Inkling2LogitsProcessor):
+    the tile must not depend on the row count, or the logits would change."""
+    torch.manual_seed(0)
+    weight = torch.randn(40_960, 256, device="cuda", dtype=torch.bfloat16)
+    q, scale = quantize_int8(weight)
+    x = torch.randn(tokens, 256, device="cuda", dtype=torch.bfloat16)
+    full = w8_matmul(x, q, scale, torch.empty(tokens, 40_960, device="cuda"))
+    real = torch.empty(tokens, 40_001, device="cuda")
+    w8_matmul(x, q[:40_001], scale[:40_001], real)
+    assert torch.equal(full[:, :40_001], real)

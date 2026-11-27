@@ -157,6 +157,33 @@ Facts, gotchas and the reasons behind the choices, so they are not re-derived.
   (`include/basalt/spec/draft_policy.hpp`); vLLM's `enable_adaptive_verification` is the
   same idea.
 
+## DFlash2 (the default drafter)
+
+- **`incoai/Inkling-2-Mini-DFlash2`, 5 layers with a 2048-token window, 16 candidates per
+  position and a selector that walks them.** vLLM's generic DFlash2 path got three things wrong
+  for Inkling 2 (our upstream PR, branch `inkling-dflash2` on the fork): the capture ids (DFlash
+  adds 1; Inkling 2 captures each visit's input and appends the final-norm output), the
+  target's `embed_norm` on the shared embeddings (without it no draft is accepted), and the soft
+  cap on the selector's summed scores (`selector_softcap_mode`). The drafter's own SGLang patch
+  and an independent llama.cpp port make the same three fixes.
+- **On SM8x the draft's attention runs in `block_decode_attention`** (`BlockDraftImpl`,
+  `dspark.py`): vLLM picked FlashInfer for the fp8 cache (FlashAttention 2 has no fp8 kernel), which
+  has no full CUDA graphs for the draft, so the draft ran eagerly: 191 tok/s at one request
+  against 268-271 with the graphs, and FlashInfer's workspace cost ~64k tokens of KV. The window is
+  `sliding_window - 1` keys before the block, as the draft was trained.
+- **Draft linears INT4, LM head INT8 shared with the target**, as for DSpark: acceptance unchanged
+  (4.02 tokens per step against 3.86-3.95 in bf16), +15% speed, +61k tokens of KV.
+- **Where each drafter wins** (one RTX 3090 Ti, `bench/spec_bench.py`, `extract_bench.py`,
+  `context_bench.py`, `scripts/quick_bench.py`): DFlash2 +30-45% on chat, code and structured
+  output at 0.2-0.5, +12% decode on document extraction with pages, +20-40% at 8-64 requests (it
+  still beats no speculation at 64, where DSpark loses 23%). DSpark +10-19% on 8-32k-token documents
+  summarized whole: its global layer sees the whole document, DFlash2's window 2048 tokens. At 128k
+  they are even, both ~1.8x no speculation. The context lookup adds 2-3% to DFlash2.
+- **The lookup's point masses on DFlash2's sparse draft-logits cache**: the cache clears only the
+  candidates it wrote last, so a point mass would leave its token at 0 the next step and rejection
+  sampling would no longer be exact. `ContextLookup.claim_candidates` records the token as the
+  step's candidates (`tests/test_lookup_dflash2.py`).
+
 ## Gotchas met
 
 - **`git am` drops a bracketed subject prefix**: `scripts/setup-vllm.sh` uses

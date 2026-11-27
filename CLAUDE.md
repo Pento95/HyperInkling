@@ -48,7 +48,12 @@ Key mechanisms of the port (spread across several files):
   prefill alone gives the same numbers bit for bit (generation with DSpark does not repeat).
 - Tool calls: `HYPERINKLING_TOOL_GRAMMAR` (`vllm/parser/inkling.py`), xgrammar on the tool blocks.
 - `HYPERINKLING_CAPTURE_DIR` enables the MoE input/routing capture hook used by GPTQ.
-- DSpark speculative decoding (on by default, `SPEC`): the block drafter always drafts 7;
+- DFlash2 speculative decoding (the default, `SPEC=dflash2`, drafter in `DFLASH2_MODEL`):
+  `Inkling2DFlash2SpeculatorConfig`/`Inkling2DFlash2Speculator` (`models/inkling2/speculator*.py`,
+  our upstream PR on branch `inkling-dflash2`); on sm8x the draft's attention is
+  `BlockDraftImpl` (`dspark.py`, `block_decode_attention`, full CUDA graphs), the draft linears
+  INT4, the lookup claims its point masses in DFlash2's sparse draft-logits cache.
+- DSpark speculative decoding (`SPEC=dspark`): the block drafter always drafts 7;
   `SPEC_K` sets how many the target verifies per batch size (vLLM dynamic speculative
   decoding). Drafter layers and Markov fold INT4 (`ops/linear_w4.py`), base logits from the
   shared INT8 head, draft KV FP8 through a KV-write-only FlashAttention impl (`dspark.py`).
@@ -77,7 +82,7 @@ PORT=18030 ./start.sh                 # test instance on another port
 PROFILE=<name> ./start.sh             # Nsight Systems; POST /start_profile, /stop_profile
 scripts/serve-try.sh <log> [args]     # short-context eager boot of the original checkpoint, :18030
 
-venv/bin/python -m pytest -q tests/                          # needs the GPU, except test_{auth,status_page,tool_grammar,json_whitespace}.py
+venv/bin/python -m pytest -q tests/                          # needs the GPU, except test_{auth,status_page,tool_grammar,json_whitespace,adaptive_k}.py
 venv/bin/python -m pytest -q -s tests/test_bgemv.py -k <name>  # one test, with timings
 ruff check bench prepare tests scripts                        # lint: ruff 0.17.6 (as CI), rules in ruff.toml
 ```

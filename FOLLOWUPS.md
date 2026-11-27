@@ -11,7 +11,7 @@ fetched with `hf download --include` only when chosen.
 | 4, speed and upstream | 58, 64, 22, 10, 7, 21, 32 |
 | 5, tool calls | 61 |
 
-Released: `ghcr.io/pento95/hyperinkling:0.1.5` (compose default) and two HF checkpoints, the
+Released: `ghcr.io/pento95/hyperinkling:0.1.6` (compose default) and two HF checkpoints, the
 original (README = docs/MODEL_CARD.md) and the uncensored one (README =
 docs/MODEL_CARD_UNCENSORED.md): re-upload a card when it changes. A new image goes with a new
 tag (`scripts/build-image.sh` refuses a published one) and the compose default.
@@ -80,32 +80,13 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
 
 ## Phase 4: speed and polish
 
-58. **DFlash2 drafter**, [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)
-    (Apache-2.0, 495M parameters, 5 layers, all with a 2048 window, block 8 = 7 drafts per request,
-    16 candidates per position). Tokens per verify step on our W4 target, greedy, 7 drafts verified,
-    700-token answers (DFlash2 offline in fp32, DSpark as served):
-
-    | | chat | prose | code | struct | doc | all |
-    |---|---|---|---|---|---|---|
-    | DFlash2 | 2.99 | 2.24 | 4.25 | 4.16 | 3.86 | **3.34** |
-    | DSpark | 1.84 | 1.54 | 3.39 | 3.31 | 3.23 | 2.44 |
-
-    Acceptance by position (all 7 verified): chat 0.70 / 0.46 / 0.30 / 0.22 / 0.15 / 0.10 / 0.06, code 0.83 / 0.64 /
-    0.53 / 0.43 / 0.34 / 0.27 / 0.22. How it was measured: the target's features for the whole text from one prefill
-    (a dump hook in `Inkling2DSparkModel.precompute_and_store_context_kv`, `.local/df/hook.patch`), the drafter run
-    offline in PyTorch on them (`.local/df/offline.py`, greedy walk of the selector); the drafter weights are in
-    `.local/df/drafter`.
-    Layers in INT4 g128 (round to nearest) with the INT8 head: 3.29 (INT4 g32 3.31, INT8 3.34). Verifying
-    2 / 3 / 4 / 5 / 7: 2.35 / 2.73 / 2.98 / 3.15 / 3.34, so 4 drafts already beat DSpark at 7. Uncensored
-    checkpoint: 3.37 against 2.44. It also has no global KV (DSpark's costs 2 KiB per token, up to ~12% of the context). The port:
-    vLLM has DFlash2, not with Inkling; features = DSpark's (visits 5, 23, 41 and the final norm),
-    the target's `embed_norm` on the borrowed embeddings, softcap after the selector's
-    correction, candidates from the first 200,058 ids (llama.cpp#33049 fixes the same three). Then
-    INT4 layers, the shared INT8 head, the lookup and the adaptive verify length, and tok/s at 1 and 6
-    requests. Not measured: temperature above 0, tok/s. Published checkpoints keep `mtp.safetensors` (636 MB):
-    images up to 0.1.5 need it; when DFlash2 becomes the default the wizard downloads only the chosen
-    drafter (DFlash2 from its own repository, 990 MB in bf16), DSpark stays an option.
-    2DSD (drafting across the loops) exists only for a research variant of the model.
+58. **DFlash2, what is left** [NS] (NOTES "DFlash2"): the selector's codebooks in INT8 (2 x 103 MB
+    bf16, ~10k tokens of KV); the draft KV in bf16 (the drafter's values are not unit-scale, DSpark keeps
+    bf16 on SM12x for that reason), which needs `SconvStateManager` to take a hit alignment larger than
+    the block size (its assert fires: the alignment is set before the draft's pages are known);
+    long-document acceptance (DSpark is 10-19% ahead at 8-32k); our block-attention fix for SM8x as a
+    comment on #69165 once both PRs are in; published checkpoints keep `mtp.safetensors` (636 MB) for
+    `SPEC=dspark`.
 
 7. **Per-request verify length** [BS draft policy, vLLM adaptive verification]: needs decode
    graphs with per-request query lengths; docs/varlen-decode-investigation.md maps the
@@ -144,12 +125,9 @@ own structure, **[NS]** ours (measurements in this repo, nsys profiles).
     (`scripts/setup-vllm.sh` stops if a force-push removed it). #69165 hit a sampler-warmup
     OOM at `max_num_seqs` 256: keep the wizard's cap.
 
-64. **No speculation above a batch size** [NS]. Aggregate decode, prose, 512 tokens, `MAX_SEQS=64`
-    (`scripts/quick_bench.py`), DSpark against `SPEC=off`: 1 request 148-164 / 136 tok/s, 8: 588 / 527,
-    16: 900 / 798, 32: 1264 / 1263, 64: 1432 / 1860. The adaptive verify length chooses among 2, 4, 7, never 0;
-    vLLM's schedule accepts k = 0 per batch size. Next: 0 as a candidate (its cost measured like the others,
-    with or without the drafter's pass), its decode graphs' context, then code and structured text, where
-    the break-even should move above 32. Until then the wizard proposes `SPEC=off` from 32 requests.
+64. **No speculation above a batch size** [NS]: DSpark only breaks even at 32 requests and loses 23% at
+    64 (prose, `scripts/quick_bench.py`); DFlash2 is still +35% over no speculation at 64. The adaptive
+    verify length could take 0 as a candidate (vLLM's schedule accepts k = 0); the wizard warns instead.
 
 ## Phase 5: tool calls
 

@@ -25,17 +25,18 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 TABLE = REPO / "docs" / "memory_matrix.tsv"
 MAX_CONTEXT = 1_048_576  # the model's own limit
-# Per-token KV of a long request (the 8 full-attention layer visits, 8-bit; the DSpark
-# drafter adds its own full-attention layer), to turn GiB into tokens.
-KIB_PER_TOKEN = {"dspark": 18, "off": 16}
-# Decode tok/s of one request, 8k context, RTX 3090 Ti (README).
-DECODE_1 = {"dspark": 267, "off": 131}
+# Per-token KV of a long request (the 8 full-attention layer visits, 8-bit; DSpark adds
+# its own full-attention layer, DFlash2's layers are windowed), to turn GiB into tokens.
+KIB_PER_TOKEN = {"dflash2": 16, "dspark": 18, "off": 16}
+# The default drafter: the matrix's shifts (async, chunk, request count) are measured on it.
+REF_SPEC = "dflash2"
+DFLASH2_REPO, DFLASH2_DIR = "incoai/Inkling-2-Mini-DFlash2", "Inkling-2-Mini-DFlash2"
 # GPU memory kept free after warmup (start.sh KEEP_FREE_GB): the matrix's value, and the
 # range measured under load (1.0 ran out of memory).
 KEEP_FREE_DEFAULT, KEEP_FREE_MIN, KEEP_FREE_MAX = 2.0, 1.5, 3.5
 DISPLAY_GIB = 1.0  # what a desktop on the same GPU may take
 # Requests decoding together at which DSpark's aggregate decode equals no speculation (prose,
-# 512 tokens, scripts/quick_bench.py): +11-14% at 1-16, even at 32, -23% at 64.
+# 512 tokens, scripts/quick_bench.py); DFlash2 is still ahead at 64.
 SPEC_BREAK_EVEN = 32
 # Context the adaptive verify length (its CUDA graphs) and the context lookup take.
 ADAPTIVE_COST = 5_120
@@ -65,7 +66,7 @@ def load_table():
 def expected(rows, vision, spec, async_, seqs, nbt):
     """Longest request for a combination: measured, or the 6-request async-on NBT-2048 row
     of this vision tower and spec shifted by what async, NBT and the request count shift
-    on the GPU (a shift not measured for `spec` is taken from DSpark's)."""
+    on the GPU (a shift not measured for `spec` is taken from REF_SPEC's)."""
     if (vision, spec, async_, seqs, nbt) in rows:
         return rows[(vision, spec, async_, seqs, nbt)]
 
@@ -73,7 +74,7 @@ def expected(rows, vision, spec, async_, seqs, nbt):
         return rows.get((v, s, a, q, n))
 
     def shift(change):  # change(spec) -> (from, to) row values, or None
-        for s in (spec, "dspark"):
+        for s in (spec, REF_SPEC):
             a, b = change(s)
             if a is not None and b is not None:
                 return b - a
@@ -81,7 +82,7 @@ def expected(rows, vision, spec, async_, seqs, nbt):
 
     base = row(vision, spec)
     if base is None:  # this tower measured with the other spec only
-        other = "off" if spec == "dspark" else "dspark"
+        other = "off" if spec != "off" else REF_SPEC
         if None in (row("gpu", spec), row(vision, other), row("gpu", other)):
             return None
         base = row("gpu", spec) + row(vision, other) - row("gpu", other)
@@ -93,12 +94,12 @@ def expected(rows, vision, spec, async_, seqs, nbt):
     if seqs != 6:
         # Piecewise-linear in the request count over the measured gpu series.
         series = sorted((q, v) for (vi, s, a, q, n), v in rows.items()
-                        if (vi, s, a, n) == ("gpu", "dspark", True, 2048))
+                        if (vi, s, a, n) == ("gpu", REF_SPEC, True, 2048))
         lo = max((p for p in series if p[0] <= seqs), default=series[0])
         hi = min((p for p in series if p[0] >= seqs), default=series[-1])
         ref = lo[1] if hi[0] == lo[0] else (
             lo[1] + (hi[1] - lo[1]) * (seqs - lo[0]) / (hi[0] - lo[0]))
-        base += int(ref - (row("gpu", "dspark") or ref))
+        base += int(ref - (row("gpu", REF_SPEC) or ref))
     return max(0, min(MAX_CONTEXT, base))
 
 
@@ -181,23 +182,26 @@ def main():
               ("c", "none", "no vision: text only"))
     for key, vision, note in towers:
         print(f"   {key}) {note}  (longest request: "
-              f"{ctx(vision, 'dspark', True, seqs, 2048)})")
+              f"{ctx(vision, REF_SPEC, True, seqs, 2048)})")
     vision = {k: v for k, v, _ in towers}[ask("   choice", "abc", "a")]
 
-    print("\n3) Speculative decoding with the bundled DSpark drafter?")
-    print(f"   y) yes: one request decodes ~{DECODE_1['dspark']} tok/s instead of "
-          f"~{DECODE_1['off']} (more on code and structured output, less on free prose); "
-          f"longest request {ctx(vision, 'dspark', True, seqs, 2048)}")
-    print(f"   n) no: longest request {ctx(vision, 'off', True, seqs, 2048)}")
-    many = seqs >= SPEC_BREAK_EVEN
-    if many:
-        print(f"   With {seqs} requests decoding together DSpark stops paying: on prose it breaks "
-              f"even at {SPEC_BREAK_EVEN},\n   and is 23% slower in aggregate at 64 "
-              "(it still wins while fewer are decoding).")
-    spec = "dspark" if ask("   choice", "yn", "n" if many else "y") == "y" else "off"
+    print("\n3) Speculative decoding (lossless: the same output, faster). Both drafters give "
+          "~1.8x decode\n   up to 128k tokens of context.")
+    print("   a) DFlash2 (incoai/Inkling-2-Mini-DFlash2, a 1 GB download): +12% decode on "
+          "document extraction\n      (6k-token prompts with pages), +30-45% on chat, code "
+          "and structured output, +20-40%\n      with 8-64 requests; longest request "
+          f"{ctx(vision, 'dflash2', True, seqs, 2048)}")
+    print("   b) DSpark (the checkpoint's own drafter, it sees the whole context): +10-19% on "
+          "8-32k-token\n      documents summarized or analyzed whole; longest request "
+          f"{ctx(vision, 'dspark', True, seqs, 2048)}")
+    print(f"   c) none: longest request {ctx(vision, 'off', True, seqs, 2048)}")
+    if seqs >= SPEC_BREAK_EVEN:
+        print(f"   With {seqs} requests decoding together DSpark only breaks even; DFlash2 is "
+              "still +35% at 64.")
+    spec = {"a": "dflash2", "b": "dspark", "c": "off"}[ask("   choice", "abc", "a")]
 
     adaptive = "n"
-    if spec == "dspark":
+    if spec != "off":
         print("\n3a) Adaptive verify length and drafts from the context: +43% while the "
               "answer copies the prompt, +4-10% on free text and code, for "
               f"~{fmt_tokens(ADAPTIVE_COST)} of context.")
@@ -243,7 +247,7 @@ def main():
 
     longest = expected(rows, vision, spec, async_, seqs, nbt)
     if longest:
-        if adaptive == "n" and spec == "dspark":
+        if adaptive == "n" and spec != "off":
             longest += ADAPTIVE_COST
         longest -= int((keep_free - KEEP_FREE_DEFAULT) * 2**20 / KIB_PER_TOKEN[spec])
     print(f"\n8) Longest request: auto fits it to the GPU at boot (expected "
@@ -299,7 +303,7 @@ def main():
         env["IMAGES"] = 0
     if vision == "host":
         env["HYPERINKLING_VISION_HOST"] = 1
-    if spec == "dspark" and adaptive == "n":
+    if spec != "off" and adaptive == "n":
         env["HYPERINKLING_SPEC_ADAPTIVE"] = ""
         env["HYPERINKLING_LOOKUP"] = 0
     if tier != "auto" and tier > 36:  # compose's /dev/shm default is 48
@@ -328,6 +332,8 @@ def main():
     print("\nStart it:  docker compose up -d     (logs: docker compose logs -f; the first start"
           " downloads the checkpoint)")
     print(f"Native:    hf download {repo} --local-dir models/{local}   (once)")
+    if spec == "dflash2":
+        print(f"           hf download {DFLASH2_REPO} --local-dir models/{DFLASH2_DIR}   (once)")
     exports = " ".join(f"{k}={v}" for k, v in env.items()
                        if k not in ("UID", "GID", "SHM_GB", "BIND", "HF_REPO", "CHECKPOINT"))
     print(f"Native:    {exports} ./start.sh")

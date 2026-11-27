@@ -2,8 +2,8 @@
 
 **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Thinking Machines
 Lab, Apache-2.0) on one RTX 3090 / 3090 Ti, with vLLM.** Text and images (document pages),
-tool calls, strict JSON output, ~340k tokens of context per request, several requests at
-once, and the model's own DSpark drafter for speculative decoding.
+tool calls, strict JSON output, ~349k tokens of context per request, several requests at
+once, and speculative decoding with the DFlash2 drafter (or the model's own DSpark).
 
 Upstream vLLM runs Inkling 2 Mini on Hopper and Blackwell. This repository is the port to
 one Ampere card (sm86) plus a requantized checkpoint that fits in 24 GB: a pinned vLLM with
@@ -11,8 +11,8 @@ one patch, a model-preparation pipeline, and a launcher with measured defaults.
 
 It does not aim to beat other inference engines on one request at a time. It is a solid base
 for serving the new Inkling 2 Mini to **several requests in parallel** on one 3090: vLLM's
-batching, prefix cache and CPU tier, a long context next to the vision tower, and DSpark
-that still pays at 6 requests.
+batching, prefix cache and CPU tier, a long context next to the vision tower, and
+speculative decoding that still pays at 64 requests.
 
 > **Scope, honestly.** This is a personal project, written almost entirely with an AI coding
 > assistant ("vibe coded"), published because it may be useful to other 3090 owners. It
@@ -24,7 +24,7 @@ that still pays at 6 requests.
 
 ```bash
 git clone https://github.com/Pento95/HyperInkling hyperinkling && cd hyperinkling
-python3 scripts/wizard.py         # a few questions -> .env (checkpoint, vision, DSpark, ...)
+python3 scripts/wizard.py         # a few questions -> .env (checkpoint, vision, drafter, ...)
 docker compose up -d              # first start pulls the image (~26 GB) and the checkpoint (~16 GB)
 docker compose logs -f hyperinkling
 ```
@@ -111,6 +111,21 @@ cells at one request are one prompt: between prompts they range from 170 to 400 
 target verifies every draft); how much it gains depends on the text: most on code, structured
 output and answers that quote the prompt, least on free prose like these summaries.
 
+**Which drafter** (`SPEC`, both lossless; one request unless stated, 1.5-2k-token answers):
+
+| | no speculation | DSpark | DFlash2 (default) |
+|---|---|---|---|
+| chat, code, structured output, prose at temperature 0.2-0.5 (`bench/spec_bench.py`) | | 147-288 tok/s | **208-398 tok/s** |
+| the same at 6 requests, aggregate | | 421 tok/s | **627 tok/s** |
+| document extraction: 1-3 pages, 6k-token prompts, 6 at once (`bench/extract_bench.py`) | | 469 tok/s, 83 requests in 5 min | **541 tok/s, 96-104** |
+| 8 / 16 / 32 / 64 requests, prose (`scripts/quick_bench.py`) | 527 / 798 / 1,263 / 1,860 | 532 / 789 / 1,242 / 1,427 | **751 / 1,089 / 1,468 / 1,930** |
+| 8k / 32k documents summarized whole (the table above) | 131 / 124 | **324 / 198** | 282-311 / 166 |
+| 128k documents, 1 / 2 requests | 101 / 144 | 185 / 247 | 189 / 252 |
+
+DSpark's own layer sees the whole context, DFlash2's window the last 2,048 tokens: DSpark is ahead
+on long documents read whole, DFlash2 everywhere else (NOTES "DFlash2"). DFlash2 is a separate
+1 GB download (`incoai/Inkling-2-Mini-DFlash2`, Apache-2.0; Compose fetches it).
+
 A field report on a **3090 (not Ti)**, power limit 320 W, gpu-unlock active, 0.1.2, same bench:
 
 | | 1 request, no DSpark | 1 request, DSpark | 6 requests, no DSpark | 6 requests, DSpark |
@@ -130,32 +145,32 @@ Longest single request, 8 requests at once, KV at 8 bits, the defaults otherwise
 (`docs/memory_matrix.tsv`, `bench/memory_matrix.sh`). The server fits it at boot
 (`MAX_LEN=auto`); the wizard shows it for every choice.
 
-| vision tower | DSpark (default) | no DSpark |
-|---|---|---|
-| on the GPU (default) | **340k** | 431k |
-| in host RAM | 375k | 471k |
-| none (text only) | 377k | 473k |
+| vision tower | DFlash2 (default) | DSpark | no speculation |
+|---|---|---|---|
+| on the GPU (default) | **349k** | 340k | 431k |
+| in host RAM | 390k | 375k | 471k |
+| none (text only) | 388k | 377k | 473k |
 
-With DSpark and the vision tower on the GPU: 362k at 1 request, 345k at 6, 326k at 16, 306k at 32,
-268k at 64. Async scheduling off gives ~17k more; a prefill chunk of 1024 ~12k more. Without
-DSpark, without the vision tower, with async scheduling off and a 1024 prefill chunk: **500k**
+With DFlash2 and the vision tower on the GPU: 374k at 1 request, 357k at 6, 333k at 16, 306k at 32,
+255k at 64. Async scheduling off gives ~18k more; a prefill chunk of 1024 ~13k more. Without
+speculation, without the vision tower, with async scheduling off and a 1024 prefill chunk: **500k**
 at 1 request (495k at 6), as far as the 24 GiB allow, not to the model's 1M.
 
 | knob | default | what it does | context / VRAM | speed |
 |---|---|---|---|---|
-| `SPEC` | `dspark` | speculative decoding with the bundled drafter | ~91k tokens less (340k vs 431k) | 1.5-2x decode at one request, 1.7-1.8x aggregate at 6; with many requests decoding at once it stops paying (prose: +11-14% up to 16, even at 32, -23% at 64), so the wizard proposes it off from 32 |
+| `SPEC` | `dflash2` | speculative decoding: `dflash2` (the DFlash2 drafter, `DFLASH2_MODEL`), `dspark` (the checkpoint's own) or `off` | `dflash2` 349k, `dspark` 340k, `off` 431k | see "Which drafter" above |
 | `MAX_LEN` | `auto` | longest request: `auto` is what the KV cache holds after warmup; a number caps it (and the boot fails if it does not fit) | none | none |
 | `KEEP_FREE_GB` | 2 | GPU memory kept free after warmup (never below the activation peak vLLM measures); the KV cache gets the rest. The wizard offers 1.5 to 3.5, +1 for a monitor on the GPU | 0.5 less: ~29k tokens more; 1.0 ran out of memory under load | none |
-| `ASYNC` | 1 | async scheduling (two steps in flight) | off: ~17k tokens more | off: -3 to -4% decode |
-| `NBT` | 2048 | prefill chunk (and image encodings per step) | 1024: ~12k tokens more | 1024: -8% prefill, same decode |
+| `ASYNC` | 1 | async scheduling (two steps in flight) | off: ~18k tokens more | off: -3 to -4% decode |
+| `NBT` | 2048 | prefill chunk (and image encodings per step) | 1024: ~13k tokens more | 1024: -8% prefill, same decode |
 | `LONG_PREFILL` | `NBT`/2 | most tokens of one prompt per step while other requests are there (no limit when it is alone); 0 = off | none | short prompts beside a 120k prefill: TTFT 26.6 -> 1.9 s; that prefill +19% |
-| `IMAGES` | 50 | images per request; 0 = no vision tower | 0: ~37k tokens more | no images |
-| `HYPERINKLING_VISION_HOST` | 0 | vision tower weights in host RAM, copied to the GPU layer by layer per image | 1: ~35k tokens more | +27 ms per A4 page |
+| `IMAGES` | 50 | images per request; 0 = no vision tower | 0: ~39k tokens more | no images |
+| `HYPERINKLING_VISION_HOST` | 0 | vision tower weights in host RAM, copied to the GPU layer by layer per image | 1: ~41k tokens more | +27 ms per A4 page |
 | `IMAGE_MAX_W` / `_H` | 1040 x 1560 | largest image: 1,014 tokens, an A4 page at ~126 ppi (two per 2048 chunk); larger ones are scaled down to it | A4 at 300 ppi (2480 x 3508, with `ENCODER_CACHE=16384`): ~5.5x the tokens per page | 300 ppi: ~5.5x the prefill per page |
-| `MAX_SEQS` | 8 | requests at once | 362k at 1, 345k at 6, 340k at 8, 326k at 16, 268k at 64 | more aggregate decode |
+| `MAX_SEQS` | 8 | requests at once | 374k at 1, 357k at 6, 349k at 8, 333k at 16, 255k at 64 | more aggregate decode |
 | `KV_OFFLOAD_GB` | `auto` (60% of RAM - 8 GiB, at most 36) | prefix-cache tier in host RAM (`/dev/shm`) | host RAM only | evicted prefixes come back in 0.1 s instead of seconds |
 | `HYPERINKLING_SPEC_ADAPTIVE` | `2,4,7` | verify length chosen per step from these; empty = the fixed `SPEC_K` schedule | ~5k tokens | with the lookup, against `SPEC_K`: +43% copying, +4-10% on free text and code, within noise at 6 requests |
-| `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context instead of DSpark's on a match of 8 tokens or more (lossless) | 6 MB | +10% while copying |
+| `HYPERINKLING_LOOKUP` | 1 | drafts copied from the request's own context instead of the drafter's on a match of 8 tokens or more (lossless) | 6 MB | +10% while copying |
 | `SPEC_K` | `[[1,2,4],[3,8,3]]` | drafts verified per step, by batch size, when the adaptive length is off | none | |
 | `SPEC_DRAFT` | `probabilistic` | drafts sampled from the draft distribution | none | +15-20% on structured output at temperature > 0 |
 | `HYPERINKLING_MOE_ORDER` | 1 | each expert's rows in a fixed order: the same prefill gives the same numbers bit for bit (generation with DSpark still varies between runs) | none | 0: +0.4% decode at 6 requests |
@@ -175,6 +190,7 @@ at 1 request (495k at 6), as far as the 24 GiB allow, not to the model's 1M.
 | KV cache | unit-scale FP8 E4M3, emulated (sm86 has no FP8) | Triton attention, fp16 MMAs |
 | loop controllers, sconv taps | bf16 | Triton batched GEMV |
 | short-conv state | only each step's last tokens hold real blocks | Triton |
+| DFlash2 drafter | layers INT4 g128, selector bf16; KV FP8 | Triton W4A16, block attention with CUDA graphs |
 | DSpark drafter | layers INT4 g128; Markov fold INT4; KV FP8 | Triton W4A16 split-K |
 | vision tower | bf16, on the GPU (or streamed from host RAM) | FlashAttention-2 + cuBLAS |
 | prefix cache | GPU + CPU tier | vLLM OffloadingConnector |

@@ -93,14 +93,14 @@ it. "Aggregate" is the sum over the requests running at once.
 Longest single request, 8 requests served at once, KV cache FP8 E4M3 (8 bits), fitted by the
 server at boot.
 
-| vision tower | DSpark (default) | no DSpark |
-|---|---|---|
-| on the GPU (default) | **340k** | 431k |
-| in host RAM | 375k | 471k |
-| none (text only) | 377k | 473k |
+| vision tower | DFlash2 (default) | DSpark | no speculation |
+|---|---|---|---|
+| on the GPU (default) | **349k** | 340k | 431k |
+| in host RAM | 390k | 375k | 471k |
+| none (text only) | 388k | 377k | 473k |
 
-Async scheduling off gives ~17k more, a 1024-token prefill chunk ~12k more. Without DSpark and
-the vision tower, async off, chunk 1024: 500k.
+Async scheduling off gives ~18k more, a 1024-token prefill chunk ~13k more. Without speculation
+and the vision tower, async off, chunk 1024: 500k.
 
 ## Use
 

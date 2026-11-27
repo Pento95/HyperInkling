@@ -40,13 +40,19 @@ DASHBOARD=${DASHBOARD:-1}
 DASHBOARD_HOST=${DASHBOARD_HOST:-$HOST}
 DASHBOARD_PORT=${DASHBOARD_PORT:-8082}
 MAX_SEQS=${MAX_SEQS:-8}
-# Speculative decoding with the bundled DSpark drafter (on unless SPEC=off). The
-# block drafter always drafts 7 tokens; SPEC_K says how many of them the target
-# verifies, by batch size: [first, last, k] ranges. k=4 for
-# 1-2 requests, k=3 from 3 (bench/dspark_k_sweep.sh; a verify step touches ~6x the
-# experts of a plain step, so long windows only pay on predictable text).
-SPEC=${SPEC:-dspark}
+# Speculative decoding: dflash2 (the incoai/Inkling-2-Mini-DFlash2 drafter, in
+# DFLASH2_MODEL), dspark (the checkpoint's own drafter: ahead on 8-32k-token documents
+# summarized whole, as it sees the whole context) or off. Both draft 7 tokens per step;
+# SPEC_K says how many the target verifies, by batch size ([first, last, k] ranges), when
+# the adaptive length below is off.
+SPEC=${SPEC:-dflash2}
 SPEC_K=${SPEC_K:-[[1,2,4],[3,8,3]]}
+DFLASH2_MODEL=${DFLASH2_MODEL:-$REPO/models/Inkling-2-Mini-DFlash2}
+if [ "$SPEC" = dflash2 ] && [ ! -f "$DFLASH2_MODEL/model.safetensors" ]; then
+	echo "[start] SPEC=dflash2 needs the drafter: hf download incoai/Inkling-2-Mini-DFlash2" \
+		"--local-dir $DFLASH2_MODEL (or SPEC=dspark)" >&2
+	exit 1
+fi
 # Drafts sampled from the draft distribution (as the reference) rather than
 # greedy: at temperature 0.2-0.5 +15-20% on structured output.
 SPEC_DRAFT=${SPEC_DRAFT:-probabilistic}
@@ -56,7 +62,7 @@ SPEC_DRAFT=${SPEC_DRAFT:-probabilistic}
 # 1,2,3,4,5,7 ~14k. With the lookup, against SPEC_K (temperature 0): +43% copying, +10% code
 # and struct, +4-5% chat and prose, 6 requests within noise.
 export HYPERINKLING_SPEC_ADAPTIVE=${HYPERINKLING_SPEC_ADAPTIVE-2,4,7}
-# Drafts from the request's own context in place of DSpark's (ops/lookup.py): +10% on
+# Drafts from the request's own context in place of the drafter's (ops/lookup.py): +10% on
 # top of a long verify length while the answer copies the prompt; lossless. 0 disables.
 export HYPERINKLING_LOOKUP=${HYPERINKLING_LOOKUP-1}
 # Extra speculative-config fields, as a JSON fragment starting with a comma.
@@ -177,8 +183,9 @@ if [ -z "${GRAPH_SIZES:-}" ]; then
 fi
 case "$SPEC" in
 dspark) args+=(--speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"num_speculative_tokens_per_batch_size\":$SPEC_K,\"draft_sample_method\":\"$SPEC_DRAFT\"$SPEC_OPTS}") ;;
+dflash2) args+=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$DFLASH2_MODEL\",\"num_speculative_tokens\":7,\"num_speculative_tokens_per_batch_size\":$SPEC_K,\"draft_sample_method\":\"$SPEC_DRAFT\"$SPEC_OPTS}") ;;
 off) ;;
-*) echo "[start] SPEC must be dspark or off, not '$SPEC'" >&2; exit 1 ;;
+*) echo "[start] SPEC must be dspark, dflash2 or off, not '$SPEC'" >&2; exit 1 ;;
 esac
 
 # PROFILE=<name>: run under Nsight Systems. Nothing is recorded until
@@ -200,7 +207,7 @@ echo "Context $([ "$MAX_LEN" = auto ] && echo "auto (what the GPU holds)" || ech
 echo "KV $KV_DTYPE, prefix cache on, CPU tier ${KV_OFFLOAD_GB} GiB"
 if [ -n "$HYPERINKLING_SPEC_ADAPTIVE" ]; then verify="adaptive over $HYPERINKLING_SPEC_ADAPTIVE"
 else verify="by batch size $SPEC_K"; fi
-echo "Speculation: $SPEC$([ "$SPEC" = dspark ] && echo ", $SPEC_DRAFT drafts, verify k $verify, context lookup $HYPERINKLING_LOOKUP")"
+echo "Speculation: $SPEC$([ "$SPEC" != off ] && echo ", $SPEC_DRAFT drafts, verify k $verify, context lookup $HYPERINKLING_LOOKUP")"
 echo "INT8: attention=$HYPERINKLING_ATTN_W8 head=$HYPERINKLING_HEAD_W8" \
 	"embed=$HYPERINKLING_EMBED_W8 (host RAM: $HYPERINKLING_EMBED_UVA)"
 echo "Images: up to $IMAGES/request, ${IMAGE_MAX_W}x${IMAGE_MAX_H} profiled, larger ones scaled to $HYPERINKLING_IMAGE_MAX_CELLS cells, vision tower $([ "$HYPERINKLING_VISION_HOST" = 1 ] && echo 'in host RAM' || echo 'on the GPU')"
